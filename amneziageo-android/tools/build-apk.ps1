@@ -23,7 +23,7 @@
 param(
   [Alias('c')][ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
   [Alias('v')][string]$Version,
-  [string]$UpdateUrl = 'https://github.com/bor-project/amneziageo/releases/latest/download/update.json',
+  [string]$UpdateUrl = 'https://github.com/ytreeeeeeeeeeee/amneziageo/releases/latest/download/update.json',
   [ValidateSet('', 'stable', 'beta', 'test')][string]$Channel = '',
   [switch]$Prerelease
 )
