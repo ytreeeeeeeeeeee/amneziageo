@@ -14,7 +14,7 @@ DIST="$HERE/dist"
 CONFIGURATION="Release"
 VERSION=""
 ABIS=""
-UPDATE_URL="https://github.com/bor-project/amneziageo/releases/latest/download/update.json"
+UPDATE_URL="https://github.com/ytreeeeeeeeeeee/amneziageo/releases/latest/download/update.json"
 CHANNEL=""
 
 usage() {

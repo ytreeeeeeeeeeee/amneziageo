@@ -16,7 +16,7 @@ OUT="$ROOT/dist"
 CONFIGURATION="Release"
 WITH_GUI="yes"
 # Release manifest the packaged agent checks itself against; empty leaves the update section hidden.
-UPDATE_URL="https://github.com/bor-project/amneziageo/releases/latest/download/update.json"
+UPDATE_URL="https://github.com/ytreeeeeeeeeeee/amneziageo/releases/latest/download/update.json"
 CHANNEL=""
 # Folder with the packages of the release before; empty builds no patch.
 EARLIER=""

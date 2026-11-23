@@ -2,7 +2,7 @@
 # Installs AmneziaGeo from its GitHub releases: picks the packages for this architecture and hands them to apt.
 set -euo pipefail
 
-REPO="bor-project/amneziageo"
+REPO="ytreeeeeeeeeeee/amneziageo"
 TAG=""
 PRERELEASE="no"
 WITH_GUI="yes"

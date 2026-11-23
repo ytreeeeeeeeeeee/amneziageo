@@ -8,7 +8,7 @@
 
 AmneziaGeo - кроссплатформенный VPN-клиент для Windows, Linux и Android на базе AmneziaWG, доработанного WireGuard. Раздельное туннелирование (split tunneling) направляет выбранный трафик через ваши серверы. На Windows можно подключить несколько VPN одновременно и выбрать сервер для каждого правила маршрутизации.
 
-**[Скачать](https://github.com/bor-project/amneziageo/releases) · [Документация](https://bor-project.github.io/amneziageo/index.ru.html) · [Сервер](https://github.com/bor-project/amneziageo_server/blob/master/README.ru.md)**
+**[Скачать](https://github.com/ytreeeeeeeeeeee/amneziageo/releases) · [Документация](https://bor-project.github.io/amneziageo/index.ru.html) · [Сервер](https://github.com/ytreeeeeeeeeeee/amneziageo_server/blob/master/README.ru.md)**
 
 ## Возможности
 
@@ -21,11 +21,12 @@ AmneziaGeo - кроссплатформенный VPN-клиент для Window
 
 Windows 7, 10 и 11 (x64 и ARM64), Linux (пакеты deb для amd64 и arm64) и Android.
 
-Установка, настройка, команды CLI и сборка из исходников - на **[сайте документации](https://bor-project.github.io/amneziageo/index.ru.html)**.
+Пакеты для установки доступны в [релизах форка](https://github.com/ytreeeeeeeeeeee/amneziageo/releases).
+Настройка, команды CLI и сборка из исходников описаны на **[сайте документации](https://bor-project.github.io/amneziageo/index.ru.html)**.
 
 ## Сервер
 
-**[AmneziaGeo Server](https://github.com/bor-project/amneziageo_server/blob/master/README.ru.md)** - панель управления своим сервером AmneziaWG на Linux: клиенты с конфигурациями, QR-кодами и подписками, шаблоны, маршрутизация по гео-базам и доменам через другие серверы, резолвер для клиентов. Гео-источники, списки маршрутизации и подписку такого сервера клиент читает сам; любой другой сервер AmneziaWG тоже подходит. Установка и настройка - на **[сайте документации сервера](https://bor-project.github.io/amneziageo_server/index.ru.html)**.
+**[AmneziaGeo Server](https://github.com/ytreeeeeeeeeeee/amneziageo_server/blob/master/README.ru.md)** - панель управления своим сервером AmneziaWG на Linux: клиенты с конфигурациями, QR-кодами и подписками, шаблоны, маршрутизация по гео-базам и доменам через другие серверы, резолвер для клиентов. Гео-источники, списки маршрутизации и подписку такого сервера клиент читает сам; любой другой сервер AmneziaWG тоже подходит. Установка и настройка - на **[сайте документации сервера](https://bor-project.github.io/amneziageo_server/index.ru.html)**.
 
 ## Поддержать проект
 

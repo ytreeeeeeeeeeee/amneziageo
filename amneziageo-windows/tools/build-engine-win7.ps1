@@ -78,11 +78,17 @@ if ($missing) {
         $marker = Join-Path $deps 'prepared'
         if (Test-Path $marker) { Remove-Item -Force $marker }
 
+        $previousGoToolchain = $env:GOTOOLCHAIN
         Push-Location $submodule
         try {
+            # build.cmd can bundle a Go version older than the submodule's go.mod requires.
+            $env:GOTOOLCHAIN = 'auto'
             & cmd.exe /c build.cmd
             if ($LASTEXITCODE -ne 0) { throw "build.cmd bootstrap failed ($LASTEXITCODE)" }
-        } finally { Pop-Location }
+        } finally {
+            $env:GOTOOLCHAIN = $previousGoToolchain
+            Pop-Location
+        }
     } finally {
         New-Item -ItemType Directory -Force -Path $deps | Out-Null
         foreach ($k in $keep) {
