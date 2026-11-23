@@ -1474,6 +1474,12 @@
   <data name="QrScanner_CameraPermissionDenied" xml:space="preserve">
     <value>Camera access denied</value>
   </data>
+  <data name="RoutingEditor_AddExactApplication" xml:space="preserve">
+    <value>Add this application</value>
+  </data>
+  <data name="RoutingEditor_AddWholeFolder" xml:space="preserve">
+    <value>Add the entire folder</value>
+  </data>
   <data name="RoutingEditor_AppKindApplication" xml:space="preserve">
     <value>{0} · application</value>
   </data>

@@ -51,8 +51,8 @@ public static class OwnAppRule
         var own = OwnFolder();
         return own.Length > 0
             && (own.Equals(path, StringComparison.OrdinalIgnoreCase)
-                || own.StartsWith(path + "\\", StringComparison.OrdinalIgnoreCase)
-                || path.StartsWith(own + "\\", StringComparison.OrdinalIgnoreCase));
+                || AppPathToken.IsUnderDirectory(path, own)
+                || AppPathToken.IsUnderDirectory(own, path));
     }
 
     // Where this process runs from, in the same words a rule is written in.

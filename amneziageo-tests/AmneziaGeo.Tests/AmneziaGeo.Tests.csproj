@@ -19,6 +19,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\..\amneziageo-android\AmneziaGeo.Android.Ui\Services\VpnConnectPreparation.cs" Link="VpnConnectPreparation.cs" />
+    <Compile Include="..\..\amneziageo-android\AmneziaGeo.Android.Engine\GeoRoutingPlan.cs" Link="GeoRoutingPlan.cs" />
+    <Compile Include="..\..\amneziageo-android\AmneziaGeo.Android.Engine\VpnSessionFiles.cs" Link="VpnSessionFiles.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\amneziageo-lib\AmneziaGeo.Cli\AmneziaGeo.Cli.csproj" />
     <ProjectReference Include="..\..\amneziageo-lib\AmneziaGeo.Dal\AmneziaGeo.Dal.csproj" />
     <ProjectReference Include="..\..\amneziageo-lib\AmneziaGeo.Deltas\AmneziaGeo.Deltas.csproj" />

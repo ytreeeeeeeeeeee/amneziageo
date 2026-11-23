@@ -1,3 +1,4 @@
+using AmneziaGeo.Ipc;
 using AmneziaGeo.Windows.App;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -44,6 +45,96 @@ public sealed class AppMatcherImagesTests
 public class AppMatcherReloadTests
 {
     private static AppMatcher Matcher(params string[] rules) => new(rules, NullLogger<AppMatcher>.Instance);
+
+    [Theory]
+    [InlineData("path=Z:/Games/Missing Game/game.exe")]
+    [InlineData("dir=Z:/Games/Missing Game")]
+    public void AStoredRuleWithForwardSlashesMatchesTheWindowsProcessPath(string rule)
+    {
+        var matcher = Matcher(rule);
+
+        Assert.True(matcher.MatchesDevicePath(@"Z:\Games\Missing Game\game.exe"));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ProgramDataRootMatchesNestedAppsAndKeepsTheFolderBoundary(bool usePortableRule)
+    {
+        var root = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData).TrimEnd('\\');
+        Assert.NotEmpty(root);
+        var matcher = Matcher("dir=" + (usePortableRule ? "%PROGRAMDATA%" : root));
+
+        Assert.True(matcher.MatchesDevicePath(Path.Combine(root, "Example", "bin", "app.exe")));
+        Assert.False(matcher.MatchesDevicePath(Path.Combine(root + "-other", "app.exe")));
+    }
+
+    [Theory]
+    [InlineData(@"AppData\Local", "%LOCALAPPDATA%")]
+    [InlineData(@"AppData\Roaming", "%APPDATA%")]
+    public void AppDataRootMatchesNestedAppsInNewAndPreviouslySavedRules(string relativePath, string token)
+    {
+        var profile = AppPathToken.Expand("%USERPROFILE%").First();
+        var root = Path.Combine(profile, relativePath);
+        Assert.Equal("app:dir=" + token + "\\", AppPathToken.NormalizeAppRule("app:dir=" + root));
+        Assert.Equal(token, AppPathToken.Tokenize(root + "\\"));
+
+        var image = Path.Combine(root, "Vendor", "bin", "app.exe");
+        var sibling = Path.Combine(root + "Backup", "app.exe");
+        foreach (var rule in new[] { token, root, @"%USERPROFILE%\" + relativePath })
+        {
+            var matcher = Matcher("dir=" + rule);
+
+            Assert.True(matcher.MatchesDevicePath(image));
+            Assert.False(matcher.MatchesDevicePath(sibling));
+        }
+    }
+
+    [Theory]
+    [InlineData("Local")]
+    [InlineData("Roaming")]
+    public void AParentAppDataRuleMatchesNestedApps(string folder)
+    {
+        var profile = AppPathToken.Expand("%USERPROFILE%").First();
+        var root = Path.Combine(profile, "AppData");
+        var image = Path.Combine(root, folder, "Vendor", "app.exe");
+        var sibling = Path.Combine(profile, "AppDataBackup", folder, "Vendor", "app.exe");
+
+        foreach (var rule in new[] { root, @"%USERPROFILE%\AppData" })
+        {
+            var matcher = Matcher("dir=" + rule);
+
+            Assert.True(matcher.MatchesDevicePath(image));
+            Assert.False(matcher.MatchesDevicePath(sibling));
+        }
+    }
+
+    [Theory]
+    [InlineData(@"Tools\app.exe")]
+    [InlineData(@"AppData\Local\Vendor\app.exe")]
+    [InlineData(@"AppData\Roaming\Vendor\app.exe")]
+    public void AProfileRootMatchesNestedAppsWithOrWithoutATrailingSeparator(string relativePath)
+    {
+        var profile = AppPathToken.Expand("%USERPROFILE%").First();
+        var image = Path.Combine(profile, relativePath);
+
+        foreach (var rule in new[] { profile, profile + "\\", "%USERPROFILE%", "%USERPROFILE%\\" })
+        {
+            Assert.True(Matcher("dir=" + rule).MatchesDevicePath(image));
+        }
+    }
+
+    [Theory]
+    [InlineData(@"dir=Z:\Tools\v1.2")]
+    [InlineData(@"dir=Z:\Tools\v1.2\")]
+    public void AStoredVersionedFolderRuleMatchesOnlyAppsWithinThatFolder(string rule)
+    {
+        var matcher = Matcher(rule);
+
+        Assert.True(matcher.MatchesDevicePath(@"Z:\Tools\v1.2\Vendor\app.exe"));
+        Assert.False(matcher.MatchesDevicePath(@"Z:\Tools\OtherApp\app.exe"));
+        Assert.False(matcher.MatchesDevicePath(@"Z:\Tools\v1.3\Vendor\app.exe"));
+    }
 
     [Fact]
     public void AnEditedRuleSetIsPutInForce()

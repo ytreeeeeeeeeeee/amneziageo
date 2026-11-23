@@ -77,7 +77,7 @@ public static class AppRuleCover
         {
             "path" => Same(Tokenized(value), path),
             "name" => Same(value, LeafOf(path)),
-            "dir" => Under(AppPathToken.StripVersionedLeaf(Tokenized(value)), path),
+            "dir" => AppPathToken.IsUnderDirectory(Tokenized(value), path),
             "pkg" => AppPathToken.PackageFamilyFromPath(path) is { } family && Same(Family(value), family),
             _ => false,
         };
@@ -88,9 +88,8 @@ public static class AppRuleCover
     {
         return kind switch
         {
-            "dir" => Same(AppPathToken.StripVersionedLeaf(Tokenized(value)), AppPathToken.StripVersionedLeaf(dir))
-                || Under(AppPathToken.StripVersionedLeaf(Tokenized(value)), dir),
-            "path" => Under(dir, Tokenized(value)),
+            "dir" => Same(Tokenized(value), dir) || AppPathToken.IsUnderDirectory(Tokenized(value), dir),
+            "path" => AppPathToken.IsUnderDirectory(dir, Tokenized(value)),
             "pkg" => AppPathToken.PackageFamilyFromPath(dir) is { } family && Same(Family(value), family),
             _ => false,
         };
@@ -122,10 +121,6 @@ public static class AppRuleCover
         var slash = path.LastIndexOfAny(_slashes);
         return slash >= 0 ? path[(slash + 1)..] : path;
     }
-
-    private static bool Under(string dir, string path) =>
-        path.StartsWith(dir + "\\", StringComparison.OrdinalIgnoreCase)
-        || path.StartsWith(dir + "/", StringComparison.OrdinalIgnoreCase);
 
     private static bool Same(string left, string right) => string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
 }

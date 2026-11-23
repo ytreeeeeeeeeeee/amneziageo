@@ -1076,13 +1076,18 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
         OnPropertyChanged(nameof(ShowDropdownSuggestions));
     }
 
-    // Running and installed applications answer one query: each source keeps its own group, a name met twice
-    // stands once, what the list already holds drops out, and the head of the result is offered.
+    // An explicit Windows path can be added before any matches from the running and installed lists.
     private IReadOnlyList<RoutingSuggestionViewModel> MatchApps(string query)
     {
         var held = new HashSet<string>(Rules.Select(AppPathToken.NormalizeAppRule), StringComparer.OrdinalIgnoreCase);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var matches = new List<RoutingSuggestionViewModel>();
+        if (OperatingSystem.IsWindows() && WindowsPathSuggestion(query) is { } direct && !held.Contains(direct.Token))
+        {
+            seen.Add(direct.Token);
+            matches.Add(direct);
+        }
+
         foreach (var group in _appGroups)
         {
             foreach (var candidate in group.Where(c => Names(c, query)))
@@ -1102,6 +1107,30 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
         }
 
         return matches;
+    }
+
+    private static RoutingSuggestionViewModel? WindowsPathSuggestion(string query)
+    {
+        const string filePrefix = "app:path=";
+        const string folderPrefix = "app:dir=";
+        var isFile = query.StartsWith(filePrefix, StringComparison.OrdinalIgnoreCase);
+        var isFolder = query.StartsWith(folderPrefix, StringComparison.OrdinalIgnoreCase);
+        var path = isFile ? query[filePrefix.Length..]
+            : isFolder ? query[folderPrefix.Length..]
+            : query;
+        path = path.Trim().Trim('"');
+        var absolutePath = AppPathToken.ExpandInputPath(path);
+        if (!System.IO.Path.IsPathFullyQualified(absolutePath)
+            || absolutePath.Split('\\', '/').Any(component => component is "." or ".."))
+        {
+            return null;
+        }
+
+        isFile |= !isFolder && absolutePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
+        var token = AppPathToken.NormalizeAppRule((isFile ? filePrefix : folderPrefix) + absolutePath);
+        return new RoutingSuggestionViewModel(token, Loc.Instance.Get(isFile
+            ? "RoutingEditor_AddExactApplication"
+            : "RoutingEditor_AddWholeFolder"));
     }
 
     // Matches the name and the path alike: both get typed.
@@ -1774,7 +1803,7 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
         var dir = System.IO.Path.GetDirectoryName(image);
         return string.IsNullOrEmpty(dir)
             ? $"app:path={image}"
-            : $"app:dir={AppPathToken.StripVersionedLeaf(dir)}";
+            : AppPathToken.RuleForDiscoveredDirectory(dir);
     }
 
     /// <summary>
@@ -1790,8 +1819,9 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
 
         // Store a version-independent package match for Store apps, else a portable %ENV% path, so the rule
         // survives the app auto-updating and export to another machine or user.
-        token = AmneziaGeo.Ipc.AppPathToken.NormalizeAppRule(token);
-        if (!Rules.Contains(token))
+        token = AppPathToken.NormalizeAppRule(token);
+        if (!Rules.Any(rule => string.Equals(AppPathToken.NormalizeAppRule(rule), token,
+            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)))
         {
             Rules.Add(token);
         }
@@ -1874,6 +1904,11 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
 
         var eq = token.IndexOf('=');
         var value = (eq >= 0 ? token[(eq + 1)..] : string.Empty).Trim();
+        if (OperatingSystem.IsWindows())
+        {
+            value = Environment.ExpandEnvironmentVariables(value);
+        }
+
         var norm = value.Replace('/', '\\').TrimEnd('\\').ToLowerInvariant();
         if (norm.Length == 0)
         {

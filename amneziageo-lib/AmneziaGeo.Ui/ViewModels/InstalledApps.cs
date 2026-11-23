@@ -1,4 +1,5 @@
 using Microsoft.Win32;
+using AmneziaGeo.Ipc;
 using AmneziaGeo.Localization;
 using System.Runtime.Versioning;
 
@@ -98,7 +99,7 @@ internal static class InstalledApps
     {
         if (key.GetValue("InstallLocation") as string is { } location && !string.IsNullOrWhiteSpace(location))
         {
-            return $"app:dir={location.Trim().Trim('"').TrimEnd('\\', '/')}";
+            return AppPathToken.RuleForDiscoveredDirectory(location);
         }
 
         var exe = ExeFromDisplayIcon(key.GetValue("DisplayIcon") as string);

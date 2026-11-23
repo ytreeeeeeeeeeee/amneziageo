@@ -50,6 +50,105 @@ public sealed class AppPickerTests
         Assert.Equal(["org.auto", "org.mail"], picker.Picked);
     }
 
+    [Theory]
+    [InlineData(@"Z:\Games\Missing Game\game.exe", @"app:path=Z:\Games\Missing Game\game.exe")]
+    [InlineData(@"app:path=Z:\Games\Missing Game\game.exe", @"app:path=Z:\Games\Missing Game\game.exe")]
+    [InlineData(@"Z:\Games\Missing Game", @"app:dir=Z:\Games\Missing Game\")]
+    [InlineData(@"Z:/Games/Missing Game/game.exe", @"app:path=Z:\Games\Missing Game\game.exe")]
+    [InlineData(@"app:dir=%LOCALAPPDATA%/Missing Game", @"app:dir=%LOCALAPPDATA%\Missing Game\")]
+    [InlineData(@"app:dir=Z:\Games\Missing Game", @"app:dir=Z:\Games\Missing Game\")]
+    [InlineData(@"app:dir=Z:\Games\Folder.exe", @"app:dir=Z:\Games\Folder.exe\")]
+    [InlineData(@"app:dir=Z:\Tools\v1.2", @"app:dir=Z:\Tools\v1.2\")]
+    [InlineData(@"app:dir=%LOCALAPPDATA%\Missing Game", @"app:dir=%LOCALAPPDATA%\Missing Game\")]
+    public void AnExplicitWindowsPath_IsOfferedAndAddedWithoutAnAppMatch(string input, string token)
+    {
+        var runningApps = new TaskCompletionSource<IpcAck>();
+        var editor = new RoutingListEditorViewModel(new Silent(runningApps.Task));
+        try
+        {
+            editor.AddMethodIndex = 1;
+            editor.RuleInput = input;
+
+            Assert.Equal(token, editor.MatchedSuggestions[0].Token);
+            Assert.Equal(token, editor.TopSuggestions[0].Token);
+
+            editor.PickSuggestionCommand.Execute(token);
+            Assert.Equal(token, Assert.Single(editor.Rules));
+
+            editor.RuleInput = input.Replace('/', '\\');
+            Assert.DoesNotContain(editor.MatchedSuggestions, suggestion => suggestion.Token == token);
+        }
+        finally
+        {
+            runningApps.SetCanceled();
+        }
+    }
+
+    [Theory]
+    [InlineData(@"Z:\Games\Missing Game\game.exe", @"app:path=Z:\Games\Missing Game\game.exe")]
+    [InlineData(@"Z:\Games\Missing Game", @"app:dir=Z:\Games\Missing Game\")]
+    public void ACustomWindowsPathVariable_UsesTheExpandedPathForTheKindAndRule(string path, string token)
+    {
+        var variable = $"AMNEZIAGEO_PATH_TEST_{Guid.NewGuid():N}";
+        var runningApps = new TaskCompletionSource<IpcAck>();
+        var editor = new RoutingListEditorViewModel(new Silent(runningApps.Task));
+        Environment.SetEnvironmentVariable(variable, path);
+        try
+        {
+            editor.AddMethodIndex = 1;
+            editor.RuleInput = $"%{variable}%";
+
+            var suggestion = Assert.Single(editor.MatchedSuggestions);
+            Assert.Equal(token, suggestion.Token);
+            editor.PickSuggestionCommand.Execute(suggestion.Token);
+            Assert.Equal(token, Assert.Single(editor.Rules));
+
+            editor.RuleInput = path;
+            Assert.Empty(editor.MatchedSuggestions);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable, null);
+            runningApps.SetCanceled();
+        }
+    }
+
+    [Fact]
+    public void AnOldFolderRuleWithoutATrailingSeparatorIsNotOfferedAgain()
+    {
+        var editor = Editor(@"app:dir=Z:\Games\Missing Game");
+        editor.AddMethodIndex = 1;
+        editor.RuleInput = @"Z:\Games\Missing Game\";
+
+        Assert.Empty(editor.MatchedSuggestions);
+    }
+
+    [Theory]
+    [InlineData(@"game.exe")]
+    [InlineData(@"app:path=Games\game.exe")]
+    [InlineData(@"app:path=Z:game.exe")]
+    [InlineData(@"app:dir=\Games")]
+    [InlineData(@"app:path=Z:\Games\.\game.exe")]
+    [InlineData(@"app:dir=Z:/Games/../Tools")]
+    [InlineData(@"app:dir=%LOCALAPPDATA%\..\Tools")]
+    public void ARelativeOrNonCanonicalWindowsPath_IsNotOfferedAsAnExplicitRule(string input)
+    {
+        var runningApps = new TaskCompletionSource<IpcAck>();
+        var editor = new RoutingListEditorViewModel(new Silent(runningApps.Task));
+        try
+        {
+            editor.AddMethodIndex = 1;
+            editor.RuleInput = input;
+
+            Assert.Empty(editor.MatchedSuggestions);
+            Assert.Empty(editor.TopSuggestions);
+        }
+        finally
+        {
+            runningApps.SetCanceled();
+        }
+    }
+
     [Fact]
     public void ARuleOnAProgramThePickerDidNotOffer_StaysAfterSave()
     {
@@ -120,7 +219,7 @@ public sealed class AppPickerTests
     }
 
     // Answers every command with nothing.
-    private sealed class Silent : IAgentConnection
+    private sealed class Silent(Task<IpcAck>? runningApps = null) : IAgentConnection
     {
         public event Action? Connected
         {
@@ -144,7 +243,10 @@ public sealed class AppPickerTests
         {
         }
 
-        public Task<IpcAck> SendCommandAsync(IpcCommand command) => Task.FromResult(new IpcAck(true, string.Empty));
+        public Task<IpcAck> SendCommandAsync(IpcCommand command) =>
+            command.Op == IpcContract.OpListProcesses && runningApps is not null
+                ? runningApps
+                : Task.FromResult(new IpcAck(true, string.Empty));
 
         public Task<IpcAck> SendCommandRawAsync(IpcCommand command) => SendCommandAsync(command);
 

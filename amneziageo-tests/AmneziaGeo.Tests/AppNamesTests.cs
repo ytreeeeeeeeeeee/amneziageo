@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Text;
+using System.Text.Json;
 using AmneziaGeo.Dal;
 using AmneziaGeo.Decl;
 using AmneziaGeo.Geo;
@@ -7,6 +8,7 @@ using AmneziaGeo.Ipc;
 using AmneziaGeo.Localization;
 using AmneziaGeo.Ui.ViewModels;
 using AmneziaGeo.Windows.App;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace AmneziaGeo.Tests;
@@ -174,6 +176,38 @@ public sealed class AppNamesTests : IAsyncLifetime
             routed.Rules);
         Assert.Equal([@"path=C:\Program Files\Mozilla Firefox\firefox.exe", @"path=C:\Tools\tool.exe"], routed.Apps);
         Assert.Empty(routed.DirectApps);
+    }
+
+    [Fact]
+    public async Task AnOldCachedFolderRoutesTheUpdatedAppBeforeTheNextSearch()
+    {
+        const string name = "Vendor Tool";
+        const string oldFolder = @"Z:\Tools\Vendor\app-1.2.3";
+        const string updatedImage = @"Z:\Tools\Vendor\app-2.0.0\tool.exe";
+        var geo = new GeoConfigurator(_store, new NoFiles());
+        var id = await geo.ApplyToRoutingListAsync(0, "Apps",
+            ["proxy|app:" + name, "direct|app:dir=" + oldFolder]);
+        await _store.SetSettingAsync(AppFinds.Key,
+            JsonSerializer.Serialize(new Dictionary<string, string[]> { [name] = ["dir=" + oldFolder] }));
+        var list = (await _store.GetRoutingListAsync(id))!;
+
+        var routed = await AppFinds.ExpandListAsync(_store, list);
+
+        Assert.Equal(@"dir=Z:\Tools\Vendor\", Assert.Single(routed.Apps));
+        Assert.Equal("dir=" + oldFolder, Assert.Single(routed.DirectApps));
+        Assert.True(new AppMatcher(routed.Apps, NullLogger<AppMatcher>.Instance).MatchesDevicePath(updatedImage));
+        Assert.False(new AppMatcher(routed.DirectApps, NullLogger<AppMatcher>.Instance).MatchesDevicePath(updatedImage));
+    }
+
+    [Fact]
+    public async Task ACurrentCachedFolderKeepsItsBoundaryWhenItsParentAlsoLooksVersioned()
+    {
+        const string name = "Vendor Tool";
+        var value = AppPathToken.RuleForDiscoveredDirectory(@"Z:\Tools\Vendor\v1.2\app-1.2.3")["app:".Length..];
+        await AppFinds.SearchAsync(_store, [name], [new NamedApp(name, string.Empty, string.Empty, value)]);
+
+        Assert.Equal(@"dir=Z:\Tools\Vendor\v1.2\", value);
+        Assert.Equal(value, Assert.Single((await AppFinds.ReadAsync(_store))[name]));
     }
 
     [Fact]

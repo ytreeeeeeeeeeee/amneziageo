@@ -72,15 +72,15 @@ internal sealed partial class RoutingEditorView : UserControl
     // routing VM's RoutingEditor (MenuFlyout items do not inherit the editor's DataContext).
     private async void OnPickApplication(object? sender, RoutedEventArgs e)
     {
-        await PutPickedAsync(() => PickFileAsync(Loc.Instance.Get("MainCode_ApplicationTitle"), Extensions()));
+        await PutPickedAsync(() => PickFileAsync(Loc.Instance.Get("MainCode_ApplicationTitle"), Extensions()), "app:path=");
     }
 
     private async void OnPickFolder(object? sender, RoutedEventArgs e)
     {
-        await PutPickedAsync(PickFolderAsync);
+        await PutPickedAsync(PickFolderAsync, "app:dir=");
     }
 
-    private async Task PutPickedAsync(Func<Task<string?>> pick)
+    private async Task PutPickedAsync(Func<Task<string?>> pick, string windowsPrefix)
     {
         if ((DataContext as RoutingViewModel)?.RoutingEditor is not { } vm)
         {
@@ -90,7 +90,7 @@ internal sealed partial class RoutingEditorView : UserControl
         var path = await pick();
         if (!string.IsNullOrEmpty(path))
         {
-            vm.RuleInput = path;
+            vm.RuleInput = OperatingSystem.IsWindows() ? windowsPrefix + path : path;
         }
     }
 
