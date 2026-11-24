@@ -18,9 +18,19 @@ public sealed class AppPathTokenTests
     [InlineData(WhatsAppDir)]
     [InlineData(@"%PROGRAMFILES%\WindowsApps\5319275A.WhatsAppDesktop_2.2628.101.0_x64__cv1g1gvanyjgm\WhatsApp.exe")]
     [InlineData(@"C:/Program Files/WindowsApps/5319275A.WhatsAppDesktop_2.2628.101.0_x64__cv1g1gvanyjgm/WhatsApp.exe")]
+    [InlineData(@"C:\Program Files\WindowsApps\\5319275A.WhatsAppDesktop_2.2628.101.0_x64__cv1g1gvanyjgm\\WhatsApp.exe")]
     public void PackageFamily_FromPackagedPath(string path)
     {
         Assert.Equal(WhatsAppFamily, AppPathToken.PackageFamilyFromPath(path));
+    }
+
+    [Theory]
+    [InlineData(@"Z:\Games\\Tools//Game.exe", @"Z:\Games\Tools\Game.exe")]
+    [InlineData(@"//server\\share/Tools//", @"\\server\share\Tools\")]
+    [InlineData(@"\\?\UNC\\server\share\\Tool.exe", @"\\?\UNC\server\share\Tool.exe")]
+    public void WindowsSeparatorsAreCollapsedWithoutChangingTheUncPrefix(string path, string expected)
+    {
+        Assert.Equal(expected, AppPathToken.NormalizeWindowsSeparators(path));
     }
 
     [Fact]
@@ -54,6 +64,67 @@ public sealed class AppPathTokenTests
     public void NormalizeAppRule_PackagedBecomesPkg(string token)
     {
         Assert.Equal("app:pkg=" + WhatsAppFamily, AppPathToken.NormalizeAppRule(token));
+    }
+
+    [Theory]
+    [InlineData(@"Z:\Tools\Vendor\app-1.2.3\", @"app:dir=Z:\Tools\Vendor\")]
+    [InlineData(@"Z:\Tools\Vendor\v1.2.3", @"app:dir=Z:\Tools\Vendor\")]
+    [InlineData(@"Z:\Tools\Vendor", @"app:dir=Z:\Tools\Vendor\")]
+    [InlineData(@"Z:\WindowsApps\123.Messaging_2.0.0.0_x64__cv1g1gvanyjgm", "app:pkg=123.Messaging_cv1g1gvanyjgm")]
+    public void ADiscoveredAppUsesAVersionIndependentRule(string directory, string expected)
+    {
+        Assert.Equal(expected, AppPathToken.RuleForDiscoveredDirectory(directory));
+    }
+
+    [Theory]
+    [InlineData("%USERPROFILE%")]
+    [InlineData("%LOCALAPPDATA%")]
+    [InlineData("%APPDATA%")]
+    [InlineData("%PROGRAMDATA%")]
+    [InlineData("%PROGRAMFILES%")]
+    [InlineData("%PROGRAMFILES(X86)%")]
+    [InlineData("%SYSTEMROOT%")]
+    public void NormalizeAppRule_UsesOneTrailingSeparatorForKnownDirectoryRoots(string token)
+    {
+        var root = AppPathToken.Expand(token).First().TrimEnd('\\', '/');
+        var expected = "app:dir=" + token + "\\";
+
+        foreach (var path in new[] { root, root + "\\", root + "\\\\", token, token + "\\" })
+        {
+            Assert.Equal(expected, AppPathToken.NormalizeAppRule("app:dir=" + path));
+        }
+    }
+
+    [Fact]
+    public void NormalizeAppRule_ExpandsAnyDirectoryVariableBeforeAddingTheSeparator()
+    {
+        var name = $"AMNEZIAGEO_PATH_TEST_{Guid.NewGuid():N}";
+        const string folder = @"Z:\Games\Example";
+        Environment.SetEnvironmentVariable(name, folder + "\\");
+
+        try
+        {
+            Assert.Equal("app:dir=" + folder + "\\", AppPathToken.NormalizeAppRule($"app:dir=%{name}%"));
+            Assert.Equal("app:path=" + folder + "\\app.exe", AppPathToken.NormalizeAppRule($"app:path=%{name}%\\app.exe"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(name, null);
+        }
+    }
+
+    [Theory]
+    [InlineData(@"%USERPROFILE%\AppData\Local", "%LOCALAPPDATA%")]
+    [InlineData(@"%userprofile%\appdata\local\", "%LOCALAPPDATA%")]
+    [InlineData(@"%USERPROFILE%\AppData\Roaming", "%APPDATA%")]
+    [InlineData(@"%USERPROFILE%\AppData\Roaming\", "%APPDATA%")]
+    [InlineData(@"%USERPROFILE%\AppData\Local\Vendor\app.exe", @"%LOCALAPPDATA%\Vendor\app.exe")]
+    [InlineData(@"%USERPROFILE%\AppData\Roaming\Vendor\app.exe", @"%APPDATA%\Vendor\app.exe")]
+    [InlineData(@"%USERPROFILE%\AppData\LocalLow", @"%USERPROFILE%\AppData\LocalLow")]
+    [InlineData(@"%USERPROFILE%\AppData\RoamingBackup", @"%USERPROFILE%\AppData\RoamingBackup")]
+    public void Tokenize_NormalizesLegacyProfileAppDataPaths(string path, string expected)
+    {
+        Assert.Equal(expected, AppPathToken.Tokenize(path));
     }
 
     [Theory]

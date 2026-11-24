@@ -82,7 +82,7 @@ internal static class InstalledPrograms
                 }
                 else if (folder is { Length: > 0 })
                 {
-                    programs.Add(new NamedApp(display.Trim(), string.Empty, string.Empty, "dir=" + folder));
+                    programs.Add(new NamedApp(display.Trim(), string.Empty, string.Empty, AppPathToken.RuleForDiscoveredDirectory(folder)["app:".Length..]));
                 }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)

@@ -126,6 +126,11 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     private LinkWatch? _links;
     private int _linksDue;
     private readonly TunnelWatch _watch = new(GoneRaises, GoneWindowMs);
+    private readonly VpnConnectPreparation _connectPreparation = new();
+    private PendingLaunch? _pendingLaunch;
+
+    private sealed record PendingLaunch(string Id, string Config, bool PlanAttributed, string DownNotice,
+        WsEndpoint? Front, bool RestartRequired);
     private readonly Handler _ticks = new(Looper.MainLooper!);
 
     // Когда голова собирала снимок по показанию связи.
@@ -212,6 +217,8 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     /// The in-process agent instance.
     /// </summary>
     public static AndroidAgentConnection? Current { get; private set; }
+
+    internal static event Action? ConnectionActivityChanged;
 
     /// <summary>
     /// Latest snapshot pushed to the listeners.
@@ -665,134 +672,259 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
     }
 
-    private async Task<IpcAck> SetConnectionAsync(string desired)
+    private Task<IpcAck> SetConnectionAsync(string desired) => desired == "disconnect"
+        ? Task.FromResult(_connectPreparation.Disconnect(DisconnectTunnel).Ack)
+        : QueueConnectAsync();
+
+    private Task<IpcAck> QueueConnectAsync(long? afterDisconnect = null)
     {
-        if (desired == "disconnect")
+        var restartRequired = false;
+        return _connectPreparation.RunAsync(ct =>
         {
-            _dialWanted = false;
-            _frontHanded = false;
-            _raiseOwed = false;
-            _watch.Dropped();
-            Save();
-            _log.Info("agent", "disconnect requested");
+            restartRequired = _restartRequired;
+            return ConnectTunnelAsync(ct);
+        }, ex => ConnectStartFailed(restartRequired, ex), afterDisconnect);
+    }
 
-            // Stops through a broadcast: a head in the background is barred from starting the service.
-            if (VpnBridge.IsRunning(Application.Context))
-            {
-                VpnBridge.RequestStop(Application.Context);
-            }
-            else
-            {
-                // The tunnel is not there to drop the session it left on the disk.
-                VpnBridge.ClearRequest();
-                OnVpnStateChanged(VpnStage.Disconnected, null);
-            }
-
-            return Ok();
+    private IpcAck DisconnectTunnel()
+    {
+        if (!RevokePendingLaunch())
+        {
+            return new IpcAck(false, "could not revoke the pending VPN launch");
         }
 
-        // Two different refusals: nothing to connect to, and a selection whose config is gone.
-        if (_selectedTarget is not { Length: > 0 })
+        ClearDialIntent();
+        Save();
+        _log.Info("agent", "disconnect requested");
+
+        // Revocation and promotion compete for one file. If promotion won, stop that committed session only.
+        var committed = VpnBridge.ReadRequest();
+        if (VpnBridge.IsRunning(Application.Context) && (committed is not null || _boundStatus == ConnectionStatus.Connected))
         {
-            SetConnectFailure(nameof(ConnectFailureReason.NoTargetSelected), string.Empty);
-            _log.Error("agent", "connect refused: no configuration selected");
+            VpnBridge.RequestStop(Application.Context, committed?.SessionId ?? string.Empty);
+        }
+        else
+        {
+            VpnBridge.ClearRequest();
+            OnVpnStateChanged(VpnStage.Disconnected, null);
+        }
+
+        return Ok();
+    }
+
+    private bool RevokePendingLaunch()
+    {
+        if (_pendingLaunch is not { } launch)
+        {
+            return true;
+        }
+
+        if (!VpnBridge.DropStagedRequest(launch.Id))
+        {
+            return false;
+        }
+
+        _pendingLaunch = null;
+        _log.Info("agent", "[FIX] revoked the pending VPN launch");
+        return true;
+    }
+
+    private async Task<IpcAck> ConnectTunnelAsync(CancellationToken ct)
+    {
+        IpcAck Refuse(ConnectFailureReason reason, string detail, string message) => _connectPreparation.Apply(() =>
+        {
+            SetConnectFailure(reason.ToString(), detail);
+            _log.Warn("agent", "connect refused: " + message);
             PushSnapshot();
-            return new IpcAck(false, "nothing selected");
+            return new IpcAck(false, message);
+        }, ct);
+
+        if (_selectedTarget is not { Length: > 0 } configName)
+        {
+            return Refuse(ConnectFailureReason.NoTargetSelected, string.Empty, "nothing selected");
         }
 
-        var configName = _selectedTarget;
         if (!_configs.TryGetValue(configName, out var configText))
         {
-            SetConnectFailure(nameof(ConnectFailureReason.ConfigMissing), configName);
-            _log.Error("agent", $"connect refused: configuration '{configName}' is gone");
-            PushSnapshot();
-            return new IpcAck(false, $"configuration '{configName}' not found");
+            return Refuse(ConnectFailureReason.ConfigMissing, configName, $"configuration '{configName}' not found");
         }
 
-        var granted = await EnsureVpnPermissionAsync();
-        if (!granted)
+        if (!await EnsureVpnPermissionAsync())
         {
-            SetConnectFailure(nameof(ConnectFailureReason.PermissionDenied), string.Empty);
-            _log.Warn("agent", "connect refused: vpn permission denied");
-            PushSnapshot();
-            return new IpcAck(false, "vpn permission denied");
+            return Refuse(ConnectFailureReason.PermissionDenied, string.Empty, "vpn permission denied");
         }
 
-        // A tunnel connected on another configuration stays until the server of this one answers.
-        var live = _active && VpnBridge.IsRunning(Application.Context);
-        var standing = SwitchGuard.Standing(live, _boundStatus, _boundTarget, configName);
-        var restart = _restartRequired;
-        _raiseOwed = false;
-        ClearConnectFailure();
-        _retryAttempt = 0;
-        _restartRequired = false;
-        _dialWanted = true;
-        _frontHanded = false;
-        _watch.Asked(live);
-        Save();
-        // Reports the connecting stage from the request: the tunnel process speaks only once it is up, and until
-        // then a snapshot would pull the card back to disconnected.
-        _active = true;
-        _boundStatus = ConnectionStatus.Connecting;
-        _boundTarget = _selectedTarget;
-        PushSnapshot();
+        var (standing, restart) = _connectPreparation.Apply(() =>
+        {
+            // A tunnel connected on another configuration stays until the server of this one answers.
+            var live = _active && VpnBridge.IsRunning(Application.Context);
+            var previous = SwitchGuard.Standing(live, _boundStatus, _boundTarget, configName);
+            var restartRequired = _restartRequired;
+            _raiseOwed = false;
+            ClearConnectFailure();
+            _retryAttempt = 0;
+            _restartRequired = false;
+            _dialWanted = true;
+            _frontHanded = false;
+            _watch.Asked(live);
+            Save();
+            _active = true;
+            _boundStatus = ConnectionStatus.Connecting;
+            _boundTarget = configName;
+            PushSnapshot();
+            return (previous, restartRequired);
+        }, ct);
 
-        // The server is asked what it offers before the plan and the tunnel take its word.
-        var offer = await _offers.BeforeConnectAsync(configName, configText, OfferChangedAsync, CancellationToken.None).ConfigureAwait(false);
+        var offer = await _offers.BeforeConnectAsync(configName, configText, OfferChangedAsync, ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
         await RefreshOffersAsync().ConfigureAwait(false);
 
         // A list the server put in use joins the plan of this connect, and the lists it handed out show at once.
+        ct.ThrowIfCancellationRequested();
         if (await TakeStorePickAsync().ConfigureAwait(false))
         {
-            _restartRequired = false;
+            _connectPreparation.Apply(() => _restartRequired = false, ct);
         }
 
         await KeepServerListsAsync(configName).ConfigureAwait(false);
-
         await RefreshRoutingSummariesAsync().ConfigureAwait(false);
         await RefreshGeoSourcesAsync().ConfigureAwait(false);
-        if (standing is not null && SwitchGuard.Keeps(await AskedAsync(configName, configText).ConfigureAwait(false)))
+        ct.ThrowIfCancellationRequested();
+        if (standing is not null && SwitchGuard.Keeps(await AskedAsync(configName, configText, ct).ConfigureAwait(false)))
         {
-            return Kept(configName, standing, restart);
+            return _connectPreparation.Apply(() => Kept(configName, standing, restart), ct);
         }
 
-        var useRouter = RouterEnabled();
+        var transport = _transports.GetValueOrDefault(configName);
+        var listId = ConfigRouting.Allowed(transport) ? _selectedRoutingList : null;
+        var useRouter = transport?.UseRouter != false;
 
         // Правила разворачиваются в пуле: агент живёт в процессе UI, и план большого списка держит поток.
         var planStarted = System.Environment.TickCount64;
-        var session = await Task.Run(() => RaiseSessionPlanAsync(useRouter)).ConfigureAwait(false);
-
-        _log.Info("agent", $"connect requested: config '{_selectedTarget}', app rules {AppRulesLine(session.Mode, session.Packages.Length, AttributedNow())}"
-            + $"{BypassLine(session.Bypass.Length)}, plan {(session.Rebuilt ? "ready" : "unchanged")} in {System.Environment.TickCount64 - planStarted} ms");
+        var session = await Task.Run(() => PrepareSessionPlanAsync(useRouter, listId), ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
         var words = await NoticeWordsAsync().ConfigureAwait(false);
-        _downNotice = DownKey(configName, words);
+        var dns = await _store.GetConfigDnsAsync(configName, ct).ConfigureAwait(false);
+        var vpnDns = VpnDns.Pick(dns, offer.Dns(), WgConfigEditor.GetDns(configText), Beside(true));
         var front = Front(configName, configText);
-        _handedFront = front;
-        _frontHanded = true;
-        StartService(GeoVpnService.ActionConnect, configText, _selectedTarget,
+        var signal = TunnelSignal.Of(offer, configText, transport?.UseIpv6 == true, transport?.AllowSignal != false);
+        var request = new VpnRequest(configText, configName,
             session.Mode == "off" ? null : session.Mode, session.Mode == "off" ? null : session.Packages,
-            _transports.GetValueOrDefault(configName), front, foreground: true, EngineLogLevel(_logLevel), _directTcp,
-            _excludeRoutes, session.Bypass, _localInTunnel, JsonSerializer.Serialize(words),
-            TunnelSignal.Of(offer, configText, _transports.GetValueOrDefault(configName)?.UseIpv6 == true, _transports.GetValueOrDefault(configName)?.AllowSignal != false),
-            [.. _geoSources.Select(source => source.Url), LinkCause.UpdateBase],
-            VpnDns.Pick(await _store.GetConfigDnsAsync(configName).ConfigureAwait(false), offer.Dns(), WgConfigEditor.GetDns(configText), Beside(true)));
-        return new IpcAck(true, "connecting");
+            transport?.Mtu ?? 0, transport?.UseIpv6 == true, front?.Address(), front?.Port ?? 0,
+            EngineLog: EngineLogLevel(_logLevel), MtuMode: (int)(transport?.MtuMode ?? default),
+            DirectTcp: _directTcp, ExcludeRoutes: _excludeRoutes, BypassApps: session.Bypass,
+            LocalInTunnel: _localInTunnel, WsOffered: front?.Offered == true, Notice: words,
+            SignalPort: signal?.Port ?? 0, SignalFrom: signal is null ? null : [.. signal.Sources],
+            Bases: [.. _geoSources.Select(source => source.Url), LinkCause.UpdateBase],
+            HoldTraffic: transport?.HoldTraffic != false,
+            VpnDns: vpnDns is null ? null : [.. vpnDns.Servers], VpnDnsNetwork: vpnDns?.Network == true,
+            Plan: session.Plan, PlanStamp: session.Stamp);
+        ct.ThrowIfCancellationRequested();
+        var id = VpnBridge.StageRequest(request);
+        var delivery = new PendingLaunch(id, configName, session.Plan.TunnelApps.Count > 0,
+            DownKey(configName, words), front, restart);
+        var started = false;
+        try
+        {
+            return _connectPreparation.Apply(() =>
+            {
+                if (!string.Equals(configName, _selectedTarget, StringComparison.Ordinal))
+                {
+                    RestoreCancelledPreparation();
+                    return VpnConnectPreparation.Cancelled;
+                }
+
+                _log.Info("agent", $"connect requested: config '{configName}', app rules {AppRulesLine(session.Mode, session.Packages.Length, session.Plan.TunnelApps.Count > 0)}"
+                    + $"{BypassLine(session.Bypass.Length)}, plan {(session.Rebuilt ? "ready" : "unchanged")} in {System.Environment.TickCount64 - planStarted} ms");
+                if (!RevokePendingLaunch())
+                {
+                    throw new IOException("could not revoke the previous pending VPN launch");
+                }
+
+                StartService(id);
+                _pendingLaunch = delivery;
+                started = true;
+                return new IpcAck(true, "connecting");
+            }, ct);
+        }
+        finally
+        {
+            if (!started)
+            {
+                VpnBridge.DropStagedRequest(id);
+            }
+        }
+    }
+
+    private IpcAck ConnectStartFailed(bool restartRequired, Exception error)
+    {
+        var failedTarget = _boundTarget ?? _selectedTarget ?? string.Empty;
+        _log.Error("agent", "[FIX] preparing or starting the VPN failed", error);
+
+        ApplyConnectFailure(nameof(ConnectFailureReason.ServiceStartFailed), failedTarget, restartRequired);
+        return new IpcAck(false, "could not start vpn service");
+    }
+
+    private void ApplyConnectFailure(string reason, string config, bool restartRequired)
+    {
+        if (TryRestoreRunningTunnel())
+        {
+            _restartRequired = restartRequired;
+            SetConnectFailure(reason, config);
+            PushSnapshot();
+        }
+        else
+        {
+            ClearDialIntent();
+            Save();
+            OnVpnStateChanged(VpnStage.Failed, config, reason);
+        }
+    }
+
+    private void ClearDialIntent()
+    {
+        _dialWanted = false;
+        _frontHanded = false;
+        _raiseOwed = false;
+        _watch.Dropped();
+    }
+
+    private bool TryRestoreRunningTunnel()
+    {
+        if (!VpnBridge.IsRunning(Application.Context)
+            || VpnBridge.ReadStage() is not { Stage: VpnStage.Connected or VpnStage.Connecting } live)
+        {
+            return false;
+        }
+
+        _active = true;
+        _boundTarget = live.Detail;
+        _boundStatus = live.Stage == VpnStage.Connected ? ConnectionStatus.Connected : ConnectionStatus.Connecting;
+        _planAttributed = VpnBridge.ReadRequest()?.Plan?.TunnelApps.Count > 0;
+        _watch.Heard();
+        return true;
     }
 
     // Hands the server of a configuration to the tunnel, which dials it past itself, and waits for its word; a
     // tunnel that says nothing leaves the verdict unknown.
-    private async Task<string> AskedAsync(string name, string text)
+    private async Task<string> AskedAsync(string name, string text, CancellationToken ct)
     {
         var front = Front(name, text);
+        var id = Guid.NewGuid().ToString("N");
         VpnBridge.ClearSwitchResult();
-        VpnBridge.WriteSwitch(new SwitchRequest(text, name, front?.Address(), front?.Port ?? 0, front?.Offered ?? false, EngineLogLevel(_logLevel)));
-        VpnBridge.RequestSwitch(Application.Context);
-        var said = await SwitchGuard
-            .AwaitAsync(VpnBridge.ReadSwitchResult, SwitchWaitMs, ProbePollMs, pause => Task.Delay(pause))
-            .ConfigureAwait(false);
-        VpnBridge.ClearSwitchResult();
-        VpnBridge.ClearSwitch();
-        return said;
+        VpnBridge.WriteSwitch(new SwitchRequest(text, name, front?.Address(), front?.Port ?? 0, front?.Offered ?? false, EngineLogLevel(_logLevel), id));
+        try
+        {
+            VpnBridge.RequestSwitch(Application.Context);
+            return await SwitchGuard
+                .AwaitAsync(() => VpnBridge.ReadSwitchResult(id), SwitchWaitMs, ProbePollMs, pause => Task.Delay(pause, ct))
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            VpnBridge.ClearSwitchResult();
+            VpnBridge.ClearSwitch();
+        }
     }
 
     // Puts the head back on the configuration the tunnel stands on: the server of the one asked for kept silent.
@@ -845,80 +977,18 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         };
     }
 
-    private static void StartService(string action, string? config, string? name, string? appMode, string[]? appPkgs, ConfigTransport? transport, WsEndpoint? front, bool foreground, int engineLog = 1, bool directTcp = true, bool excludeRoutes = false, string[]? bypassPkgs = null, bool localInTunnel = false, string? notice = null, SignalPlace? signal = null, string[]? bases = null, VpnDnsPick? vpnDns = null)
+    private static void StartService(string sessionId)
     {
         var context = Application.Context;
-        var intent = new Intent(context, typeof(GeoVpnService));
-        intent.SetAction(action);
-        if (config is not null)
+        using var intent = new Intent(context, typeof(GeoVpnService));
+        intent.SetAction(GeoVpnService.ActionConnect);
+        intent.PutExtra(GeoVpnService.ExtraSessionId, sessionId);
+        using var service = OperatingSystem.IsAndroidVersionAtLeast(26)
+            ? context.StartForegroundService(intent)
+            : context.StartService(intent);
+        if (service is null)
         {
-            intent.PutExtra(GeoVpnService.ExtraConfig, config);
-        }
-
-        if (name is not null)
-        {
-            intent.PutExtra(GeoVpnService.ExtraName, name);
-        }
-
-        if (appMode is not null && appPkgs is { Length: > 0 })
-        {
-            intent.PutExtra(GeoVpnService.ExtraAppMode, appMode);
-            intent.PutExtra(GeoVpnService.ExtraAppList, appPkgs);
-        }
-
-        if (bypassPkgs is { Length: > 0 })
-        {
-            intent.PutExtra(GeoVpnService.ExtraBypassApps, bypassPkgs);
-        }
-
-        intent.PutExtra(GeoVpnService.ExtraEngineLog, engineLog);
-        intent.PutExtra(GeoVpnService.ExtraDirectTcp, directTcp);
-        intent.PutExtra(GeoVpnService.ExtraExcludeRoutes, excludeRoutes);
-        intent.PutExtra(GeoVpnService.ExtraLocalInTunnel, localInTunnel);
-        if (notice is not null)
-        {
-            intent.PutExtra(GeoVpnService.ExtraNotice, notice);
-        }
-
-        if (signal is not null)
-        {
-            intent.PutExtra(GeoVpnService.ExtraSignalPort, signal.Port);
-            intent.PutExtra(GeoVpnService.ExtraSignalFrom, [.. signal.Sources]);
-        }
-
-        if (bases is { Length: > 0 })
-        {
-            intent.PutExtra(GeoVpnService.ExtraBases, bases);
-        }
-
-        if (vpnDns is not null)
-        {
-            intent.PutExtra(GeoVpnService.ExtraVpnDns, [.. vpnDns.Servers]);
-            intent.PutExtra(GeoVpnService.ExtraVpnDnsNetwork, vpnDns.Network);
-        }
-
-        if (transport is not null)
-        {
-            intent.PutExtra(GeoVpnService.ExtraMtu, transport.Mtu);
-            intent.PutExtra(GeoVpnService.ExtraMtuMode, (int)transport.MtuMode);
-            intent.PutExtra(GeoVpnService.ExtraIpv6, transport.UseIpv6);
-            intent.PutExtra(GeoVpnService.ExtraHoldTraffic, transport.HoldTraffic);
-        }
-
-        if (front is { } carried)
-        {
-            intent.PutExtra(GeoVpnService.ExtraWsHost, carried.Address());
-            intent.PutExtra(GeoVpnService.ExtraWsPort, carried.Port);
-            intent.PutExtra(GeoVpnService.ExtraWsOffered, carried.Offered);
-        }
-
-        if (foreground && Build.VERSION.SdkInt >= BuildVersionCodes.O)
-        {
-            context.StartForegroundService(intent);
-        }
-        else
-        {
-            context.StartService(intent);
+            throw new InvalidOperationException("Android did not start the VPN service");
         }
     }
 
@@ -1035,9 +1105,9 @@ internal sealed class AndroidAgentConnection : IAgentConnection
 
     // Reads what is running: the tunnel lives in another process and can be gone without a word, so the window
     // asks again whenever it comes up.
-    private void SyncTunnelState()
+    private void SyncTunnelState() => _connectPreparation.Apply(() =>
     {
-        if (_disposed)
+        if (_disposed || _connectPreparation.IsPending || _pendingLaunch is not null)
         {
             return;
         }
@@ -1064,7 +1134,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             _log.Note("agent", "the window is back on the screen; the session that went with the tunnel process is raised again");
             _ = SetConnectionAsync("connect");
         }
-    }
+    });
 
     // Looks at the tunnel process and comes back after the pause.
     private void WatchTick()
@@ -1129,8 +1199,13 @@ internal sealed class AndroidAgentConnection : IAgentConnection
 
     // Takes a session whose tunnel process is gone: raised again while the window is on the screen, shown as down
     // otherwise.
-    private bool LookAtTunnel()
+    private bool LookAtTunnel() => _connectPreparation.Apply(() =>
     {
+        if (_connectPreparation.IsPending)
+        {
+            return false;
+        }
+
         var active = _active;
         var step = _watch.Look(active, VpnBridge.IsRunning(Application.Context), active && StillWanted(), MainActivity.Shown,
             System.Environment.TickCount64);
@@ -1154,7 +1229,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         return true;
-    }
+    });
 
     // Whether the session that stood is still asked for: nobody took it down and the tunnel did not close it itself.
     private bool StillWanted() =>
@@ -1240,19 +1315,58 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         var stage = intent.GetIntExtra(VpnBridge.ExtraStage, -1);
-        if (stage >= 0)
+        var launchId = intent.GetStringExtra(VpnBridge.ExtraLaunchId);
+        if (stage >= 0 || launchId is not null)
         {
-            if ((VpnStage)stage is VpnStage.Connecting or VpnStage.Connected)
+            _connectPreparation.Apply(() => TakeTunnelEvent(stage, launchId, intent));
+        }
+    }
+
+    private void TakeTunnelEvent(int stageValue, string? launchId, Intent intent)
+    {
+        var reason = intent.GetStringExtra(VpnBridge.ExtraReason);
+        if (_pendingLaunch is { } launch)
+        {
+            // A reply for a revoked launch, or a stage from the previous tunnel, cannot settle this launch.
+            if (launch.Id != launchId)
             {
-                _watch.Heard();
+                return;
             }
 
-            _alwaysOn = intent.GetBooleanExtra(VpnBridge.ExtraAlwaysOn, false);
-            _alwaysOnLockdown = intent.GetBooleanExtra(VpnBridge.ExtraLockdown, false);
-            Heard((VpnStage)stage);
-            OnVpnStateChanged((VpnStage)stage, intent.GetStringExtra(VpnBridge.ExtraDetail),
-                intent.GetStringExtra(VpnBridge.ExtraReason), intent.GetIntExtra(VpnBridge.ExtraRetry, 0));
+            _pendingLaunch = null;
+            if (stageValue < 0)
+            {
+                ApplyConnectFailure(reason ?? nameof(ConnectFailureReason.ServiceStartFailed), launch.Config, launch.RestartRequired);
+                return;
+            }
+
+            _planAttributed = launch.PlanAttributed;
+            _downNotice = launch.DownNotice;
+            _handedFront = launch.Front;
+            _frontHanded = true;
         }
+        else if (launchId is not null && (!_dialWanted || _connectPreparation.IsPending
+            || VpnBridge.ReadRequest()?.SessionId != launchId))
+        {
+            return;
+        }
+
+        if (stageValue < 0)
+        {
+            return;
+        }
+
+        var stage = (VpnStage)stageValue;
+        if (stage is VpnStage.Connecting or VpnStage.Connected)
+        {
+            _watch.Heard();
+        }
+
+        _alwaysOn = intent.GetBooleanExtra(VpnBridge.ExtraAlwaysOn, false);
+        _alwaysOnLockdown = intent.GetBooleanExtra(VpnBridge.ExtraLockdown, false);
+        Heard(stage);
+        OnVpnStateChanged(stage, intent.GetStringExtra(VpnBridge.ExtraDetail),
+            reason, intent.GetIntExtra(VpnBridge.ExtraRetry, 0));
     }
 
     private void OnVpnStateChanged(VpnStage stage, string? detail, string? reason = null, int retry = 0)
@@ -1477,6 +1591,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         LogProxyOffer(proxy.Running, reach);
         var (updateSources, updateSource) = _updater.Sources();
 
+        var activeChanged = Latest?.Active != _active;
         Latest = new StatusSnapshot(
             AgentVersion: AppVersion,
             BoundTarget: _boundTarget,
@@ -1543,6 +1658,10 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             FoundApps: _appFinds);
 
         SnapshotReceived?.Invoke(Latest);
+        if (activeChanged)
+        {
+            ConnectionActivityChanged?.Invoke();
+        }
     }
 
     // Where the proxy answers. Named from the moment it is switched on: the screen that offers it is where the
@@ -3305,30 +3424,25 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         return Ok();
     }
 
-    // The plan the session routes by stays on disk while the list, its settings and the session around it hold:
-    // unfolding a large list costs seconds, and a switch back to a list already seen would pay them again.
-    private async Task<(string Mode, string[] Packages, string[] Bypass, bool Rebuilt)> RaiseSessionPlanAsync(bool useRouter)
+    // Reuse only the plan committed together with the request that owns it.
+    private async Task<(string Mode, string[] Packages, string[] Bypass, GeoRoutingPlan Plan, string Stamp, bool Rebuilt)>
+        PrepareSessionPlanAsync(bool useRouter, long? listId)
     {
         await EnsureInitAsync().ConfigureAwait(false);
-        var stamp = AppFinds.ExpandStamp(await ReadListStampAsync().ConfigureAwait(false), _appFinds);
-        var settings = await ReadListSettingsAsync().ConfigureAwait(false);
+        var stamp = AppFinds.ExpandStamp(listId is { } id
+            ? await _store.GetRoutingListStampAsync(id).ConfigureAwait(false) : null, _appFinds);
+        var settings = listId is { } settingsId
+            ? await _store.GetRoutingSettingsAsync(settingsId).ConfigureAwait(false) : null;
         var split = AppSplit(stamp, settings, useRouter);
         var mark = RoutingPlanStamp.Of(stamp, settings, InboundRanges(), useRouter, PerAppSupported, _routeTtl, _splitLimit);
-        if (VpnBridge.PlanExists() && string.Equals(VpnBridge.ReadPlanStamp(), mark, StringComparison.Ordinal))
+        if (VpnBridge.ReadRequest() is { Plan: { } held, PlanStamp: { } heldStamp }
+            && string.Equals(heldStamp, mark, StringComparison.Ordinal))
         {
-            _planAttributed ??= VpnBridge.ReadPlan().TunnelApps.Count > 0;
-            return (split.Mode, split.Packages, split.Bypass, false);
+            return (split.Mode, split.Packages, split.Bypass, held, mark, false);
         }
 
-        VpnBridge.WritePlanStamp(string.Empty);
-        var plan = await BuildPlanAsync(useRouter).ConfigureAwait(false);
-        _planAttributed = plan.TunnelApps.Count > 0;
-        if (VpnBridge.WritePlan(plan))
-        {
-            VpnBridge.WritePlanStamp(mark);
-        }
-
-        return (split.Mode, split.Packages, split.Bypass, true);
+        var plan = await BuildPlanAsync(useRouter, listId).ConfigureAwait(false);
+        return (split.Mode, split.Packages, split.Bypass, plan, mark, true);
     }
 
     // Выбранный список, если выбранная конфигурация его берёт.
@@ -3337,14 +3451,6 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         && !ConfigRouting.Allowed(_transports.GetValueOrDefault(name))
             ? null
             : _selectedRoutingList;
-
-    // Поколение и правила выбранного списка, без развёрнутых корзин.
-    private async Task<RoutingListStamp?> ReadListStampAsync() =>
-        RoutedList is { } listId ? await _store.GetRoutingListStampAsync(listId).ConfigureAwait(false) : null;
-
-    // Настройки движения выбранного списка.
-    private async Task<RoutingSettings?> ReadListSettingsAsync() =>
-        RoutedList is { } listId ? await _store.GetRoutingSettingsAsync(listId).ConfigureAwait(false) : null;
 
     // Соединение приписывается своему владельцу начиная с Android 10.
     private static bool PerAppSupported => Build.VERSION.SdkInt >= BuildVersionCodes.Q;
@@ -3373,9 +3479,9 @@ internal sealed class AndroidAgentConnection : IAgentConnection
 
     // The rules the session routes by. Addresses stay ranges and names stay names: a name resolved to a fresh
     // address keeps its verdict, which a set of host routes fixed at connect never could.
-    private async Task<GeoRoutingPlan> BuildPlanAsync(bool useRouter)
+    private async Task<GeoRoutingPlan> BuildPlanAsync(bool useRouter, long? routedList)
     {
-        if (RoutedList is not { } listId)
+        if (routedList is not { } listId)
         {
             return GeoRoutingPlan.Full with { UseRouter = useRouter };
         }
@@ -4476,8 +4582,8 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         return Ok();
     }
 
-    // Binds the next connect to a config; an empty name leaves none selected.
-    private async Task<IpcAck> SelectConfigAsync(IReadOnlyList<string> args)
+    // A new selection invalidates preparation before it can hand its old request to the service.
+    private Task<IpcAck> SelectConfigAsync(IReadOnlyList<string> args) => Task.FromResult(_connectPreparation.Apply(() =>
     {
         var name = args.Count > 0 && args[0].Length > 0 ? args[0] : null;
         if (name is not null && !_configs.ContainsKey(name))
@@ -4485,17 +4591,53 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             return Fail();
         }
 
-        // Nothing selected leaves nothing to run: the tunnel bound to the old target goes down with it.
-        if (name is null && _active)
+        if (string.Equals(_selectedTarget, name, StringComparison.Ordinal)
+            && (name is not null || (!_active && !_connectPreparation.IsPending && _pendingLaunch is null)))
         {
-            await SetConnectionAsync("disconnect").ConfigureAwait(false);
+            return Ok();
+        }
+
+        var preparing = _connectPreparation.IsPending || _pendingLaunch is not null;
+        if (!RevokePendingLaunch())
+        {
+            return new IpcAck(false, "could not revoke the pending VPN launch");
         }
 
         Journal(SwitchLog.Config(_selectedTarget, name));
         _selectedTarget = name;
-        Save();
-        PushSnapshot();
+
+        if (name is null)
+        {
+            return _connectPreparation.Disconnect(DisconnectTunnel).Ack;
+        }
+
+        _connectPreparation.Invalidate();
+        if (preparing)
+        {
+            _log.Info("agent", "[FIX] the VPN preparation was cancelled after the selected configuration changed");
+            RestoreCancelledPreparation();
+        }
+        else
+        {
+            Save();
+            PushSnapshot();
+        }
+
         return Ok();
+    }));
+
+    private void RestoreCancelledPreparation()
+    {
+        if (TryRestoreRunningTunnel())
+        {
+            Save();
+            PushSnapshot();
+            return;
+        }
+
+        ClearDialIntent();
+        Save();
+        OnVpnStateChanged(VpnStage.Disconnected, null);
     }
 
     // Keeps a switchover in the log whatever the capture floor is.
@@ -4677,13 +4819,20 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     // Движок читает конфигурацию на старте: новый текст встаёт только на поднятом заново туннеле.
     private async Task RestartTunnelAsync()
     {
-        await SetConnectionAsync("disconnect").ConfigureAwait(false);
+        var generation = _connectPreparation.Apply<long?>(() => _dialWanted
+            ? _connectPreparation.Disconnect(DisconnectTunnel).Generation
+            : null);
+        if (generation is null)
+        {
+            return;
+        }
+
         for (var attempt = 0; attempt < RestartWaitTicks && _active; attempt++)
         {
             await Task.Delay(RestartTickMs).ConfigureAwait(false);
         }
 
-        await SetConnectionAsync("connect").ConfigureAwait(false);
+        await QueueConnectAsync(generation).ConfigureAwait(false);
     }
 
     private SubscriptionService Subscriptions()

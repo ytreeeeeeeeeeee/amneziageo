@@ -1,3 +1,5 @@
+using AmneziaGeo.Ipc;
+
 namespace AmneziaGeo.Linux.App;
 
 /// <summary>
@@ -37,7 +39,7 @@ internal sealed class AppImages
             var equals = token.IndexOf('=');
             if (equals <= 0)
             {
-                images._paths.Add(token);
+                images.AddPath(token, directory: false);
                 continue;
             }
 
@@ -51,10 +53,10 @@ internal sealed class AppImages
             switch (kind)
             {
                 case "path":
-                    images._paths.Add(value);
+                    images.AddPath(value, directory: false);
                     break;
                 case "dir":
-                    images._directories.Add(value.TrimEnd('/') + '/');
+                    images.AddPath(value, directory: true);
                     break;
                 case "name":
                     images._names.Add(value);
@@ -67,6 +69,24 @@ internal sealed class AppImages
         }
 
         return images;
+    }
+
+    private void AddPath(string value, bool directory)
+    {
+        var path = LinuxAppPath.Resolve(value);
+        if (OwnAppRule.NamesLinuxPath(value, path))
+        {
+            return;
+        }
+
+        if (directory)
+        {
+            _directories.Add(path.TrimEnd('/') + '/');
+        }
+        else
+        {
+            _paths.Add(path);
+        }
     }
 
     /// <summary>

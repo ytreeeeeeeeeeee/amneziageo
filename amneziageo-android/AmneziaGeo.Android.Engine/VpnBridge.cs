@@ -10,34 +10,6 @@ using AmneziaGeo.Routing;
 namespace AmneziaGeo.Android.Engine;
 
 /// <summary>
-/// Session the tunnel raises when no head asks for it: the system starts an always-on tunnel with a bare intent,
-/// and a tunnel the system killed comes back the same way.
-/// </summary>
-public sealed record VpnRequest(
-    string Config,
-    string Name,
-    string? AppMode,
-    string[]? AppList,
-    int Mtu,
-    bool Ipv6,
-    string? WsHost,
-    int WsPort,
-    int EngineLog = 1,
-    int MtuMode = 0,
-    bool DirectTcp = true,
-    bool ExcludeRoutes = false,
-    string[]? BypassApps = null,
-    bool LocalInTunnel = false,
-    bool WsOffered = false,
-    NoticeWords? Notice = null,
-    int SignalPort = 0,
-    string[]? SignalFrom = null,
-    string[]? Bases = null,
-    bool HoldTraffic = true,
-    string[]? VpnDns = null,
-    bool VpnDnsNetwork = false);
-
-/// <summary>
 /// One probe the head hands to the tunnel: a socket is excused from the tunnel only inside the process that
 /// owns it, so the run happens there and its payload comes back through a file.
 /// </summary>
@@ -52,7 +24,7 @@ public sealed record CardsRequest(IReadOnlyList<SweepServer> Servers, bool Carri
 /// The configuration the head wants the tunnel to move to while another one is connected. The tunnel asks its
 /// server first: only the process of the tunnel dials past the tunnel.
 /// </summary>
-public sealed record SwitchRequest(string Config, string Name, string? WsHost, int WsPort, bool WsOffered, int EngineLog = 1);
+public sealed record SwitchRequest(string Config, string Name, string? WsHost, int WsPort, bool WsOffered, int EngineLog = 1, string? Id = null);
 
 /// <summary>
 /// Carries the routing rules and the tunnel stage between the head and the tunnel, which run in separate
@@ -79,6 +51,8 @@ public static class VpnBridge
     /// Stage extra, a <see cref="VpnStage"/> value.
     /// </summary>
     public const string ExtraStage = "stage";
+
+    public const string ExtraLaunchId = "launch-id";
 
     /// <summary>
     /// Session name or failure reason extra.
@@ -216,11 +190,9 @@ public static class VpnBridge
     public const string ExtraNowRun = "nowrun";
 
     private const string PlanFile = "plan.json";
-    private const string PlanStampFile = "plan-stamp.txt";
     private const string ProxyFile = "proxy.json";
     private const string ProxyStateFile = "proxy-state.json";
     private const string SessionsFile = "sessions.txt";
-    private const string RequestFile = "session.json";
     private const string ProbeFile = "probe.json";
     private const string RouteTtlFile = "route-ttl.txt";
     private const string ProbeResultFile = "probe-result.txt";
@@ -246,10 +218,15 @@ public static class VpnBridge
     /// Reports a stage to the head.
     /// </summary>
     public static void Publish(Context context, VpnStage stage, string? detail, string? reason = null,
-        bool alwaysOn = false, bool lockdown = false, int retry = 0)
+        bool alwaysOn = false, bool lockdown = false, int retry = 0, string? acceptedLaunchId = null)
     {
-        var intent = Broadcast(context, ActionEvent);
+        using var intent = Broadcast(context, ActionEvent);
         intent.PutExtra(ExtraStage, (int)stage);
+        if (acceptedLaunchId is not null)
+        {
+            intent.PutExtra(ExtraLaunchId, acceptedLaunchId);
+        }
+
         intent.PutExtra(ExtraAlwaysOn, alwaysOn);
         intent.PutExtra(ExtraLockdown, lockdown);
         intent.PutExtra(ExtraRetry, retry);
@@ -263,6 +240,14 @@ public static class VpnBridge
             intent.PutExtra(ExtraReason, reason);
         }
 
+        context.SendBroadcast(intent);
+    }
+
+    public static void RejectLaunch(Context context, string id, string reason)
+    {
+        using var intent = Broadcast(context, ActionEvent);
+        intent.PutExtra(ExtraLaunchId, id);
+        intent.PutExtra(ExtraReason, reason);
         context.SendBroadcast(intent);
     }
 
@@ -393,7 +378,16 @@ public static class VpnBridge
     /// <summary>
     /// Asks a running tunnel to stop; a service the head could start instead is barred from the background.
     /// </summary>
-    public static void RequestStop(Context context) => context.SendBroadcast(Broadcast(context, ActionStop));
+    public static void RequestStop(Context context, string? sessionId = null)
+    {
+        using var intent = Broadcast(context, ActionStop);
+        if (sessionId is not null)
+        {
+            intent.PutExtra(ExtraLaunchId, sessionId);
+        }
+
+        context.SendBroadcast(intent);
+    }
 
     /// <summary>
     /// Whether the tunnel process is alive; a tunnel the system has killed answers no query.
@@ -428,72 +422,8 @@ public static class VpnBridge
         }
     }
 
-    /// <summary>
-    /// Writes the rules the next session routes by; the lists are too large for a Binder transaction.
-    /// </summary>
-    public static bool WritePlan(GeoRoutingPlan plan)
-    {
-        try
-        {
-            using var stream = File.Create(PlanPath());
-            JsonSerializer.Serialize(stream, plan);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            global::Android.Util.Log.Warn("VpnBridge", "writing the routing plan failed: " + ex);
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Whether the rules of a session stand on disk.
-    /// </summary>
-    public static bool PlanExists() => File.Exists(PlanPath());
-
-    /// <summary>
-    /// Returns the stamp of the rules on disk, empty when there is none.
-    /// </summary>
-    public static string ReadPlanStamp()
-    {
-        try
-        {
-            var path = PlanStampPath();
-            return File.Exists(path) ? File.ReadAllText(path).Trim() : string.Empty;
-        }
-        catch (Exception ex)
-        {
-            global::Android.Util.Log.Warn("VpnBridge", "reading the routing plan stamp failed: " + ex);
-            return string.Empty;
-        }
-    }
-
-    /// <summary>
-    /// Stamps the rules on disk; an empty stamp drops the mark and the next session builds them again.
-    /// </summary>
-    public static void WritePlanStamp(string stamp)
-    {
-        try
-        {
-            var path = PlanStampPath();
-            if (stamp.Length == 0)
-            {
-                File.Delete(path);
-                return;
-            }
-
-            File.WriteAllText(path, stamp);
-        }
-        catch (Exception ex)
-        {
-            global::Android.Util.Log.Warn("VpnBridge", "writing the routing plan stamp failed: " + ex);
-        }
-    }
-
-    /// <summary>
-    /// Reads the rules written for this session, the whole tunnel when there are none.
-    /// </summary>
-    public static GeoRoutingPlan ReadPlan()
+    // Only saved requests created by older clients lack an embedded plan.
+    public static GeoRoutingPlan ReadLegacyPlan()
     {
         try
         {
@@ -508,8 +438,63 @@ public static class VpnBridge
         }
         catch (Exception ex)
         {
-            global::Android.Util.Log.Warn("VpnBridge", "reading the routing plan failed: " + ex);
+            global::Android.Util.Log.Warn("VpnBridge", "reading the legacy routing plan failed: " + ex);
             return GeoRoutingPlan.Full;
+        }
+    }
+
+    private static VpnSessionFiles SessionFiles() =>
+        new(Application.Context.FilesDir?.AbsolutePath ?? ".");
+
+    public static string StageRequest(VpnRequest request)
+    {
+        var files = SessionFiles();
+        try
+        {
+            files.Prune();
+        }
+        catch (IOException ex)
+        {
+            global::Android.Util.Log.Warn("VpnBridge", "cleaning up old staged VPN sessions failed: " + ex);
+        }
+
+        return files.Stage(request);
+    }
+
+    public static VpnRequest? ReadStagedRequest(string id)
+    {
+        try
+        {
+            return SessionFiles().ReadStaged(id);
+        }
+        catch (Exception ex)
+        {
+            global::Android.Util.Log.Warn("VpnBridge", "reading the staged VPN session failed: " + ex);
+            return null;
+        }
+    }
+
+    private static readonly object _sessionGate = new();
+
+    public static bool TryPromoteRequest(string id)
+    {
+        lock (_sessionGate)
+        {
+            return SessionFiles().TryPromote(id);
+        }
+    }
+
+    public static bool DropStagedRequest(string id)
+    {
+        try
+        {
+            SessionFiles().Drop(id);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            global::Android.Util.Log.Warn("VpnBridge", "dropping the staged VPN session failed: " + ex);
+            return false;
         }
     }
 
@@ -520,12 +505,40 @@ public static class VpnBridge
     {
         try
         {
-            using var stream = File.Create(RequestPath());
-            JsonSerializer.Serialize(stream, request);
+            lock (_sessionGate)
+            {
+                SessionFiles().Write(request);
+            }
         }
         catch (Exception ex)
         {
             global::Android.Util.Log.Warn("VpnBridge", "writing the session failed: " + ex);
+        }
+    }
+
+    internal static VpnRequest? UpdateRequest(VpnRequest observed, Func<VpnRequest, VpnRequest> update)
+    {
+        lock (_sessionGate)
+        {
+            try
+            {
+                var files = SessionFiles();
+                var current = files.Read();
+                if (current is null || current.SessionId != observed.SessionId
+                    || (current.SessionId is null && (current.Name != observed.Name || current.Config != observed.Config)))
+                {
+                    return null;
+                }
+
+                var updated = update(current);
+                files.Write(updated);
+                return updated;
+            }
+            catch (Exception ex)
+            {
+                global::Android.Util.Log.Warn("VpnBridge", "updating the VPN session failed: " + ex);
+                return null;
+            }
         }
     }
 
@@ -536,15 +549,7 @@ public static class VpnBridge
     {
         try
         {
-            var path = RequestPath();
-            if (!File.Exists(path))
-            {
-                return null;
-            }
-
-            using var stream = File.OpenRead(path);
-            var request = JsonSerializer.Deserialize<VpnRequest>(stream);
-            return request is { Config.Length: > 0 } ? request : null;
+            return SessionFiles().Read();
         }
         catch (Exception ex)
         {
@@ -556,7 +561,7 @@ public static class VpnBridge
     /// <summary>
     /// Whether the session of the last connect still waits on disk: nobody has taken the tunnel down.
     /// </summary>
-    public static bool HasRequest() => File.Exists(RequestPath());
+    public static bool HasRequest() => SessionFiles().Exists;
 
     /// <summary>
     /// Drops the session, so a tunnel the user stopped stays down.
@@ -565,7 +570,10 @@ public static class VpnBridge
     {
         try
         {
-            File.Delete(RequestPath());
+            lock (_sessionGate)
+            {
+                SessionFiles().Clear();
+            }
         }
         catch (Exception ex)
         {
@@ -1116,11 +1124,11 @@ public static class VpnBridge
     /// <summary>
     /// Writes what the server said for the head to read.
     /// </summary>
-    public static void WriteSwitchResult(string verdict)
+    public static void WriteSwitchResult(string id, string verdict)
     {
         try
         {
-            File.WriteAllText(SwitchResultPath(), verdict);
+            File.WriteAllText(SwitchResultPath(), id + "\n" + verdict);
         }
         catch (Exception ex)
         {
@@ -1131,12 +1139,13 @@ public static class VpnBridge
     /// <summary>
     /// Reads what the server said, an empty string while it is still being asked.
     /// </summary>
-    public static string ReadSwitchResult()
+    public static string ReadSwitchResult(string id)
     {
         try
         {
             var path = SwitchResultPath();
-            return File.Exists(path) ? File.ReadAllText(path) : string.Empty;
+            var result = File.Exists(path) ? File.ReadAllText(path) : string.Empty;
+            return result.StartsWith(id + "\n", StringComparison.Ordinal) ? result[(id.Length + 1)..] : string.Empty;
         }
         catch (Exception ex)
         {
@@ -1175,9 +1184,6 @@ public static class VpnBridge
     private static string PlanPath() =>
         Path.Combine(Application.Context.FilesDir?.AbsolutePath ?? ".", PlanFile);
 
-    private static string PlanStampPath() =>
-        Path.Combine(Application.Context.FilesDir?.AbsolutePath ?? ".", PlanStampFile);
-
     private static string ProxyPath() =>
         Path.Combine(Application.Context.FilesDir?.AbsolutePath ?? ".", ProxyFile);
 
@@ -1186,9 +1192,6 @@ public static class VpnBridge
 
     private static string SessionsPath() =>
         Path.Combine(Application.Context.FilesDir?.AbsolutePath ?? ".", SessionsFile);
-
-    private static string RequestPath() =>
-        Path.Combine(Application.Context.FilesDir?.AbsolutePath ?? ".", RequestFile);
 
     private static string RouteTtlPath() =>
         Path.Combine(Application.Context.FilesDir?.AbsolutePath ?? ".", RouteTtlFile);

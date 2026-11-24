@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Text;
+using System.Text.Json;
 using AmneziaGeo.Dal;
 using AmneziaGeo.Decl;
 using AmneziaGeo.Geo;
@@ -7,6 +8,7 @@ using AmneziaGeo.Ipc;
 using AmneziaGeo.Localization;
 using AmneziaGeo.Ui.ViewModels;
 using AmneziaGeo.Windows.App;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace AmneziaGeo.Tests;
@@ -139,6 +141,39 @@ public sealed class AppNamesTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task AList_KeepsDistinctPathsWhenExpandingAnAppName()
+    {
+        const string upperPath = "path=/opt/vendor/Tool";
+        const string lowerPath = "path=/opt/vendor/tool";
+        var geo = new GeoConfigurator(_store, new NoFiles());
+        var id = await geo.ApplyToRoutingListAsync(0, "Apps", ["proxy|app:" + upperPath, "proxy|app:" + lowerPath, "proxy|app:Vendor Tool"]);
+        await AppFinds.SearchAsync(_store, ["vendor tool"],
+            [new("Vendor Tool", string.Empty, string.Empty, upperPath), new("Vendor Tool", string.Empty, string.Empty, lowerPath)]);
+        string[] expected = OperatingSystem.IsLinux() ? [upperPath, lowerPath] : [upperPath];
+
+        var stored = (await _store.GetRoutingListAsync(id))!;
+        var expanded = await AppFinds.ExpandListAsync(_store, stored);
+
+        Assert.Equal([upperPath, lowerPath, "Vendor Tool"], stored.Apps);
+        Assert.Equal(expected, (await AppFinds.ReadAsync(_store))["VENDOR TOOL"]);
+        Assert.Equal(expected, expanded.Apps);
+    }
+
+    [Fact]
+    public async Task ASearch_RefreshesTheCacheWhenOnlyThePathCaseChangesOnLinux()
+    {
+        const string oldPath = "path=/opt/vendor/Tool";
+        const string newPath = "path=/opt/vendor/tool";
+        await AppFinds.SearchAsync(_store, ["Vendor Tool"], [new("Vendor Tool", string.Empty, string.Empty, oldPath)]);
+
+        var result = await AppFinds.SearchAsync(_store, ["Vendor Tool"], [new("Vendor Tool", string.Empty, string.Empty, newPath)]);
+
+        string[] changed = OperatingSystem.IsLinux() ? ["Vendor Tool"] : [];
+        Assert.Equal(changed, result.Changed);
+        Assert.Equal(OperatingSystem.IsLinux() ? newPath : oldPath, Assert.Single((await AppFinds.ReadAsync(_store))["Vendor Tool"]));
+    }
+
+    [Fact]
     public async Task ASearch_KeepsWhatEachNameStandsForAndTellsWhatChanged()
     {
         var first = await AppFinds.SearchAsync(_store, ["Firefox", "Discord"], Programs);
@@ -174,6 +209,38 @@ public sealed class AppNamesTests : IAsyncLifetime
             routed.Rules);
         Assert.Equal([@"path=C:\Program Files\Mozilla Firefox\firefox.exe", @"path=C:\Tools\tool.exe"], routed.Apps);
         Assert.Empty(routed.DirectApps);
+    }
+
+    [Fact]
+    public async Task AnOldCachedFolderRoutesTheUpdatedAppBeforeTheNextSearch()
+    {
+        const string name = "Vendor Tool";
+        const string oldFolder = @"Z:\Tools\Vendor\app-1.2.3";
+        const string updatedImage = @"Z:\Tools\Vendor\app-2.0.0\tool.exe";
+        var geo = new GeoConfigurator(_store, new NoFiles());
+        var id = await geo.ApplyToRoutingListAsync(0, "Apps",
+            ["proxy|app:" + name, "direct|app:dir=" + oldFolder]);
+        await _store.SetSettingAsync(AppFinds.Key,
+            JsonSerializer.Serialize(new Dictionary<string, string[]> { [name] = ["dir=" + oldFolder] }));
+        var list = (await _store.GetRoutingListAsync(id))!;
+
+        var routed = await AppFinds.ExpandListAsync(_store, list);
+
+        Assert.Equal(@"dir=Z:\Tools\Vendor\", Assert.Single(routed.Apps));
+        Assert.Equal("dir=" + oldFolder, Assert.Single(routed.DirectApps));
+        Assert.True(new AppMatcher(routed.Apps, NullLogger<AppMatcher>.Instance).MatchesDevicePath(updatedImage));
+        Assert.False(new AppMatcher(routed.DirectApps, NullLogger<AppMatcher>.Instance).MatchesDevicePath(updatedImage));
+    }
+
+    [Fact]
+    public async Task ACurrentCachedFolderKeepsItsBoundaryWhenItsParentAlsoLooksVersioned()
+    {
+        const string name = "Vendor Tool";
+        var value = AppPathToken.RuleForDiscoveredDirectory(@"Z:\Tools\Vendor\v1.2\app-1.2.3")["app:".Length..];
+        await AppFinds.SearchAsync(_store, [name], [new NamedApp(name, string.Empty, string.Empty, value)]);
+
+        Assert.Equal(@"dir=Z:\Tools\Vendor\v1.2\", value);
+        Assert.Equal(value, Assert.Single((await AppFinds.ReadAsync(_store))[name]));
     }
 
     [Fact]

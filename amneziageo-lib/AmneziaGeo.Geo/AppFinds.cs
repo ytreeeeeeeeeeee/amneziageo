@@ -196,12 +196,13 @@ public static class AppFinds
             }
 
             var known = held.TryGetValue(name, out var before);
-            if (known && before!.SequenceEqual(found, StringComparer.OrdinalIgnoreCase))
+            var same = (before ?? []).SequenceEqual(found, AppNames.RuleValueComparer);
+            if (known && same)
             {
                 continue;
             }
 
-            if (!(before ?? []).SequenceEqual(found, StringComparer.OrdinalIgnoreCase))
+            if (!same)
             {
                 changed.Add(name);
             }
@@ -230,7 +231,7 @@ public static class AppFinds
         {
             foreach (var (name, values) in JsonSerializer.Deserialize<Dictionary<string, string[]>>(raw) ?? [])
             {
-                finds[name] = values ?? [];
+                finds[name] = [.. (values ?? []).Select(RestoreCachedValue).OfType<string>()];
             }
         }
         catch (JsonException)
@@ -239,5 +240,20 @@ public static class AppFinds
         }
 
         return finds;
+    }
+
+    private static string? RestoreCachedValue(string? value)
+    {
+        const string directoryPrefix = "dir=";
+        // Legacy Windows searches trimmed trailing separators. Current directory results already end in one.
+        if (value is null || value.Length <= directoryPrefix.Length
+            || !value.StartsWith(directoryPrefix, StringComparison.OrdinalIgnoreCase)
+            || value[^1] is '\\' or '/')
+        {
+            return value;
+        }
+
+        var rule = AppPathToken.RuleForDiscoveredDirectory(value[directoryPrefix.Length..]);
+        return OwnAppRule.Names(rule) ? null : rule["app:".Length..];
     }
 }

@@ -613,6 +613,9 @@
   <data name="RoutingEditor_RoutesTrimmed" xml:space="preserve">
     <value>The list doesn't fit: only {0} of {1} Direct ranges go direct, the rest go through the tunnel.</value>
   </data>
+  <data name="RoutingEditor_PreviousRulePage" xml:space="preserve">
+    <value>Previous</value>
+  </data>
   <data name="RoutingEditor_RelayNotice" xml:space="preserve">
     <value>Entries in the list: {0} (ranges: {1}, names: {2}, a name counts as 8), threshold {3}: {4} of them are decided on the fly - rules over half the threshold and what did not fit. Every app sees the VPN; add an app the VPN gets in the way of to Direct.</value>
   </data>
@@ -1474,6 +1477,12 @@
   <data name="QrScanner_CameraPermissionDenied" xml:space="preserve">
     <value>Camera access denied</value>
   </data>
+  <data name="RoutingEditor_AddExactApplication" xml:space="preserve">
+    <value>Add this application</value>
+  </data>
+  <data name="RoutingEditor_AddWholeFolder" xml:space="preserve">
+    <value>Add the entire folder</value>
+  </data>
   <data name="RoutingEditor_AppKindApplication" xml:space="preserve">
     <value>{0} · application</value>
   </data>
@@ -1495,6 +1504,9 @@
   <data name="RoutingEditor_ImportedNameTaken" xml:space="preserve">
     <value>A routing list named «{0}» already exists, so this one is saved as «{1}».</value>
   </data>
+  <data name="RoutingEditor_NextRulePage" xml:space="preserve">
+    <value>Next</value>
+  </data>
   <data name="RoutingEditor_NotARoutingList" xml:space="preserve">
     <value>This does not look like a routing list.</value>
   </data>
@@ -1509,6 +1521,9 @@
   </data>
   <data name="RoutingEditor_RuleEntriesShown" xml:space="preserve">
     <value>First {0} of {1} entries</value>
+  </data>
+  <data name="RoutingEditor_RulePageRange" xml:space="preserve">
+    <value>{0}–{1} of {2}</value>
   </data>
   <data name="RoutingEditor_RuleNoEntries" xml:space="preserve">
     <value>No entries: the category is absent from the downloaded databases</value>

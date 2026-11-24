@@ -254,7 +254,7 @@
                      IsVisible="{Binding ValidationMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
 
           <!-- Записи корзины: токен, вид записи и её содержимое по требованию. -->
-          <Border Classes="rulebox" IsVisible="{Binding HasRules}"
+          <Border x:Name="RulePageStart" Classes="rulebox" IsVisible="{Binding HasRules}"
                   Classes.compact="{Binding IsCardless, Source={x:Static svc:UiLayout.Instance}}">
             <ItemsControl ItemsSource="{Binding RuleItems}"
                           controls:RowFocus.Enabled="True" controls:RowFocus.Spare="{Binding #AddRow}"
@@ -361,6 +361,17 @@
               </ItemsControl.ItemTemplate>
             </ItemsControl>
           </Border>
+
+          <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8" IsVisible="{Binding ShowRulePages}">
+            <Button Classes="softbtn" Command="{Binding PreviousRulePageCommand}"
+                    IsEnabled="{Binding HasPreviousRulePage}" Click="OnRulePageChanged"
+                    Content="{l:Tr RoutingEditor_PreviousRulePage}" />
+            <TextBlock Grid.Column="1" Text="{Binding RulePageSummary}" Classes="muted"
+                       TextAlignment="Center" VerticalAlignment="Center" />
+            <Button Grid.Column="2" Classes="softbtn" Command="{Binding NextRulePageCommand}"
+                    IsEnabled="{Binding HasNextRulePage}" Click="OnRulePageChanged"
+                    Content="{l:Tr RoutingEditor_NextRulePage}" />
+          </Grid>
         </StackPanel>
       </StackPanel>
     </Border>

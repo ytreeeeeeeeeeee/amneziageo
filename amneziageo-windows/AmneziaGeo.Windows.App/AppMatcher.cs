@@ -175,10 +175,10 @@ internal sealed class AppMatcher
         }
     }
 
-    // A Store/MSIX package folder becomes a package match; a Squirrel app-<ver> leaf is hoisted (#204).
+    // A Store/MSIX package folder becomes a package match. Other folder rules keep their stored scope.
     private static void AddDirMatcher(RuleSet set, string value)
     {
-        var canon = AmneziaGeo.Ipc.AppPathToken.Tokenize(value.TrimEnd('\\', '/'));
+        var canon = AmneziaGeo.Ipc.AppPathToken.Tokenize(value);
         var family = AmneziaGeo.Ipc.AppPathToken.PackageFamilyFromPath(canon);
         if (family is not null)
         {
@@ -186,7 +186,7 @@ internal sealed class AppMatcher
         }
         else
         {
-            set.Dirs.Add(AmneziaGeo.Ipc.AppPathToken.StripVersionedLeaf(canon));
+            set.Dirs.Add(canon);
         }
     }
 
@@ -446,8 +446,7 @@ internal sealed class AppMatcher
 
         foreach (var dir in set.Dirs)
         {
-            // Matches dir prefix, catches versioned subfolders.
-            if (canon.StartsWith(dir + "\\", StringComparison.OrdinalIgnoreCase))
+            if (AmneziaGeo.Ipc.AppPathToken.IsUnderDirectory(dir, canon))
             {
                 return true;
             }

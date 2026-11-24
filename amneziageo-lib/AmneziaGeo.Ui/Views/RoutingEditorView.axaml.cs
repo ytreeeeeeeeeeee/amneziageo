@@ -57,6 +57,10 @@ internal sealed partial class RoutingEditorView : UserControl
         }
     }
 
+    // Wait for the page command and layout before scrolling to the first row.
+    private void OnRulePageChanged(object? sender, RoutedEventArgs e) =>
+        Dispatcher.UIThread.Post(() => RulePageStart.BringIntoView(new Avalonia.Rect(0, 0, 1, 1)), DispatcherPriority.Loaded);
+
     // Copies everything the expanded rule covers to the clipboard.
     private async void OnCopyRuleEntries(object? sender, RoutedEventArgs e)
     {
@@ -72,15 +76,15 @@ internal sealed partial class RoutingEditorView : UserControl
     // routing VM's RoutingEditor (MenuFlyout items do not inherit the editor's DataContext).
     private async void OnPickApplication(object? sender, RoutedEventArgs e)
     {
-        await PutPickedAsync(() => PickFileAsync(Loc.Instance.Get("MainCode_ApplicationTitle"), Extensions()));
+        await PutPickedAsync(() => PickFileAsync(Loc.Instance.Get("MainCode_ApplicationTitle"), Extensions()), "app:path=");
     }
 
     private async void OnPickFolder(object? sender, RoutedEventArgs e)
     {
-        await PutPickedAsync(PickFolderAsync);
+        await PutPickedAsync(PickFolderAsync, "app:dir=");
     }
 
-    private async Task PutPickedAsync(Func<Task<string?>> pick)
+    private async Task PutPickedAsync(Func<Task<string?>> pick, string rulePrefix)
     {
         if ((DataContext as RoutingViewModel)?.RoutingEditor is not { } vm)
         {
@@ -90,7 +94,7 @@ internal sealed partial class RoutingEditorView : UserControl
         var path = await pick();
         if (!string.IsNullOrEmpty(path))
         {
-            vm.RuleInput = path;
+            vm.RuleInput = OperatingSystem.IsWindows() || OperatingSystem.IsLinux() ? rulePrefix + path : path;
         }
     }
 

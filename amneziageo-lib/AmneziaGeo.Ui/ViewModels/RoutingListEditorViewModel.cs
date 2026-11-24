@@ -498,11 +498,43 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
 
     // Set while rules of the shown bucket have no row yet.
     private bool _rowsPending;
+    private int _rulePage;
+
+    internal bool UseRulePages { get; init; } = OperatingSystem.IsAndroid();
+
+    public bool ShowRulePages => UseRulePages && Rules.Count > FirstRows;
+
+    public bool HasPreviousRulePage => _rulePage > 0;
+
+    public bool HasNextRulePage => _rulePage < LastRulePage;
+
+    public string RulePageSummary => Loc.Instance.Get("RoutingEditor_RulePageRange",
+        _rulePage * FirstRows + 1, _rulePage * FirstRows + RuleItems.Count, Rules.Count);
+
+    private int LastRulePage => Math.Max(Rules.Count - 1, 0) / FirstRows;
+
+    [RelayCommand]
+    private void PreviousRulePage() => GoToRulePage(_rulePage - 1);
+
+    [RelayCommand]
+    private void NextRulePage() => GoToRulePage(_rulePage + 1);
+
+    private void GoToRulePage(int page)
+    {
+        if (!UseRulePages || page < 0 || page > LastRulePage)
+        {
+            return;
+        }
+
+        _rulePage = page;
+        RuleItems.Clear();
+        SyncRuleItems();
+    }
 
     /// <summary>
     /// True while rules of the shown bucket wait for their rows.
     /// </summary>
-    public bool RowsPending => _rowsPending && !_seeding;
+    public bool RowsPending => !UseRulePages && _rowsPending && !_seeding;
 
     // Rules left expanded, kept across a projection rebuild.
     private readonly HashSet<string> _expandedRules = new(StringComparer.Ordinal);
@@ -599,6 +631,7 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
     // Rebuilds the shown bucket's projection: its first rows at once, the rest in portions.
     protected void RebuildRuleItems()
     {
+        _rulePage = 0;
         RuleItems.Clear();
         _rowsPending = false;
         SyncRuleItems();
@@ -608,22 +641,26 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
     private void SyncRuleItems()
     {
         var rules = Rules;
-        var whole = !_rowsPending;
+        _rulePage = Math.Min(_rulePage, LastRulePage);
+        var start = _rulePage * FirstRows;
+        var count = UseRulePages ? Math.Min(FirstRows, rules.Count - start) : rules.Count;
+        var whole = UseRulePages || !_rowsPending;
         var held = default(HashSet<string>);
         var built = 0;
         var at = 0;
-        while (at < rules.Count)
+        while (at < count)
         {
             if (at < RuleItems.Count)
             {
                 var token = RuleItems[at].Token;
-                if (string.Equals(token, rules[at], StringComparison.Ordinal))
+                if (string.Equals(token, rules[start + at], StringComparison.Ordinal))
                 {
                     at++;
                     continue;
                 }
 
-                held ??= new HashSet<string>(rules, StringComparer.Ordinal);
+                held ??= new HashSet<string>(
+                    UseRulePages ? rules.Skip(start).Take(count) : rules, StringComparer.Ordinal);
                 if (!held.Contains(token))
                 {
                     RuleItems.RemoveAt(at);
@@ -640,7 +677,7 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
                 break;
             }
 
-            RuleItems.Insert(at, RowOf(rules[at]));
+            RuleItems.Insert(at, RowOf(rules[start + at]));
             built++;
             at++;
         }
@@ -655,7 +692,7 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
             RuleItems.RemoveAt(RuleItems.Count - 1);
         }
 
-        _rowsPending = RuleItems.Count < rules.Count;
+        _rowsPending = !UseRulePages && RuleItems.Count < rules.Count;
         RefreshCounts();
     }
 
@@ -841,6 +878,13 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
         OnPropertyChanged(nameof(DirectTabText));
         OnPropertyChanged(nameof(BlockTabText));
         OnPropertyChanged(nameof(HasRules));
+        if (UseRulePages)
+        {
+            OnPropertyChanged(nameof(ShowRulePages));
+            OnPropertyChanged(nameof(HasPreviousRulePage));
+            OnPropertyChanged(nameof(HasNextRulePage));
+            OnPropertyChanged(nameof(RulePageSummary));
+        }
     }
 
     /// <summary>
@@ -1076,13 +1120,25 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
         OnPropertyChanged(nameof(ShowDropdownSuggestions));
     }
 
-    // Running and installed applications answer one query: each source keeps its own group, a name met twice
-    // stands once, what the list already holds drops out, and the head of the result is offered.
+    // An explicit path can be added before any matches from the running and installed lists.
     private IReadOnlyList<RoutingSuggestionViewModel> MatchApps(string query)
     {
-        var held = new HashSet<string>(Rules.Select(AppPathToken.NormalizeAppRule), StringComparer.OrdinalIgnoreCase);
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var linux = OperatingSystem.IsLinux();
+        var comparer = linux ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+        var held = new HashSet<string>(Rules.Select(AppPathToken.NormalizeAppRule), comparer);
+        var seen = new HashSet<string>(comparer);
         var matches = new List<RoutingSuggestionViewModel>();
+        if (OperatingSystem.IsWindows() || linux)
+        {
+            foreach (var direct in ExplicitPathSuggestions(query, linux))
+            {
+                if (!held.Contains(direct.Token) && seen.Add(direct.Token))
+                {
+                    matches.Add(direct);
+                }
+            }
+        }
+
         foreach (var group in _appGroups)
         {
             foreach (var candidate in group.Where(c => Names(c, query)))
@@ -1102,6 +1158,89 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
         }
 
         return matches;
+    }
+
+    internal static IEnumerable<RoutingSuggestionViewModel> ExplicitPathSuggestions(string query, bool linux)
+    {
+        const string filePrefix = "app:path=";
+        const string folderPrefix = "app:dir=";
+        var isFile = query.StartsWith(filePrefix, StringComparison.OrdinalIgnoreCase);
+        var isFolder = query.StartsWith(folderPrefix, StringComparison.OrdinalIgnoreCase);
+        var path = isFile ? query[filePrefix.Length..]
+            : isFolder ? query[folderPrefix.Length..]
+            : query;
+        path = path.Trim().Trim('"');
+        if (path.Contains('\0'))
+        {
+            yield break;
+        }
+
+        var absolutePath = linux ? ExpandLinuxPath(path) : AppPathToken.ExpandInputPath(path);
+        var components = linux ? absolutePath.Split('/') : absolutePath.Split('\\', '/');
+        if (!(linux ? absolutePath.StartsWith('/') : System.IO.Path.IsPathFullyQualified(absolutePath))
+            || components.Any(component => component is "." or ".."))
+        {
+            yield break;
+        }
+
+        // Linux executables often have no extension. A bare path can describe either kind.
+        var folderHint = linux && absolutePath.EndsWith('/');
+        var ambiguous = linux && !isFile && !isFolder && !folderHint;
+        isFile |= !isFolder && (linux ? !folderHint : absolutePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
+        if (linux)
+        {
+            absolutePath = "/" + string.Join('/', components.Where(component => component.Length > 0));
+        }
+
+        yield return Suggest(isFile);
+        if (ambiguous)
+        {
+            yield return Suggest(file: false);
+        }
+
+        RoutingSuggestionViewModel Suggest(bool file)
+        {
+            var token = (file ? filePrefix : folderPrefix) + absolutePath;
+            if (!linux)
+            {
+                token = AppPathToken.NormalizeAppRule(token);
+            }
+            else if (!file && !absolutePath.EndsWith('/'))
+            {
+                token += "/";
+            }
+            return new RoutingSuggestionViewModel(token, Loc.Instance.Get(file
+                ? "RoutingEditor_AddExactApplication"
+                : "RoutingEditor_AddWholeFolder"));
+        }
+    }
+
+    private static string ExpandLinuxPath(string path)
+    {
+        var slash = path.IndexOf('/');
+        var prefix = slash < 0 ? path : path[..slash];
+        string? root = null;
+        if (prefix == "~")
+        {
+            root = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        }
+        else if (prefix.StartsWith('$'))
+        {
+            var name = prefix[1..];
+            if (name.Length >= 2 && name.StartsWith('{') && name.EndsWith('}'))
+            {
+                name = name[1..^1];
+            }
+
+            root = name.Length > 0 ? Environment.GetEnvironmentVariable(name) : null;
+        }
+
+        if (string.IsNullOrEmpty(root))
+        {
+            return path;
+        }
+
+        return slash < 0 ? root : root.TrimEnd('/') + path[slash..];
     }
 
     // Matches the name and the path alike: both get typed.
@@ -1774,7 +1913,7 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
         var dir = System.IO.Path.GetDirectoryName(image);
         return string.IsNullOrEmpty(dir)
             ? $"app:path={image}"
-            : $"app:dir={AppPathToken.StripVersionedLeaf(dir)}";
+            : AppPathToken.RuleForDiscoveredDirectory(dir);
     }
 
     /// <summary>
@@ -1790,8 +1929,9 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
 
         // Store a version-independent package match for Store apps, else a portable %ENV% path, so the rule
         // survives the app auto-updating and export to another machine or user.
-        token = AmneziaGeo.Ipc.AppPathToken.NormalizeAppRule(token);
-        if (!Rules.Contains(token))
+        token = AppPathToken.NormalizeAppRule(token);
+        if (!Rules.Any(rule => string.Equals(AppPathToken.NormalizeAppRule(rule), token,
+            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)))
         {
             Rules.Add(token);
         }
@@ -1874,6 +2014,11 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
 
         var eq = token.IndexOf('=');
         var value = (eq >= 0 ? token[(eq + 1)..] : string.Empty).Trim();
+        if (OperatingSystem.IsWindows())
+        {
+            value = Environment.ExpandEnvironmentVariables(value);
+        }
+
         var norm = value.Replace('/', '\\').TrimEnd('\\').ToLowerInvariant();
         if (norm.Length == 0)
         {

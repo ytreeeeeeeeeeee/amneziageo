@@ -64,6 +64,11 @@ public sealed class GeoVpnService : VpnService
     public const string ExtraConfig = "config";
 
     /// <summary>
+    /// Identifies the staged request and routing plan carried by a new launch.
+    /// </summary>
+    public const string ExtraSessionId = "session-id";
+
+    /// <summary>
     /// Session name extra key.
     /// </summary>
     public const string ExtraName = "name";
@@ -370,7 +375,7 @@ public sealed class GeoVpnService : VpnService
         _screenOn = (GetSystemService(PowerService) as PowerManager)?.IsInteractive ?? true;
         _queries = new VpnBridge.Listener { Handler = _ => Answer() };
         VpnBridge.Listen(this, _queries, VpnBridge.ActionQuery);
-        _stops = new VpnBridge.Listener { Handler = _ => Stop() };
+        _stops = new VpnBridge.Listener { Handler = StopRequested };
         VpnBridge.Listen(this, _stops, VpnBridge.ActionStop);
         _proxySettings = new VpnBridge.Listener { Handler = _ => ApplyProxy() };
         VpnBridge.Listen(this, _proxySettings, VpnBridge.ActionProxy);
@@ -409,13 +414,23 @@ public sealed class GeoVpnService : VpnService
 
         // Always-on starts the tunnel with a bare intent and the head is not there to fill it: what the last
         // connect ran on comes off the disk instead.
-        var carried = FromIntent(intent);
-        var request = carried ?? VpnBridge.ReadRequest();
+        var sessionId = intent?.GetStringExtra(ExtraSessionId);
+        var carried = sessionId is null ? FromIntent(intent) : VpnBridge.ReadStagedRequest(sessionId);
+        var stored = carried is null ? VpnBridge.ReadRequest() : null;
+        var request = carried ?? (sessionId is null || stored?.SessionId == sessionId ? stored : null);
         if (request is null)
         {
             if (intent?.Action == ActionConnect)
             {
-                Teardown(VpnStage.Failed, "no config", nameof(ConnectFailureReason.ConfigMissing));
+                // Even a revoked launch must satisfy Android's foreground-start contract before stopping.
+                if (sessionId is not null && OperatingSystem.IsAndroidVersionAtLeast(26)
+                    && _stage is not (VpnStage.Connecting or VpnStage.Connected))
+                {
+                    StartForegroundNotification(NoticeWords.Plain, _noticeName,
+                        Java.Lang.JavaSystem.CurrentTimeMillis(), NoticeStage.Disconnected);
+                }
+
+                RejectSessionStart(sessionId, startId, "no matching VPN session", ConnectFailureReason.ConfigMissing);
             }
             else
             {
@@ -426,12 +441,48 @@ public sealed class GeoVpnService : VpnService
             return StartCommandResult.NotSticky;
         }
 
-        // The dial this connect replaces is taken back before the head hears of the new one.
-        Interlocked.Exchange(ref _dial, null)?.Cancel();
-        if (carried is not null)
+        var notice = request.Notice ?? NoticeWords.Plain;
+        var stageSince = Java.Lang.JavaSystem.CurrentTimeMillis();
+        if (!StartForegroundNotification(notice, request.Name, stageSince))
         {
-            VpnBridge.WriteRequest(carried);
+            if (sessionId is not null)
+            {
+                VpnBridge.DropStagedRequest(sessionId);
+            }
+
+            RejectSessionStart(sessionId, startId, "foreground refused", ConnectFailureReason.ServiceStartFailed);
+            return StartCommandResult.NotSticky;
         }
+
+        try
+        {
+            if (carried is not null && sessionId is not null)
+            {
+                if (!VpnBridge.TryPromoteRequest(sessionId))
+                {
+                    RejectSessionStart(sessionId, startId, "VPN launch was revoked", ConnectFailureReason.ServiceStartFailed);
+                    return StartCommandResult.NotSticky;
+                }
+            }
+            else if (carried is not null)
+            {
+                VpnBridge.WriteRequest(carried);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            if (sessionId is not null)
+            {
+                VpnBridge.DropStagedRequest(sessionId);
+            }
+
+            global::Android.Util.Log.Warn("GeoVpnService", "[FIX] the VPN session was not accepted: " + ex);
+            RejectSessionStart(sessionId, startId, "could not accept the VPN session", ConnectFailureReason.ServiceStartFailed);
+            return StartCommandResult.NotSticky;
+        }
+
+        // The old dial and its committed plan have remained intact up to this point.
+        Interlocked.Exchange(ref _dial, null)?.Cancel();
 
         // A request the system delivers again after the process died is not one the head has just made.
         var asked = carried is not null && (flags & StartCommandFlags.Redelivery) == 0;
@@ -441,21 +492,22 @@ public sealed class GeoVpnService : VpnService
         {
             _hold.Raised();
         }
-        _notice = request.Notice ?? NoticeWords.Plain;
+
+        _notice = notice;
         _noticeName = request.Name;
         _baseUrls = request.Bases ?? [];
-        _stageSince = Java.Lang.JavaSystem.CurrentTimeMillis();
-        TunnelNotices.Cancel(this, TunnelNotices.StoppedId);
-        if (!StartForegroundNotification())
+        _stageSince = stageSince;
+        lock (_noticeGate)
         {
-            Teardown(VpnStage.Failed, "foreground refused", nameof(ConnectFailureReason.ServiceStartFailed));
-            return StartCommandResult.NotSticky;
+            _noticeDown = false;
+            _noticeText = TunnelNotice.Text(notice, NoticeStage.Connecting, 0, 0, 0);
         }
 
+        TunnelNotices.Cancel(this, TunnelNotices.StoppedId);
         _retry = 0;
         _session.Closed();
         KeepMarks();
-        Publish(VpnStage.Connecting, request.Name);
+        Publish(VpnStage.Connecting, request.Name, acceptedLaunchId: sessionId);
 
         // A connect the user asked for is a fresh start, whatever the previous session was being repaired for.
         _recovery.Reset();
@@ -468,8 +520,41 @@ public sealed class GeoVpnService : VpnService
 
         _guard.RemoveCallbacksAndMessages(null);
         PushGuard();
-        Dial(VpnBridge.ReadPlan(), request, repair: false);
+        Dial(request.Plan ?? VpnBridge.ReadLegacyPlan(), request, repair: false);
         return StartCommandResult.RedeliverIntent;
+    }
+
+    private void RejectSessionStart(string? sessionId, int startId, string detail, ConnectFailureReason reason)
+    {
+        if (sessionId is not null)
+        {
+            VpnBridge.RejectLaunch(this, sessionId, reason.ToString());
+            if (_stage is VpnStage.Connecting or VpnStage.Connected)
+            {
+                // A revoked launch may already have posted a foreground notification for the wrong session.
+                lock (_noticeGate)
+                {
+                    _noticeText = string.Empty;
+                }
+
+                ShowStage();
+            }
+            else
+            {
+                StopSelf(startId);
+            }
+
+            return;
+        }
+
+        if (_stage is VpnStage.Connecting or VpnStage.Connected)
+        {
+            Note("tunnel", "[FIX] " + detail + "; keeping the running session");
+            Answer();
+            return;
+        }
+
+        Teardown(VpnStage.Failed, detail, reason.ToString());
     }
 
     /// <inheritdoc/>
@@ -765,7 +850,7 @@ public sealed class GeoVpnService : VpnService
         _session.Dropped(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         KeepMarks();
         Publish(VpnStage.Connecting, request.Name);
-        Dial(VpnBridge.ReadPlan(), request, repair: true, () => Interlocked.Exchange(ref _reraising, 0));
+        Dial(request.Plan ?? VpnBridge.ReadLegacyPlan(), request, repair: true, () => Interlocked.Exchange(ref _reraising, 0));
 
         return true;
     }
@@ -1527,17 +1612,28 @@ public sealed class GeoVpnService : VpnService
         });
     }
 
-    // Asks the server of the configuration the head wants to move to. The session that stands is left alone: the
-    // engine that asks carries nothing, and only this process dials past the tunnel.
+    private readonly object _switchProbeGate = new();
+    private string? _switchProbeId;
+
+    // Asks the server of the configuration the head wants to move to without changing the current tunnel.
     private void RunSwitch()
     {
         var request = VpnBridge.ReadSwitch();
-        if (request is null)
+        if (request?.Id is not { Length: > 0 } id)
         {
             return;
         }
 
-        VpnBridge.ClearSwitch();
+        lock (_switchProbeGate)
+        {
+            if (_switchProbeId == id)
+            {
+                return;
+            }
+
+            _switchProbeId = id;
+        }
+
         var standing = _detail ?? string.Empty;
         _ = Task.Run(() =>
         {
@@ -1553,7 +1649,13 @@ public sealed class GeoVpnService : VpnService
                     : $"the server of {request.Name} could not be asked before the tunnel leaves {standing}");
             }
 
-            VpnBridge.WriteSwitchResult(verdict);
+            lock (_switchProbeGate)
+            {
+                if (_switchProbeId == id)
+                {
+                    VpnBridge.WriteSwitchResult(id, verdict);
+                }
+            }
         });
     }
 
@@ -2093,7 +2195,7 @@ public sealed class GeoVpnService : VpnService
     }
 
     // Reports a stage to the head and keeps it as the answer to a later query.
-    private void Publish(VpnStage stage, string? detail, string? reason = null)
+    private void Publish(VpnStage stage, string? detail, string? reason = null, string? acceptedLaunchId = null)
     {
         if (stage != _stage)
         {
@@ -2118,7 +2220,7 @@ public sealed class GeoVpnService : VpnService
         ShowStage();
         // Only a running tunnel can be asked whether the system holds it as the always-on one.
         var alwaysOn = Build.VERSION.SdkInt >= BuildVersionCodes.Q && IsAlwaysOn;
-        VpnBridge.Publish(this, stage, detail, reason, alwaysOn, alwaysOn && IsLockdownEnabled, _retry);
+        VpnBridge.Publish(this, stage, detail, reason, alwaysOn, alwaysOn && IsLockdownEnabled, _retry, acceptedLaunchId);
     }
 
     private static void Report(string text)
@@ -3585,8 +3687,12 @@ public sealed class GeoVpnService : VpnService
             return;
         }
 
-        var plain = request with { WsHost = null, WsPort = 0, WsOffered = false };
-        VpnBridge.WriteRequest(plain);
+        var plain = VpnBridge.UpdateRequest(request, current => current with { WsHost = null, WsPort = 0, WsOffered = false });
+        if (plain is null)
+        {
+            return;
+        }
+
         var why = $"the server of {name} offers no websocket front any more; raising the session again without the websocket";
         Report(why);
         Note("tunnel", why);
@@ -3594,7 +3700,7 @@ public sealed class GeoVpnService : VpnService
         _session.Dropped(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         KeepMarks();
         Publish(VpnStage.Connecting, name);
-        Dial(VpnBridge.ReadPlan(), plain, repair: true);
+        Dial(plain.Plan ?? VpnBridge.ReadLegacyPlan(), plain, repair: true);
     }
 
     private static string ResolveEndpoint(string config)
@@ -3667,18 +3773,13 @@ public sealed class GeoVpnService : VpnService
         return int.TryParse(cidr[(slash + 1)..], out var prefix) ? (ip, prefix) : (ip, ip.Contains(':') ? 128 : 32);
     }
 
-    private bool StartForegroundNotification()
+    private bool StartForegroundNotification(NoticeWords notice, string name, long stageSince,
+        NoticeStage stage = NoticeStage.Connecting)
     {
         // A start the system refuses ends the service within seconds; failing here names the cause instead.
         try
         {
-            lock (_noticeGate)
-            {
-                _noticeDown = false;
-                _noticeText = TunnelNotice.Text(_notice, NoticeStage.Connecting, 0, 0, 0);
-            }
-
-            var notification = TunnelNotices.Compose(this, _notice, _noticeName, NoticeStage.Connecting, 0, 0, 0, _stageSince);
+            var notification = TunnelNotices.Compose(this, notice, name, stage, 0, 0, 0, stageSince);
             if (Build.VERSION.SdkInt >= BuildVersionCodes.UpsideDownCake)
             {
                 StartForeground(TunnelNotices.TunnelId, notification, ForegroundService.TypeSpecialUse);
@@ -3770,7 +3871,7 @@ public sealed class GeoVpnService : VpnService
 
         if (VpnBridge.ReadRequest() is { } kept)
         {
-            VpnBridge.WriteRequest(kept with { Notice = words });
+            VpnBridge.UpdateRequest(kept, current => current with { Notice = words });
         }
 
         ShowStage();
@@ -3838,6 +3939,15 @@ public sealed class GeoVpnService : VpnService
             intent.GetBooleanExtra(ExtraHoldTraffic, true),
             intent.GetStringArrayExtra(ExtraVpnDns),
             intent.GetBooleanExtra(ExtraVpnDnsNetwork, false));
+    }
+
+    private void StopRequested(Intent intent)
+    {
+        var id = intent.GetStringExtra(VpnBridge.ExtraLaunchId);
+        if (id is null || id == (VpnBridge.ReadRequest()?.SessionId ?? string.Empty))
+        {
+            Stop();
+        }
     }
 
     // The stop the user asked for: what it takes down must not come back with always-on or after a kill.

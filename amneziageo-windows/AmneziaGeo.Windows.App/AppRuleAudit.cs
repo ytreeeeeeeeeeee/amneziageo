@@ -63,7 +63,7 @@ internal static class AppRuleAudit
 
             var missing = kind switch
             {
-                "dir" => !dirExists(AppPathToken.StripVersionedLeaf(AppPathToken.Tokenize(value.TrimEnd(_slashes)))),
+                "dir" => !dirExists(AppPathToken.Tokenize(value)),
                 "path" => !fileExists(AppPathToken.Tokenize(value)),
                 "svc" => !serviceExists(value),
                 _ => false,

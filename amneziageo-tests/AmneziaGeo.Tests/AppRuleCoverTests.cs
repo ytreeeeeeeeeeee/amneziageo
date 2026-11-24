@@ -35,6 +35,37 @@ public class AppRuleCoverTests
         Assert.True(AppRuleCover.Covers(@"app:dir=%LOCALAPPDATA%\Discord", @"app:path=%LOCALAPPDATA%\Discord\app-1.2.3\Discord.exe"));
     }
 
+    [Theory]
+    [InlineData(@"app:path=%LOCALAPPDATA%\Vendor\bin\app.exe")]
+    [InlineData(@"app:path=%APPDATA%\Vendor\bin\app.exe")]
+    [InlineData("app:dir=%LOCALAPPDATA%")]
+    [InlineData("app:dir=%APPDATA%")]
+    public void AProfileAppDataRuleCoversBothAppDataFolders(string target)
+    {
+        Assert.True(AppRuleCover.Covers(@"app:dir=%USERPROFILE%\AppData", target));
+        Assert.False(AppRuleCover.Covers(@"app:dir=%USERPROFILE%\App", target));
+    }
+
+    [Theory]
+    [InlineData(@"app:dir=%USERPROFILE%\")]
+    [InlineData(@"app:dir=%USERPROFILE%\AppData\")]
+    public void ADirectoryRuleCoversDifferentVariablesBelowIt(string rule)
+    {
+        Assert.True(AppRuleCover.Covers(rule, @"app:path=%LOCALAPPDATA%\Tool\app.exe"));
+        Assert.True(AppRuleCover.Covers(rule, @"app:path=%APPDATA%\Tool\app.exe"));
+        Assert.False(AppRuleCover.Covers(rule, @"app:path=%PROGRAMDATA%\Tool\app.exe"));
+    }
+
+    [Fact]
+    public void AVersionedFolderRuleKeepsItsOwnBoundary()
+    {
+        const string rule = @"app:dir=Z:\Tools\v1.2\";
+        Assert.True(AppRuleCover.Covers(rule, @"app:dir=Z:\Tools\v1.2"));
+        Assert.True(AppRuleCover.Covers(rule, @"app:path=Z:\Tools\v1.2\Vendor\app.exe"));
+        Assert.False(AppRuleCover.Covers(rule, @"app:dir=Z:\Tools\v1.3"));
+        Assert.False(AppRuleCover.Covers(rule, @"app:path=Z:\Tools\OtherApp\app.exe"));
+    }
+
     [Fact]
     public void AFolderRuleDoesNotCoverANeighbourFolder()
     {
