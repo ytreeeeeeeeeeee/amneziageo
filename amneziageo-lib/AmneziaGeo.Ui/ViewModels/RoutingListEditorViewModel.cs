@@ -498,11 +498,43 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
 
     // Set while rules of the shown bucket have no row yet.
     private bool _rowsPending;
+    private int _rulePage;
+
+    internal bool UseRulePages { get; init; } = OperatingSystem.IsAndroid();
+
+    public bool ShowRulePages => UseRulePages && Rules.Count > FirstRows;
+
+    public bool HasPreviousRulePage => _rulePage > 0;
+
+    public bool HasNextRulePage => _rulePage < LastRulePage;
+
+    public string RulePageSummary => Loc.Instance.Get("RoutingEditor_RulePageRange",
+        _rulePage * FirstRows + 1, _rulePage * FirstRows + RuleItems.Count, Rules.Count);
+
+    private int LastRulePage => Math.Max(Rules.Count - 1, 0) / FirstRows;
+
+    [RelayCommand]
+    private void PreviousRulePage() => GoToRulePage(_rulePage - 1);
+
+    [RelayCommand]
+    private void NextRulePage() => GoToRulePage(_rulePage + 1);
+
+    private void GoToRulePage(int page)
+    {
+        if (!UseRulePages || page < 0 || page > LastRulePage)
+        {
+            return;
+        }
+
+        _rulePage = page;
+        RuleItems.Clear();
+        SyncRuleItems();
+    }
 
     /// <summary>
     /// True while rules of the shown bucket wait for their rows.
     /// </summary>
-    public bool RowsPending => _rowsPending && !_seeding;
+    public bool RowsPending => !UseRulePages && _rowsPending && !_seeding;
 
     // Rules left expanded, kept across a projection rebuild.
     private readonly HashSet<string> _expandedRules = new(StringComparer.Ordinal);
@@ -599,6 +631,7 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
     // Rebuilds the shown bucket's projection: its first rows at once, the rest in portions.
     protected void RebuildRuleItems()
     {
+        _rulePage = 0;
         RuleItems.Clear();
         _rowsPending = false;
         SyncRuleItems();
@@ -608,22 +641,26 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
     private void SyncRuleItems()
     {
         var rules = Rules;
-        var whole = !_rowsPending;
+        _rulePage = Math.Min(_rulePage, LastRulePage);
+        var start = _rulePage * FirstRows;
+        var count = UseRulePages ? Math.Min(FirstRows, rules.Count - start) : rules.Count;
+        var whole = UseRulePages || !_rowsPending;
         var held = default(HashSet<string>);
         var built = 0;
         var at = 0;
-        while (at < rules.Count)
+        while (at < count)
         {
             if (at < RuleItems.Count)
             {
                 var token = RuleItems[at].Token;
-                if (string.Equals(token, rules[at], StringComparison.Ordinal))
+                if (string.Equals(token, rules[start + at], StringComparison.Ordinal))
                 {
                     at++;
                     continue;
                 }
 
-                held ??= new HashSet<string>(rules, StringComparer.Ordinal);
+                held ??= new HashSet<string>(
+                    UseRulePages ? rules.Skip(start).Take(count) : rules, StringComparer.Ordinal);
                 if (!held.Contains(token))
                 {
                     RuleItems.RemoveAt(at);
@@ -640,7 +677,7 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
                 break;
             }
 
-            RuleItems.Insert(at, RowOf(rules[at]));
+            RuleItems.Insert(at, RowOf(rules[start + at]));
             built++;
             at++;
         }
@@ -655,7 +692,7 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
             RuleItems.RemoveAt(RuleItems.Count - 1);
         }
 
-        _rowsPending = RuleItems.Count < rules.Count;
+        _rowsPending = !UseRulePages && RuleItems.Count < rules.Count;
         RefreshCounts();
     }
 
@@ -841,6 +878,13 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
         OnPropertyChanged(nameof(DirectTabText));
         OnPropertyChanged(nameof(BlockTabText));
         OnPropertyChanged(nameof(HasRules));
+        if (UseRulePages)
+        {
+            OnPropertyChanged(nameof(ShowRulePages));
+            OnPropertyChanged(nameof(HasPreviousRulePage));
+            OnPropertyChanged(nameof(HasNextRulePage));
+            OnPropertyChanged(nameof(RulePageSummary));
+        }
     }
 
     /// <summary>

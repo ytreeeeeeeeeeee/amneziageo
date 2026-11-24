@@ -57,6 +57,10 @@ internal sealed partial class RoutingEditorView : UserControl
         }
     }
 
+    // Wait for the page command and layout before scrolling to the first row.
+    private void OnRulePageChanged(object? sender, RoutedEventArgs e) =>
+        Dispatcher.UIThread.Post(() => RulePageStart.BringIntoView(new Avalonia.Rect(0, 0, 1, 1)), DispatcherPriority.Loaded);
+
     // Copies everything the expanded rule covers to the clipboard.
     private async void OnCopyRuleEntries(object? sender, RoutedEventArgs e)
     {

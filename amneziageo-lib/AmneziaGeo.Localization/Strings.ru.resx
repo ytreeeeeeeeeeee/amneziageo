@@ -613,6 +613,9 @@
   <data name="RoutingEditor_RoutesTrimmed" xml:space="preserve">
     <value>Список не помещается целиком: напрямую пойдут только {0} из {1} диапазонов «Напрямую», остальные пойдут через туннель.</value>
   </data>
+  <data name="RoutingEditor_PreviousRulePage" xml:space="preserve">
+    <value>Назад</value>
+  </data>
   <data name="RoutingEditor_RelayNotice" xml:space="preserve">
     <value>Записей в списке: {0} (диапазонов: {1}, имён: {2}, имя идёт за 8), порог {3}: {4} из них решаются на лету - правила больше половины порога и то, что в порог не вошло. VPN видят все приложения; приложение, которому VPN мешает, добавьте в «Напрямую».</value>
   </data>
@@ -1501,6 +1504,9 @@
   <data name="RoutingEditor_ImportedNameTaken" xml:space="preserve">
     <value>Список «{0}» уже есть, поэтому новый сохранится как «{1}».</value>
   </data>
+  <data name="RoutingEditor_NextRulePage" xml:space="preserve">
+    <value>Далее</value>
+  </data>
   <data name="RoutingEditor_NotARoutingList" xml:space="preserve">
     <value>Не похоже на список маршрутизации.</value>
   </data>
@@ -1515,6 +1521,9 @@
   </data>
   <data name="RoutingEditor_RuleEntriesShown" xml:space="preserve">
     <value>Показаны первые {0} из {1} записей</value>
+  </data>
+  <data name="RoutingEditor_RulePageRange" xml:space="preserve">
+    <value>{0}–{1} из {2}</value>
   </data>
   <data name="RoutingEditor_RuleNoEntries" xml:space="preserve">
     <value>Записей нет: категории нет в загруженных базах</value>

@@ -56,6 +56,55 @@ public sealed class RoutingRowsTests
     }
 
     [Fact]
+    public async Task APagedBucket_ShowsOnePageAtATimeAndCanReturnToTheStart()
+    {
+        var editor = await OpenAsync(2 * First + 1, paged: true);
+
+        Assert.True(editor.ShowRulePages);
+        Assert.False(editor.RowsPending);
+        Assert.Equal(0, editor.ShowMoreRows(First));
+        Assert.Equal(editor.Rules.Take(First), Tokens(editor));
+
+        editor.NextRulePageCommand.Execute(null);
+        Assert.Equal(editor.Rules.Skip(First).Take(First), Tokens(editor));
+
+        editor.NextRulePageCommand.Execute(null);
+        Assert.Equal(editor.Rules.Skip(2 * First), Tokens(editor));
+        Assert.False(editor.HasNextRulePage);
+
+        editor.PreviousRulePageCommand.Execute(null);
+        editor.PreviousRulePageCommand.Execute(null);
+        Assert.Equal(editor.Rules.Take(First), Tokens(editor));
+        Assert.False(editor.HasPreviousRulePage);
+        Assert.Equal(2 * First + 1, editor.Rules.Count);
+    }
+
+    [Fact]
+    public async Task APagedBucket_ReturnsToThePreviousPageWhenItsLastRowIsRemoved()
+    {
+        var editor = await OpenAsync(First + 1, paged: true);
+        editor.NextRulePageCommand.Execute(null);
+
+        editor.RemoveRuleCommand.Execute(Assert.Single(editor.RuleItems).Token);
+
+        Assert.Equal(editor.Rules, Tokens(editor));
+        Assert.False(editor.ShowRulePages);
+    }
+
+    [Fact]
+    public async Task AnotherPagedBucket_OpensOnItsFirstPage()
+    {
+        var editor = await OpenAsync(First + 1, First + 1, paged: true);
+        editor.NextRulePageCommand.Execute(null);
+
+        editor.RoleIndex = 1;
+
+        Assert.Equal(editor.DirectRules.Take(First), Tokens(editor));
+        Assert.False(editor.HasPreviousRulePage);
+        Assert.True(editor.HasNextRulePage);
+    }
+
+    [Fact]
     public async Task ARemovedRule_TakesItsRowAlone()
     {
         var editor = await OpenWholeAsync(100);
@@ -299,9 +348,9 @@ public sealed class RoutingRowsTests
         Assert.All(routing.RoutingEditor.RuleItems, row => Assert.IsType<FleetRoutingRuleItemViewModel>(row));
     }
 
-    private static async Task<RoutingListEditorViewModel> OpenAsync(int tunnel, int direct = 0)
+    private static async Task<RoutingListEditorViewModel> OpenAsync(int tunnel, int direct = 0, bool paged = false)
     {
-        var editor = new RoutingListEditorViewModel(new Lists(Listed(tunnel, direct)), 6, "main");
+        var editor = new RoutingListEditorViewModel(new Lists(Listed(tunnel, direct)), 6, "main") { UseRulePages = paged };
         await editor.LoadAsync();
         return editor;
     }
