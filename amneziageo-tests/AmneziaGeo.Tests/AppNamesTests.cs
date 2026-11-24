@@ -141,6 +141,39 @@ public sealed class AppNamesTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task AList_KeepsDistinctPathsWhenExpandingAnAppName()
+    {
+        const string upperPath = "path=/opt/vendor/Tool";
+        const string lowerPath = "path=/opt/vendor/tool";
+        var geo = new GeoConfigurator(_store, new NoFiles());
+        var id = await geo.ApplyToRoutingListAsync(0, "Apps", ["proxy|app:" + upperPath, "proxy|app:" + lowerPath, "proxy|app:Vendor Tool"]);
+        await AppFinds.SearchAsync(_store, ["vendor tool"],
+            [new("Vendor Tool", string.Empty, string.Empty, upperPath), new("Vendor Tool", string.Empty, string.Empty, lowerPath)]);
+        string[] expected = OperatingSystem.IsLinux() ? [upperPath, lowerPath] : [upperPath];
+
+        var stored = (await _store.GetRoutingListAsync(id))!;
+        var expanded = await AppFinds.ExpandListAsync(_store, stored);
+
+        Assert.Equal([upperPath, lowerPath, "Vendor Tool"], stored.Apps);
+        Assert.Equal(expected, (await AppFinds.ReadAsync(_store))["VENDOR TOOL"]);
+        Assert.Equal(expected, expanded.Apps);
+    }
+
+    [Fact]
+    public async Task ASearch_RefreshesTheCacheWhenOnlyThePathCaseChangesOnLinux()
+    {
+        const string oldPath = "path=/opt/vendor/Tool";
+        const string newPath = "path=/opt/vendor/tool";
+        await AppFinds.SearchAsync(_store, ["Vendor Tool"], [new("Vendor Tool", string.Empty, string.Empty, oldPath)]);
+
+        var result = await AppFinds.SearchAsync(_store, ["Vendor Tool"], [new("Vendor Tool", string.Empty, string.Empty, newPath)]);
+
+        string[] changed = OperatingSystem.IsLinux() ? ["Vendor Tool"] : [];
+        Assert.Equal(changed, result.Changed);
+        Assert.Equal(OperatingSystem.IsLinux() ? newPath : oldPath, Assert.Single((await AppFinds.ReadAsync(_store))["Vendor Tool"]));
+    }
+
+    [Fact]
     public async Task ASearch_KeepsWhatEachNameStandsForAndTellsWhatChanged()
     {
         var first = await AppFinds.SearchAsync(_store, ["Firefox", "Discord"], Programs);

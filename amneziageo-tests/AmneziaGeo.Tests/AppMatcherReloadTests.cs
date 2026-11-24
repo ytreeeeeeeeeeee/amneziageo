@@ -47,13 +47,17 @@ public class AppMatcherReloadTests
     private static AppMatcher Matcher(params string[] rules) => new(rules, NullLogger<AppMatcher>.Instance);
 
     [Theory]
-    [InlineData("path=Z:/Games/Missing Game/game.exe")]
-    [InlineData("dir=Z:/Games/Missing Game")]
-    public void AStoredRuleWithForwardSlashesMatchesTheWindowsProcessPath(string rule)
+    [InlineData("path=Z:/Games/Missing Game/game.exe", @"Z:\Games\Missing Game\game.exe")]
+    [InlineData("dir=Z:/Games/Missing Game", @"Z:\Games\Missing Game\game.exe")]
+    [InlineData(@"path=Z:\Games\\Missing Game\game.exe", @"Z:\Games\Missing Game\game.exe")]
+    [InlineData(@"dir=Z:\Games\\Missing Game", @"Z:\Games\Missing Game\game.exe")]
+    [InlineData(@"path=\\server\\share\Tools\\game.exe", @"\\server\share\Tools\game.exe")]
+    [InlineData(@"dir=\\server\\share\Tools", @"\\server\share\Tools\game.exe")]
+    public void AStoredRuleWithMixedOrRepeatedSeparatorsMatchesTheWindowsProcessPath(string rule, string processPath)
     {
         var matcher = Matcher(rule);
 
-        Assert.True(matcher.MatchesDevicePath(@"Z:\Games\Missing Game\game.exe"));
+        Assert.True(matcher.MatchesDevicePath(processPath));
     }
 
     [Theory]

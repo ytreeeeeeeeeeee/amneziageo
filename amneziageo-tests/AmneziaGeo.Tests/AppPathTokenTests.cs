@@ -18,9 +18,19 @@ public sealed class AppPathTokenTests
     [InlineData(WhatsAppDir)]
     [InlineData(@"%PROGRAMFILES%\WindowsApps\5319275A.WhatsAppDesktop_2.2628.101.0_x64__cv1g1gvanyjgm\WhatsApp.exe")]
     [InlineData(@"C:/Program Files/WindowsApps/5319275A.WhatsAppDesktop_2.2628.101.0_x64__cv1g1gvanyjgm/WhatsApp.exe")]
+    [InlineData(@"C:\Program Files\WindowsApps\\5319275A.WhatsAppDesktop_2.2628.101.0_x64__cv1g1gvanyjgm\\WhatsApp.exe")]
     public void PackageFamily_FromPackagedPath(string path)
     {
         Assert.Equal(WhatsAppFamily, AppPathToken.PackageFamilyFromPath(path));
+    }
+
+    [Theory]
+    [InlineData(@"Z:\Games\\Tools//Game.exe", @"Z:\Games\Tools\Game.exe")]
+    [InlineData(@"//server\\share/Tools//", @"\\server\share\Tools\")]
+    [InlineData(@"\\?\UNC\\server\share\\Tool.exe", @"\\?\UNC\server\share\Tool.exe")]
+    public void WindowsSeparatorsAreCollapsedWithoutChangingTheUncPrefix(string path, string expected)
+    {
+        Assert.Equal(expected, AppPathToken.NormalizeWindowsSeparators(path));
     }
 
     [Fact]

@@ -18,6 +18,12 @@ public static class AppNames
     private static readonly char[] _slashes = ['\\', '/'];
 
     /// <summary>
+    /// Compares rule values using the platform's path semantics. Displayed names use a separate comparison.
+    /// </summary>
+    public static StringComparer RuleValueComparer { get; } =
+        OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+
+    /// <summary>
     /// Tells whether an app rule value names a program to find: no kind before '=' and no folder in it.
     /// </summary>
     public static bool IsName(string value)
@@ -49,7 +55,7 @@ public static class AppNames
             }
         }
 
-        return [.. result.Distinct(StringComparer.OrdinalIgnoreCase)];
+        return [.. result.Distinct(RuleValueComparer)];
     }
 
     /// <summary>
@@ -81,7 +87,7 @@ public static class AppNames
     private static IReadOnlyList<string> Values(IEnumerable<NamedApp> programs)
     {
         var values = programs.Select(app => app.Value).Where(value => !OwnAppRule.Names("app:" + value))
-            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            .Distinct(RuleValueComparer).ToList();
 
         return [.. values.Where(value => !values.Any(other => Holds(other, value)))];
     }

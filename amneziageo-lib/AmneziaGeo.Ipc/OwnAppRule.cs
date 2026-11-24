@@ -40,7 +40,13 @@ public static class OwnAppRule
             return false;
         }
 
-        var path = AppPathToken.Tokenize(value.Replace('/', '\\').Trim('"').TrimEnd('\\'));
+        var unquoted = value.Trim('"');
+        if (OperatingSystem.IsLinux() && unquoted.StartsWith('/'))
+        {
+            return NamesLinuxPath(unquoted, LinuxAppPath.Resolve(unquoted));
+        }
+
+        var path = AppPathToken.Tokenize(unquoted.Replace('/', '\\').TrimEnd('\\'));
         var leaf = path[(path.LastIndexOf('\\') + 1)..];
         if (Images.Contains(leaf, StringComparer.OrdinalIgnoreCase))
         {
@@ -53,6 +59,24 @@ public static class OwnAppRule
             && (own.Equals(path, StringComparison.OrdinalIgnoreCase)
                 || AppPathToken.IsUnderDirectory(path, own)
                 || AppPathToken.IsUnderDirectory(own, path));
+    }
+
+    /// <summary>
+    /// Checks a Linux rule against both its original path and the resolved path used by the matcher.
+    /// </summary>
+    public static bool NamesLinuxPath(string path, string resolvedPath)
+    {
+        var own = LinuxAppPath.Resolve(AppContext.BaseDirectory).TrimEnd('/');
+        return MatchesLinuxPath(path, own) || MatchesLinuxPath(resolvedPath, own);
+    }
+
+    private static bool MatchesLinuxPath(string path, string own)
+    {
+        var value = path.TrimEnd('/');
+        return Images.Contains(Path.GetFileName(value), StringComparer.OrdinalIgnoreCase)
+            || (own.Length > 0 && (value.Equals(own, StringComparison.Ordinal)
+                || value.StartsWith(own + "/", StringComparison.Ordinal)
+                || own.StartsWith(value + "/", StringComparison.Ordinal)));
     }
 
     // Where this process runs from, in the same words a rule is written in.

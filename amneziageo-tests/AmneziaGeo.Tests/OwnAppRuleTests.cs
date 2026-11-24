@@ -47,6 +47,37 @@ public sealed class OwnAppRuleTests
         Assert.True(OwnAppRule.Names("app:path=" + Path.Combine(own, "anything.exe")));
     }
 
+    public static bool IsLinux => OperatingSystem.IsLinux();
+
+    [Fact(Skip = "Test requires Linux symbolic links.", SkipUnless = nameof(IsLinux))]
+    public void LinuxPathsResolveFileAndDirectoryLinksAndKeepMissingPaths()
+    {
+        var temp = Directory.CreateTempSubdirectory();
+        try
+        {
+            var real = temp.CreateSubdirectory("real").FullName;
+            var image = Path.Combine(real, "app");
+            File.WriteAllText(image, "");
+            var alias = Path.Combine(temp.FullName, "alias");
+            Directory.CreateSymbolicLink(alias, "real");
+            var fileAlias = Path.Combine(temp.FullName, "app-link");
+            File.CreateSymbolicLink(fileAlias, "alias/app");
+            var missing = Path.Combine(temp.FullName, "future", "app");
+
+            Assert.Equal(real, LinuxAppPath.Resolve(alias + "/"));
+            Assert.Equal(image, LinuxAppPath.Resolve(fileAlias));
+            Assert.Equal(missing, LinuxAppPath.Resolve(missing));
+
+            var ownAlias = Path.Combine(temp.FullName, "client");
+            Directory.CreateSymbolicLink(ownAlias, AppContext.BaseDirectory);
+            Assert.True(OwnAppRule.Names("app:dir=" + ownAlias));
+        }
+        finally
+        {
+            temp.Delete(recursive: true);
+        }
+    }
+
     [Fact]
     public void AFolderHoldingItIsNamedToo()
     {

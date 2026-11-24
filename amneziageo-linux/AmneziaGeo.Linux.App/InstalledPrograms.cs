@@ -72,7 +72,7 @@ internal static class InstalledPrograms
             {
                 if (DesktopEntry.Read(File.ReadAllLines(file), string.Empty) is { } entry)
                 {
-                    var image = Resolved(entry.Image);
+                    var image = LinuxAppPath.Resolve(entry.Image);
                     programs.Add(new NamedApp(entry.Name, image, string.Empty, "path=" + image));
                 }
             }
@@ -95,7 +95,7 @@ internal static class InstalledPrograms
                     continue;
                 }
 
-                var image = Resolved(file);
+                var image = LinuxAppPath.Resolve(file);
                 programs.Add(new NamedApp(string.Empty, file, string.Empty, "path=" + image));
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -103,50 +103,6 @@ internal static class InstalledPrograms
                 // A file that cannot be read stays out of the list.
             }
         }
-    }
-
-    // How many links to folders one path may lead through.
-    private const int FolderLinks = 40;
-
-    // The file a path runs once its links and the links to its folders are followed.
-    private static string Resolved(string path)
-    {
-        try
-        {
-            var file = File.ResolveLinkTarget(path, returnFinalTarget: true)?.FullName ?? path;
-            var folder = Path.GetDirectoryName(file);
-
-            return folder is { Length: > 0 } ? Path.Combine(RealFolder(folder, FolderLinks), Path.GetFileName(file)) : file;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return path;
-        }
-    }
-
-    // The folder with every link along it followed.
-    private static string RealFolder(string folder, int links)
-    {
-        var real = "/";
-        foreach (var part in folder.Split('/', StringSplitOptions.RemoveEmptyEntries))
-        {
-            var next = Path.GetFullPath(Path.Combine(real, part));
-            var target = new DirectoryInfo(next).ResolveLinkTarget(returnFinalTarget: true)?.FullName;
-            if (target is null)
-            {
-                real = next;
-            }
-            else if (links > 0)
-            {
-                real = RealFolder(target, links - 1);
-            }
-            else
-            {
-                throw new IOException($"too many links to folders on {folder}");
-            }
-        }
-
-        return real;
     }
 
     private static IEnumerable<string> Files(string folder, string pattern)

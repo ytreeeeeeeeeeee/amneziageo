@@ -196,12 +196,13 @@ public static class AppFinds
             }
 
             var known = held.TryGetValue(name, out var before);
-            if (known && before!.SequenceEqual(found, StringComparer.OrdinalIgnoreCase))
+            var same = (before ?? []).SequenceEqual(found, AppNames.RuleValueComparer);
+            if (known && same)
             {
                 continue;
             }
 
-            if (!(before ?? []).SequenceEqual(found, StringComparer.OrdinalIgnoreCase))
+            if (!same)
             {
                 changed.Add(name);
             }

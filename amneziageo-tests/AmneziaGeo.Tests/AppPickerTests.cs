@@ -60,6 +60,8 @@ public sealed class AppPickerTests
     [InlineData(@"app:dir=Z:\Games\Folder.exe", @"app:dir=Z:\Games\Folder.exe\")]
     [InlineData(@"app:dir=Z:\Tools\v1.2", @"app:dir=Z:\Tools\v1.2\")]
     [InlineData(@"app:dir=%LOCALAPPDATA%\Missing Game", @"app:dir=%LOCALAPPDATA%\Missing Game\")]
+    [InlineData(@"app:dir=\\server\\share\Missing Game", @"app:dir=\\server\share\Missing Game\")]
+    [InlineData(@"Z:\Games\\Missing Game\game.exe", @"app:path=Z:\Games\Missing Game\game.exe")]
     public void AnExplicitWindowsPath_IsOfferedAndAddedWithoutAnAppMatch(string input, string token)
     {
         var runningApps = new TaskCompletionSource<IpcAck>();
@@ -87,6 +89,8 @@ public sealed class AppPickerTests
     [Theory]
     [InlineData(@"Z:\Games\Missing Game\game.exe", @"app:path=Z:\Games\Missing Game\game.exe")]
     [InlineData(@"Z:\Games\Missing Game", @"app:dir=Z:\Games\Missing Game\")]
+    [InlineData(@"Z:\Games\\Missing Game\game.exe", @"app:path=Z:\Games\Missing Game\game.exe")]
+    [InlineData(@"\\server\\share\Missing Game", @"app:dir=\\server\share\Missing Game\")]
     public void ACustomWindowsPathVariable_UsesTheExpandedPathForTheKindAndRule(string path, string token)
     {
         var variable = $"AMNEZIAGEO_PATH_TEST_{Guid.NewGuid():N}";
@@ -121,6 +125,57 @@ public sealed class AppPickerTests
         editor.RuleInput = @"Z:\Games\Missing Game\";
 
         Assert.Empty(editor.MatchedSuggestions);
+    }
+
+    [Theory]
+    [InlineData("app:path=/opt/vendor/tool", "app:path=/opt/vendor/tool")]
+    [InlineData("app:dir=/opt/vendor/app-1.2", "app:dir=/opt/vendor/app-1.2/")]
+    [InlineData("/opt/vendor/Toolkit.AppImage/", "app:dir=/opt/vendor/Toolkit.AppImage/")]
+    [InlineData("/opt//vendor//app-1.2//", "app:dir=/opt/vendor/app-1.2/")]
+    public void AnExplicitLinuxPathKeepsTheRequestedRuleKind(string path, string token)
+    {
+        var suggestion = Assert.Single(RoutingListEditorViewModel.ExplicitPathSuggestions(path, linux: true));
+
+        Assert.Equal(token, suggestion.Token);
+    }
+
+    [Fact]
+    public void AnUntypedLinuxPathOffersBothRulesWithoutAnApplicationMatch()
+    {
+        var suggestions = RoutingListEditorViewModel.ExplicitPathSuggestions("/opt/vendor/tool", linux: true);
+
+        Assert.Equal(["app:path=/opt/vendor/tool", "app:dir=/opt/vendor/tool/"],
+            suggestions.Select(item => item.Token));
+    }
+
+    [Theory]
+    [InlineData("tool")]
+    [InlineData("app:dir=relative/path")]
+    [InlineData("app:path=/opt/vendor/../tool")]
+    public void LinuxPathSuggestionsRequireACanonicalAbsolutePath(string path)
+    {
+        Assert.Empty(RoutingListEditorViewModel.ExplicitPathSuggestions(path, linux: true));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ALeadingLinuxVariableCanSupplyTheAbsoluteDirectory(bool braces)
+    {
+        var variable = $"AMNEZIAGEO_PATH_TEST_{Guid.NewGuid():N}";
+        Environment.SetEnvironmentVariable(variable, "/opt/vendor/");
+        try
+        {
+            var expression = braces ? "$" + "{" + variable + "}" : "$" + variable;
+            var suggestion = Assert.Single(RoutingListEditorViewModel.ExplicitPathSuggestions(
+                "app:dir=" + expression + "/app-1.2", linux: true));
+
+            Assert.Equal("app:dir=/opt/vendor/app-1.2/", suggestion.Token);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable, null);
+        }
     }
 
     [Theory]

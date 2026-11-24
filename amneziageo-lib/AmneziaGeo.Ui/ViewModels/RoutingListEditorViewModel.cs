@@ -1076,16 +1076,23 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
         OnPropertyChanged(nameof(ShowDropdownSuggestions));
     }
 
-    // An explicit Windows path can be added before any matches from the running and installed lists.
+    // An explicit path can be added before any matches from the running and installed lists.
     private IReadOnlyList<RoutingSuggestionViewModel> MatchApps(string query)
     {
-        var held = new HashSet<string>(Rules.Select(AppPathToken.NormalizeAppRule), StringComparer.OrdinalIgnoreCase);
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var linux = OperatingSystem.IsLinux();
+        var comparer = linux ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+        var held = new HashSet<string>(Rules.Select(AppPathToken.NormalizeAppRule), comparer);
+        var seen = new HashSet<string>(comparer);
         var matches = new List<RoutingSuggestionViewModel>();
-        if (OperatingSystem.IsWindows() && WindowsPathSuggestion(query) is { } direct && !held.Contains(direct.Token))
+        if (OperatingSystem.IsWindows() || linux)
         {
-            seen.Add(direct.Token);
-            matches.Add(direct);
+            foreach (var direct in ExplicitPathSuggestions(query, linux))
+            {
+                if (!held.Contains(direct.Token) && seen.Add(direct.Token))
+                {
+                    matches.Add(direct);
+                }
+            }
         }
 
         foreach (var group in _appGroups)
@@ -1109,7 +1116,7 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
         return matches;
     }
 
-    private static RoutingSuggestionViewModel? WindowsPathSuggestion(string query)
+    internal static IEnumerable<RoutingSuggestionViewModel> ExplicitPathSuggestions(string query, bool linux)
     {
         const string filePrefix = "app:path=";
         const string folderPrefix = "app:dir=";
@@ -1119,18 +1126,77 @@ internal partial class RoutingListEditorViewModel : ViewModelBase, IEditScope
             : isFolder ? query[folderPrefix.Length..]
             : query;
         path = path.Trim().Trim('"');
-        var absolutePath = AppPathToken.ExpandInputPath(path);
-        if (!System.IO.Path.IsPathFullyQualified(absolutePath)
-            || absolutePath.Split('\\', '/').Any(component => component is "." or ".."))
+        if (path.Contains('\0'))
         {
-            return null;
+            yield break;
         }
 
-        isFile |= !isFolder && absolutePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
-        var token = AppPathToken.NormalizeAppRule((isFile ? filePrefix : folderPrefix) + absolutePath);
-        return new RoutingSuggestionViewModel(token, Loc.Instance.Get(isFile
-            ? "RoutingEditor_AddExactApplication"
-            : "RoutingEditor_AddWholeFolder"));
+        var absolutePath = linux ? ExpandLinuxPath(path) : AppPathToken.ExpandInputPath(path);
+        var components = linux ? absolutePath.Split('/') : absolutePath.Split('\\', '/');
+        if (!(linux ? absolutePath.StartsWith('/') : System.IO.Path.IsPathFullyQualified(absolutePath))
+            || components.Any(component => component is "." or ".."))
+        {
+            yield break;
+        }
+
+        // Linux executables often have no extension. A bare path can describe either kind.
+        var folderHint = linux && absolutePath.EndsWith('/');
+        var ambiguous = linux && !isFile && !isFolder && !folderHint;
+        isFile |= !isFolder && (linux ? !folderHint : absolutePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
+        if (linux)
+        {
+            absolutePath = "/" + string.Join('/', components.Where(component => component.Length > 0));
+        }
+
+        yield return Suggest(isFile);
+        if (ambiguous)
+        {
+            yield return Suggest(file: false);
+        }
+
+        RoutingSuggestionViewModel Suggest(bool file)
+        {
+            var token = (file ? filePrefix : folderPrefix) + absolutePath;
+            if (!linux)
+            {
+                token = AppPathToken.NormalizeAppRule(token);
+            }
+            else if (!file && !absolutePath.EndsWith('/'))
+            {
+                token += "/";
+            }
+            return new RoutingSuggestionViewModel(token, Loc.Instance.Get(file
+                ? "RoutingEditor_AddExactApplication"
+                : "RoutingEditor_AddWholeFolder"));
+        }
+    }
+
+    private static string ExpandLinuxPath(string path)
+    {
+        var slash = path.IndexOf('/');
+        var prefix = slash < 0 ? path : path[..slash];
+        string? root = null;
+        if (prefix == "~")
+        {
+            root = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        }
+        else if (prefix.StartsWith('$'))
+        {
+            var name = prefix[1..];
+            if (name.Length >= 2 && name.StartsWith('{') && name.EndsWith('}'))
+            {
+                name = name[1..^1];
+            }
+
+            root = name.Length > 0 ? Environment.GetEnvironmentVariable(name) : null;
+        }
+
+        if (string.IsNullOrEmpty(root))
+        {
+            return path;
+        }
+
+        return slash < 0 ? root : root.TrimEnd('/') + path[slash..];
     }
 
     // Matches the name and the path alike: both get typed.

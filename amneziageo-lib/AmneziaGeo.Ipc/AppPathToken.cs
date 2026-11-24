@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace AmneziaGeo.Ipc;
 
 /// <summary>
@@ -174,13 +176,40 @@ public static class AppPathToken
         tail.IsEmpty ? root : root.Length == 0 ? tail.ToString() : string.Concat(root, "\\", tail);
 
     private static string NormalizeSeparators(string path) =>
-        OperatingSystem.IsWindows() ? path.Replace('/', '\\') : path;
+        OperatingSystem.IsWindows() ? NormalizeWindowsSeparators(path) : path;
+
+    internal static string NormalizeWindowsSeparators(string path)
+    {
+        path = path.Replace('/', '\\');
+
+        // UNC and device paths start with two separators.
+        var start = path.StartsWith(@"\\", StringComparison.Ordinal) ? 1 : 0;
+        var repeated = path.IndexOf(@"\\", start, StringComparison.Ordinal);
+        if (repeated < 0)
+        {
+            return path;
+        }
+
+        var normalized = new StringBuilder(path.Length);
+        normalized.Append(path, 0, repeated + 1);
+        for (var i = repeated + 1; i < path.Length; i++)
+        {
+            if (path[i] != '\\' || path[i - 1] != '\\')
+            {
+                normalized.Append(path[i]);
+            }
+        }
+
+        return normalized.ToString();
+    }
 
     private static char DirectorySeparator(string path) =>
         !OperatingSystem.IsWindows() && path.StartsWith('/') ? '/' : '\\';
 
     private static string WithTrailingSeparator(string directory) =>
-        directory.Length == 0 ? directory : directory.TrimEnd(_separators) + DirectorySeparator(directory);
+        directory.Length == 0 ? directory : DirectorySeparator(directory) == '/'
+            ? directory.TrimEnd('/') + '/'
+            : directory.TrimEnd(_separators) + '\\';
 
     // The user profiles on this machine.
     private static IReadOnlyList<string> Profiles()
@@ -308,8 +337,8 @@ public static class AppPathToken
             if (kind.Equals("app:dir", StringComparison.OrdinalIgnoreCase)
                 || kind.Equals("app:path", StringComparison.OrdinalIgnoreCase))
             {
-                var family = PackageFamilyFromPath(token[(eq + 1)..]);
-                if (family is not null)
+                var path = token[(eq + 1)..];
+                if (!(OperatingSystem.IsLinux() && path.StartsWith('/')) && PackageFamilyFromPath(path) is { } family)
                 {
                     return "app:pkg=" + family;
                 }
@@ -332,7 +361,7 @@ public static class AppPathToken
         }
 
         const string marker = "\\WindowsApps\\";
-        var norm = path.Replace('/', '\\');
+        var norm = NormalizeWindowsSeparators(path);
         var at = norm.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
         if (at < 0)
         {
@@ -386,7 +415,7 @@ public static class AppPathToken
         var pub = Environment.GetEnvironmentVariable("PUBLIC");
         if (!string.IsNullOrEmpty(pub))
         {
-            var root = System.IO.Path.GetDirectoryName(pub);
+            var root = System.IO.Path.GetDirectoryName(NormalizeSeparators(pub));
             if (!string.IsNullOrEmpty(root))
             {
                 return root.TrimEnd('\\', '/');
@@ -409,6 +438,6 @@ public static class AppPathToken
 
     private static string Env(string name)
     {
-        return (Environment.GetEnvironmentVariable(name) ?? string.Empty).TrimEnd('\\', '/');
+        return NormalizeSeparators(Environment.GetEnvironmentVariable(name) ?? string.Empty).TrimEnd(_separators);
     }
 }

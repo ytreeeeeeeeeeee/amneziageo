@@ -80,7 +80,7 @@ internal sealed partial class RoutingEditorView : UserControl
         await PutPickedAsync(PickFolderAsync, "app:dir=");
     }
 
-    private async Task PutPickedAsync(Func<Task<string?>> pick, string windowsPrefix)
+    private async Task PutPickedAsync(Func<Task<string?>> pick, string rulePrefix)
     {
         if ((DataContext as RoutingViewModel)?.RoutingEditor is not { } vm)
         {
@@ -90,7 +90,7 @@ internal sealed partial class RoutingEditorView : UserControl
         var path = await pick();
         if (!string.IsNullOrEmpty(path))
         {
-            vm.RuleInput = OperatingSystem.IsWindows() ? windowsPrefix + path : path;
+            vm.RuleInput = OperatingSystem.IsWindows() || OperatingSystem.IsLinux() ? rulePrefix + path : path;
         }
     }
 
