@@ -77,6 +77,45 @@ internal sealed record TunnelRouting(
         return FromPolicy(await geo.LoadPolicyAsync(ids, AppRulePlatform.Linux, ct: ct).ConfigureAwait(false));
     }
 
+    public static async Task<TunnelRouting> LoadForConnectAsync(IStateStore store, GeoConfigurator geo, string name,
+        Func<long, CancellationToken, Task> takeVersion, CancellationToken ct)
+    {
+        if (!await ConfigRouting.AllowedAsync(store, name, ct).ConfigureAwait(false))
+        {
+            return None;
+        }
+
+        var ids = await store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false) ?? [];
+        foreach (var id in ids)
+        {
+            if (await PendingReadOnlyAsync(id).ConfigureAwait(false))
+            {
+                try
+                {
+                    await takeVersion(id, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    throw new InvalidDataException("The server's read-only routing list could not be updated before connecting.", ex);
+                }
+            }
+        }
+
+        var routing = FromPolicy(await geo.LoadPolicyAsync(ids, AppRulePlatform.Linux, ct: ct).ConfigureAwait(false));
+        foreach (var id in ids)
+        {
+            if (await PendingReadOnlyAsync(id).ConfigureAwait(false))
+            {
+                throw new InvalidDataException("The server's read-only routing list is waiting for its update.");
+            }
+        }
+
+        return routing;
+
+        async Task<bool> PendingReadOnlyAsync(long id) =>
+            await store.GetRoutingListOriginAsync(id, ct).ConfigureAwait(false) is { ReadOnly: true, Pending: not null };
+    }
+
     public static TunnelRouting FromPolicy(RoutingPolicy? policy)
     {
         if (policy is null)

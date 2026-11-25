@@ -8,14 +8,16 @@ namespace AmneziaGeo.Linux.App;
 /// <summary>
 /// Portable bundles: exports the selected configs and routing lists, and imports them back.
 /// </summary>
-internal sealed class BundleCommands(IStateStore store, GeoConfigurator geo)
+internal sealed class BundleCommands(IStateStore store, GeoConfigurator geo, AgentLog log,
+    Func<RoutingSelectionChange, CancellationToken, Task<IpcAck>> changeRouting)
 {
     // Export selection from OpExportBundle's arg0 JSON; all arrays optional. A routing list goes by its number or
     // by its name; RoutingRules maps that word to the rule tokens to KEEP; an absent list keeps all its rules.
     private sealed record SelectionRequest(
         string[]? Configs,
         string[]? RoutingLists,
-        Dictionary<string, string[]>? RoutingRules);
+        Dictionary<string, string[]>? RoutingRules,
+        bool IncludeRoutingSelection = false);
 
     /// <summary>
     /// Builds a bundle from the selected configs and routing lists.
@@ -38,7 +40,8 @@ internal sealed class BundleCommands(IStateStore store, GeoConfigurator geo)
         var pickedConfigs = new HashSet<string>(configNames, StringComparer.Ordinal);
         var missing = new List<string>();
 
-        if (configNames.Count == 0 && routingNames.Count == 0)
+        var full = selection.IncludeRoutingSelection && selection.RoutingRules is not { Count: > 0 };
+        if (configNames.Count == 0 && routingNames.Count == 0 && !full)
         {
             return new IpcAck(false, IpcMessage.Key("Agent_NothingSelectedForExport"));
         }
@@ -72,28 +75,27 @@ internal sealed class BundleCommands(IStateStore store, GeoConfigurator geo)
         }
 
         var routingBlocks = new List<PortableBundle.RoutingBlock>();
-        if (routingNames.Count > 0)
+        var (picked, unknown) = routingNames.Count == 0
+            ? ([], [])
+            : BundleLists.Pick(await store.ListRoutingListsAsync(ct).ConfigureAwait(false), routingNames);
+        missing.AddRange(unknown);
+        foreach (var (key, list) in picked)
         {
-            var (picked, unknown) = BundleLists.Pick(await store.ListRoutingListsAsync(ct).ConfigureAwait(false), routingNames);
-            missing.AddRange(unknown);
-            foreach (var (key, list) in picked)
+            // Role-tagged: bare tokens would re-import every rule as Proxy and drop its bucket.
+            var rules = list.Rules.Select(GeoConfigurator.FormatWithRole).ToList();
+
+            // Rules the user unchecked in the export tree are dropped; no entry keeps the whole list.
+            if (selection.RoutingRules is not null && selection.RoutingRules.TryGetValue(key, out var kept))
             {
-                // Role-tagged: bare tokens would re-import every rule as Proxy and drop its bucket.
-                var rules = list.Rules.Select(GeoConfigurator.FormatWithRole).ToList();
-
-                // Rules the user unchecked in the export tree are dropped; no entry keeps the whole list.
-                if (selection.RoutingRules is not null && selection.RoutingRules.TryGetValue(key, out var kept))
-                {
-                    var keepSet = new HashSet<string>(kept, StringComparer.Ordinal);
-                    rules = [.. rules.Where(keepSet.Contains)];
-                }
-
-                var settingsBlock = await store.GetRoutingSettingsAsync(list.Id, ct).ConfigureAwait(false) is { } settings
-                    ? new PortableBundle.RoutingSettingsBlock(settings.Exclusions, settings.AllUdp, settings.Mode, settings.UseGlobalProxy)
-                    : null;
-
-                routingBlocks.Add(new PortableBundle.RoutingBlock(list.Name, rules, settingsBlock, list.Uid));
+                var keepSet = new HashSet<string>(kept, StringComparer.Ordinal);
+                rules = [.. rules.Where(keepSet.Contains)];
             }
+
+            var settingsBlock = await store.GetRoutingSettingsAsync(list.Id, ct).ConfigureAwait(false) is { } settings
+                ? new PortableBundle.RoutingSettingsBlock(settings.Exclusions, settings.AllUdp, settings.Mode, settings.UseGlobalProxy)
+                : null;
+
+            routingBlocks.Add(new PortableBundle.RoutingBlock(list.Name, rules, settingsBlock, list.Uid));
         }
 
         if (missing.Count > 0)
@@ -105,7 +107,8 @@ internal sealed class BundleCommands(IStateStore store, GeoConfigurator geo)
             PortableBundle.FormatTag,
             PortableBundle.CurrentVersion,
             configBlocks,
-            routingBlocks);
+            routingBlocks,
+            ActiveRoutingListIds: await BundleLists.ExportSelectionAsync(store, picked, full, ct).ConfigureAwait(false));
         return new IpcAck(true, PortableBundle.Serialize(bundle));
     }
 
@@ -204,6 +207,10 @@ internal sealed class BundleCommands(IStateStore store, GeoConfigurator geo)
                 {
                     await store.SetRoutingSettingsAsync(new RoutingSettings(existingList.Id, existingSettings.Exclusions, existingSettings.AllUdp, existingSettings.Mode, existingSettings.UseGlobalProxy), ct).ConfigureAwait(false);
                 }
+                else if (!merge)
+                {
+                    await store.RemoveRoutingSettingsAsync(existingList.Id, ct).ConfigureAwait(false);
+                }
 
                 importedLists++;
                 continue;
@@ -217,6 +224,14 @@ internal sealed class BundleCommands(IStateStore store, GeoConfigurator geo)
             }
 
             importedLists++;
+        }
+
+        if (!await BundleLists.RestoreSelectionAsync(store, bundle, changeRouting,
+                message => log.Info("routing", message),
+                message => log.Warn("routing", message),
+                message => log.Error("routing", message), ct).ConfigureAwait(false))
+        {
+            return new IpcAck(false, "The backup contents were imported, but the routing selection could not be restored.");
         }
 
         var shown = renames.Distinct(StringComparer.Ordinal).ToList();

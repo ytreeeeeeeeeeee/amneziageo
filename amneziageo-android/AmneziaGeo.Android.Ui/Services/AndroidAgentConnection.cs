@@ -2884,7 +2884,8 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     private sealed record BundleSelection(
         string[]? Configs,
         string[]? RoutingLists,
-        Dictionary<string, string[]>? RoutingRules);
+        Dictionary<string, string[]>? RoutingRules,
+        bool IncludeRoutingSelection = false);
 
     // Packs the picked configs and routing lists into a portable bundle.
     private async Task<IpcAck> ExportBundleAsync(IReadOnlyList<string> args)
@@ -2905,7 +2906,8 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         var configNames = new HashSet<string>(selection.Configs ?? [], StringComparer.Ordinal);
         var routingNames = new HashSet<string>(selection.RoutingLists ?? [], StringComparer.Ordinal);
 
-        if (configNames.Count == 0 && routingNames.Count == 0)
+        var full = selection.IncludeRoutingSelection && selection.RoutingRules is not { Count: > 0 };
+        if (configNames.Count == 0 && routingNames.Count == 0 && !full)
         {
             return new IpcAck(false, IpcMessage.Key("Agent_NothingSelectedForExport"));
         }
@@ -2941,32 +2943,25 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         var routingBlocks = new List<PortableBundle.RoutingBlock>();
-        var activeList = default(RoutingList);
-        if (routingNames.Count > 0)
+        var (picked, _) = routingNames.Count == 0
+            ? ([], [])
+            : BundleLists.Pick(await _store.ListRoutingListsAsync().ConfigureAwait(false), routingNames);
+        foreach (var (key, list) in picked)
         {
-            var (picked, _) = BundleLists.Pick(await _store.ListRoutingListsAsync().ConfigureAwait(false), routingNames);
-            foreach (var (key, list) in picked)
+            // Role-tagged tokens: bare ones would re-import every rule as Proxy.
+            var rules = list.Rules.Select(GeoConfigurator.FormatWithRole).ToList();
+            if (selection.RoutingRules is not null && selection.RoutingRules.TryGetValue(key, out var kept))
             {
-                if (SelectedRoutingList == list.Id)
-                {
-                    activeList = list;
-                }
-
-                // Role-tagged tokens: bare ones would re-import every rule as Proxy.
-                var rules = list.Rules.Select(GeoConfigurator.FormatWithRole).ToList();
-                if (selection.RoutingRules is not null && selection.RoutingRules.TryGetValue(key, out var kept))
-                {
-                    var keep = new HashSet<string>(kept, StringComparer.Ordinal);
-                    rules = rules.Where(keep.Contains).ToList();
-                }
-
-                var settings = await _store.GetRoutingSettingsAsync(list.Id).ConfigureAwait(false);
-                routingBlocks.Add(new PortableBundle.RoutingBlock(
-                    list.Name,
-                    rules,
-                    settings is null ? null : new PortableBundle.RoutingSettingsBlock(settings.Exclusions, settings.AllUdp),
-                    list.Uid));
+                var keep = new HashSet<string>(kept, StringComparer.Ordinal);
+                rules = rules.Where(keep.Contains).ToList();
             }
+
+            var settings = await _store.GetRoutingSettingsAsync(list.Id).ConfigureAwait(false);
+            routingBlocks.Add(new PortableBundle.RoutingBlock(
+                list.Name,
+                rules,
+                settings is null ? null : new PortableBundle.RoutingSettingsBlock(settings.Exclusions, settings.AllUdp, settings.Mode, settings.UseGlobalProxy),
+                list.Uid));
         }
 
         var activeConfig = _selectedTarget is { Length: > 0 } selected
@@ -2980,8 +2975,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             configBlocks,
             routingBlocks,
             ActiveConfig: activeConfig,
-            ActiveRoutingList: activeList?.Name,
-            ActiveRoutingListId: activeList?.Uid);
+            ActiveRoutingListIds: await BundleLists.ExportSelectionAsync(_store, picked, full).ConfigureAwait(false));
         _log.Info("agent", $"exported bundle: {configBlocks.Count} configs, {routingBlocks.Count} routing lists");
         return new IpcAck(true, PortableBundle.Serialize(bundle));
     }
@@ -3030,6 +3024,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         var renames = new List<string>();
         var importedConfigs = new Dictionary<string, string>(StringComparer.Ordinal);
         var importedLists = new List<(PortableBundle.RoutingBlock Block, long Id)>();
+        var replacedLists = new HashSet<long>();
 
         foreach (var block in bundle.Configs)
         {
@@ -3072,7 +3067,15 @@ internal sealed class AndroidAgentConnection : IAgentConnection
                         ? existing.Rules.Select(GeoConfigurator.FormatWithRole).Concat(block.Rules).Distinct(StringComparer.Ordinal).ToList()
                         : block.Rules.ToList();
                     await _geo.ApplyToRoutingListAsync(existing.Id, merge ? existing.Name : BundleLists.NameOf(block), merged).ConfigureAwait(false);
-                    await ApplyRoutingSettingsAsync(existing.Id, block.Settings).ConfigureAwait(false);
+                    if (block.Settings is null && !merge)
+                    {
+                        await _store.RemoveRoutingSettingsAsync(existing.Id).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await ApplyRoutingSettingsAsync(existing.Id, block.Settings).ConfigureAwait(false);
+                    }
+                    replacedLists.Add(existing.Id);
                 }
 
                 importedLists.Add((block, existing.Id));
@@ -3092,8 +3095,22 @@ internal sealed class AndroidAgentConnection : IAgentConnection
 
         await RestoreBundleSelectionAsync(bundle, importedConfigs, importedLists).ConfigureAwait(false);
         Save();
+        var restored = await BundleLists.RestoreSelectionAsync(_store, bundle, (change, _) => ChangeRoutingAsync(change),
+            message => _log.Info("routing", message),
+            message => _log.Warn("routing", message),
+            message => _log.Error("routing", message)).ConfigureAwait(false);
+        foreach (var id in replacedLists)
+        {
+            MarkRoutingChanged(id);
+        }
+
         await RefreshRoutingSummariesAsync().ConfigureAwait(false);
         PushSnapshot();
+        if (!restored)
+        {
+            return new IpcAck(false, "The backup contents were imported, but the routing selection could not be restored.");
+        }
+
         _log.Info("agent", $"imported bundle: {bundle.Configs.Count} configs, {bundle.RoutingLists.Count} routing lists");
 
         if (renames.Count == 0)
@@ -3119,7 +3136,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             bundle.RoutingLists.Count));
     }
 
-    // Ставит выбор из бандла, пока своего нет: чужой выбор при восстановлении не трогается.
+    // Restores defaults from older Android backups that identified the routing list only by name.
     private async Task RestoreBundleSelectionAsync(
         PortableBundle.Bundle bundle,
         IReadOnlyDictionary<string, string> configs,
@@ -3133,22 +3150,27 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             _log.Info("agent", $"the bundle's server is selected again: {name}");
         }
 
-        // The list in use is found by its id; a bundle of an earlier build names it only.
-        var active = bundle.ActiveRoutingListId is { Length: > 0 } uid
-            ? lists.FirstOrDefault(one => string.Equals(one.Block.Id, uid, StringComparison.Ordinal))
-            : lists.FirstOrDefault(one => bundle.ActiveRoutingList is { Length: > 0 } named && string.Equals(one.Block.Name, named, StringComparison.Ordinal));
-        if (active.Block is not null)
+        if (bundle.ActiveRoutingListIds is not null || !string.IsNullOrEmpty(bundle.ActiveRoutingListId)
+            || string.IsNullOrEmpty(bundle.ActiveRoutingList))
+        {
+            return;
+        }
+
+        var namedLists = lists.Where(one => string.Equals(one.Block.Name, bundle.ActiveRoutingList, StringComparison.Ordinal))
+            .Select(one => one.Id).Distinct().ToArray();
+        if (namedLists.Length == 1
+            && ServerListsOnly.RefusalOfSet(await ServerListsLimitAsync().ConfigureAwait(false), namedLists) is null)
         {
             var restored = false;
             await _store.UpdateSelectedRoutingListsAsync(current =>
             {
                 restored = current is null;
-                return restored ? [active.Id] : null;
+                return restored ? namedLists : null;
             }).ConfigureAwait(false);
             await RefreshRoutingSelectionAsync().ConfigureAwait(false);
             if (restored)
             {
-                _log.Info("agent", $"the bundle's routing list is applied again: {active.Block.Name}");
+                _log.Info("routing", "restored the legacy backup routing selection: 1 list");
             }
         }
     }
@@ -3191,7 +3213,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         await _store.SetRoutingSettingsAsync(
-            new RoutingSettings(listId, settings.Exclusions, settings.AllUdp, "split")).ConfigureAwait(false);
+            new RoutingSettings(listId, settings.Exclusions, settings.AllUdp, settings.Mode, settings.UseGlobalProxy)).ConfigureAwait(false);
     }
 
     // Stores a config's websocket switch and front, tunnel MTU and IPv6 opt-in; all reach the tunnel builder on the
@@ -4473,7 +4495,8 @@ internal sealed class AndroidAgentConnection : IAgentConnection
                 new BundleSources(
                     Cache: _ => Task.FromResult(held.Sessions.Count == 0 ? "the tunnel holds nothing right now" : held.Render()),
                     Recent: _ => Task.FromResult(RecentLog.Merge(_log.Recent.Snapshot(), RecentLog.Parse(VpnBridge.ReadRecent()))),
-                    Library: new BundleLibrary([.. _order.Where(texts.ContainsKey)], name => texts.GetValueOrDefault(name), SelectedRoutingList))).ConfigureAwait(false);
+                    Library: new BundleLibrary([.. _order.Where(texts.ContainsKey)], name => texts.GetValueOrDefault(name)),
+                    AppliedRoutingListIds: Volatile.Read(ref _appliedRequest)?.Plan?.ListIds ?? [])).ConfigureAwait(false);
             _log.Info("agent", $"diagnostics archive written to {path}; keys and credentials in it are masked");
             return new IpcAck(true, path);
         }

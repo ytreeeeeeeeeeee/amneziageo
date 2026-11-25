@@ -255,6 +255,24 @@ public sealed class DiagnosticsBundleTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task RequestedAndAppliedRouting_UseStableUids()
+    {
+        var first = await _store.SaveRoutingListAsync(new RoutingList(0, "same", [], [], [], [], [], [], [], [], [], "requested-a"));
+        var second = await _store.SaveRoutingListAsync(new RoutingList(0, "same", [], [], [], [], [], [], [], [], [], "requested-b"));
+        await _store.UpdateSelectedRoutingListsAsync(_ => [first, second]);
+
+        var bundle = new DiagnosticsBundle(_store, _logs);
+        var path = await bundle.WriteAsync(Path.Combine(_root, "out"), "header\n", row => row.Message,
+            new BundleSources(AppliedRoutingListIds: [second, long.MaxValue]));
+
+        using var zip = ZipFile.OpenRead(path);
+        var summary = await TextAsync(zip, "summary.txt");
+        Assert.Contains("requested list UIDs: requested-a, requested-b", summary, StringComparison.Ordinal);
+        Assert.Contains("applied list UIDs: requested-b (1 UID(s) unavailable)", summary, StringComparison.Ordinal);
+        Assert.DoesNotContain(long.MaxValue.ToString(), summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task TheLibraryOfThePlatform_StandsInForTheStore()
     {
         const string text = "[Interface]\nPrivateKey = topSecretKey\n\n[Peer]\nPublicKey = serverKey\nEndpoint = 10.0.0.1:51820\n";
@@ -265,7 +283,7 @@ public sealed class DiagnosticsBundleTests : IAsyncLifetime
             Path.Combine(_root, "out"),
             "header\n",
             row => row.Message,
-            new BundleSources(Library: new BundleLibrary(["phone"], name => name == "phone" ? text : null, 7)));
+            new BundleSources(Library: new BundleLibrary(["phone"], name => name == "phone" ? text : null)));
 
         using var zip = ZipFile.OpenRead(path);
         var summary = await TextAsync(zip, "summary.txt");
@@ -273,7 +291,7 @@ public sealed class DiagnosticsBundleTests : IAsyncLifetime
         Assert.Contains("  phone:", summary, StringComparison.Ordinal);
         Assert.Contains("mtu:        1380", summary, StringComparison.Ordinal);
         Assert.Contains("websocket:  on -> 10.0.0.1:51820 (settings)", summary, StringComparison.Ordinal);
-        Assert.Contains("[routing] list 7", summary, StringComparison.Ordinal);
+        Assert.Contains("requested list UIDs: unset", summary, StringComparison.Ordinal);
         Assert.DoesNotContain("topSecretKey", summary, StringComparison.Ordinal);
     }
 

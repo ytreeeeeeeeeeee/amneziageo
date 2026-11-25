@@ -18,7 +18,7 @@ public static class PortableBundle
     /// <summary>
     /// The bundle schema version this build writes and can read.
     /// </summary>
-    public const int CurrentVersion = 2;
+    public const int CurrentVersion = 3;
 
     private static readonly JsonSerializerOptions _options = new()
     {
@@ -37,10 +37,11 @@ public static class PortableBundle
         IReadOnlyList<RoutingBlock> RoutingLists,
         // Version 1 pairings; read on import, never written.
         IReadOnlyList<ProfileBlock>? Profiles = null,
-        // What was in use when the bundle was written, so a restore comes back to the same server and list.
+        // The scalar routing fields are read from older backups. In version 3, null leaves the choice alone and [] clears it.
         string? ActiveConfig = null,
         string? ActiveRoutingList = null,
-        string? ActiveRoutingListId = null);
+        string? ActiveRoutingListId = null,
+        IReadOnlyList<string>? ActiveRoutingListIds = null);
 
     /// <summary>
     /// A standalone config: wg-quick text, WebSocket transport, geo split, DNS and bypass entries.

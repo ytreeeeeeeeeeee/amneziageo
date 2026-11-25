@@ -1,6 +1,7 @@
 using System.Globalization;
 
 using AmneziaGeo.Decl;
+using AmneziaGeo.Ipc;
 
 namespace AmneziaGeo.Geo;
 
@@ -73,6 +74,82 @@ public static class BundleLists
 
         var name = block.Name.Trim();
         return name.Length > 0 ? name : FallbackName;
+    }
+
+    /// <summary>Records the choice in a full backup when every selected list travels with it.</summary>
+    public static async Task<IReadOnlyList<string>?> ExportSelectionAsync(
+        IStateStore store, IReadOnlyList<(string Key, RoutingList List)> picked, bool full, CancellationToken ct = default)
+    {
+        if (!full)
+        {
+            return null;
+        }
+
+        var selected = await store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false);
+        if (selected is null)
+        {
+            return null;
+        }
+
+        var uids = picked.Select(item => item.List).Where(list => selected.Contains(list.Id) && list.Uid.Length > 0)
+            .Select(list => list.Uid).Order(StringComparer.Ordinal).ToArray();
+        return uids.Length == selected.Count ? uids : null;
+    }
+
+    /// <summary>Resolves the whole choice before asking the platform to validate and install it.</summary>
+    public static async Task<bool> RestoreSelectionAsync(
+        IStateStore store, PortableBundle.Bundle bundle,
+        Func<RoutingSelectionChange, CancellationToken, Task<IpcAck>> change,
+        Action<string> info, Action<string> warn, Action<string> error,
+        CancellationToken ct = default)
+    {
+        var uids = bundle.ActiveRoutingListIds
+            ?? (bundle.ActiveRoutingListId is { Length: > 0 } uid ? [uid] : null);
+        if (uids is null)
+        {
+            return true;
+        }
+
+        try
+        {
+            var ids = new List<long>();
+            var unknown = 0;
+            foreach (var identifier in uids.Distinct(StringComparer.Ordinal))
+            {
+                var list = string.IsNullOrEmpty(identifier)
+                    ? null
+                    : await store.GetRoutingListByUidAsync(identifier, ct).ConfigureAwait(false);
+                if (list is null)
+                {
+                    unknown++;
+                }
+                else
+                {
+                    ids.Add(list.Id);
+                }
+            }
+
+            if (unknown > 0)
+            {
+                warn($"Skipped the backup routing selection: {unknown} unknown list UID(s)");
+                return true;
+            }
+
+            var ack = await change(new(RoutingSelectionChange.Replace, ids), ct).ConfigureAwait(false);
+            if (!ack.Ok)
+            {
+                warn($"Skipped the backup routing selection: the change to {ids.Count} list(s) was refused");
+                return true;
+            }
+
+            info($"Restored the backup routing selection: {ids.Count} list(s)");
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            error($"Could not restore the backup routing selection ({ex.GetType().Name})");
+            return false;
+        }
     }
 
     // The lists one word of a selection names.

@@ -57,10 +57,11 @@ internal static class BundleCommands
         var selection = flags.Has("all")
             ? new Selection(
                 [.. snapshot.Configs.Select(config => config.Name)],
-                [.. (snapshot.RoutingLists ?? []).Select(list => list.Id.ToString(CultureInfo.InvariantCulture))])
+                [.. (snapshot.RoutingLists ?? []).Select(list => list.Id.ToString(CultureInfo.InvariantCulture))],
+                IncludeRoutingSelection: true)
             : new Selection([.. flags.Values("config")], [.. lists]);
 
-        if (selection.Configs.Length + selection.RoutingLists.Length == 0)
+        if (selection.Configs.Length + selection.RoutingLists.Length == 0 && !selection.IncludeRoutingSelection)
         {
             return Reply.Usage("nothing selected: pass --all, or --config/--list");
         }
@@ -145,5 +146,5 @@ internal static class BundleCommands
     /// <summary>
     /// What an export carries.
     /// </summary>
-    private sealed record Selection(string[] Configs, string[] RoutingLists);
+    private sealed record Selection(string[] Configs, string[] RoutingLists, bool IncludeRoutingSelection = false);
 }

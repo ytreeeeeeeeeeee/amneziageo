@@ -742,7 +742,8 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
     private sealed record SelectionRequest(
         string[]? Configs,
         string[]? RoutingLists,
-        Dictionary<string, string[]>? RoutingRules);
+        Dictionary<string, string[]>? RoutingRules,
+        bool IncludeRoutingSelection = false);
 
     // Export a selective bundle: caller picks configs and routing lists by name.
     private async Task<IpcAck> ExportBundleAsync(IReadOnlyList<string> args, CancellationToken ct)
@@ -772,7 +773,8 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         var configNames = new HashSet<string>(selection.Configs ?? [], StringComparer.Ordinal);
         var routingNames = new HashSet<string>(selection.RoutingLists ?? [], StringComparer.Ordinal);
 
-        if (configNames.Count == 0 && routingNames.Count == 0)
+        var full = selection.IncludeRoutingSelection && selection.RoutingRules is not { Count: > 0 };
+        if (configNames.Count == 0 && routingNames.Count == 0 && !full)
         {
             return new IpcAck(false, IpcMessage.Key("Agent_NothingSelectedForExport"));
         }
@@ -808,41 +810,41 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         }
 
         var routingBlocks = new List<PortableBundle.RoutingBlock>();
-        if (routingNames.Count > 0)
+        var (picked, _) = routingNames.Count == 0
+            ? ([], [])
+            : BundleLists.Pick(await store.ListRoutingListsAsync(ct), routingNames);
+        foreach (var (key, list) in picked)
         {
-            var (picked, _) = BundleLists.Pick(await store.ListRoutingListsAsync(ct), routingNames);
-            foreach (var (key, list) in picked)
+            // Role-tagged: a routing list's rules carry a bucket (proxy/direct/block/exclude). Formatting them
+            // bare would re-import every rule as Proxy and drop the bucket. Also matches the tokens the export
+            // tree shows (get-routing-list), so the keep-filter below compares like for like.
+            var rules = list.Rules.Select(GeoConfigurator.FormatWithRole).ToList();
+
+            // Drop rules the user unchecked in the export tree (machine-specific app rules, etc).
+            // No entry for this list = keep everything.
+            if (selection.RoutingRules is not null
+                && selection.RoutingRules.TryGetValue(key, out var kept))
             {
-                // Role-tagged: a routing list's rules carry a bucket (proxy/direct/block/exclude). Formatting them
-                // bare would re-import every rule as Proxy and drop the bucket. Also matches the tokens the export
-                // tree shows (get-routing-list), so the keep-filter below compares like for like.
-                var rules = list.Rules.Select(GeoConfigurator.FormatWithRole).ToList();
-
-                // Drop rules the user unchecked in the export tree (machine-specific app rules, etc).
-                // No entry for this list = keep everything.
-                if (selection.RoutingRules is not null
-                    && selection.RoutingRules.TryGetValue(key, out var kept))
-                {
-                    var keepSet = new HashSet<string>(kept, StringComparer.Ordinal);
-                    rules = rules.Where(keepSet.Contains).ToList();
-                }
-
-                PortableBundle.RoutingSettingsBlock? settingsBlock = null;
-                var settings = await store.GetRoutingSettingsAsync(list.Id, ct);
-                if (settings is not null)
-                {
-                    settingsBlock = new PortableBundle.RoutingSettingsBlock(settings.Exclusions, settings.AllUdp, settings.Mode, settings.UseGlobalProxy);
-                }
-
-                routingBlocks.Add(new PortableBundle.RoutingBlock(list.Name, rules, settingsBlock, list.Uid));
+                var keepSet = new HashSet<string>(kept, StringComparer.Ordinal);
+                rules = rules.Where(keepSet.Contains).ToList();
             }
+
+            PortableBundle.RoutingSettingsBlock? settingsBlock = null;
+            var settings = await store.GetRoutingSettingsAsync(list.Id, ct);
+            if (settings is not null)
+            {
+                settingsBlock = new PortableBundle.RoutingSettingsBlock(settings.Exclusions, settings.AllUdp, settings.Mode, settings.UseGlobalProxy);
+            }
+
+            routingBlocks.Add(new PortableBundle.RoutingBlock(list.Name, rules, settingsBlock, list.Uid));
         }
 
         var bundle = new PortableBundle.Bundle(
             PortableBundle.FormatTag,
             PortableBundle.CurrentVersion,
             configBlocks,
-            routingBlocks);
+            routingBlocks,
+            ActiveRoutingListIds: await BundleLists.ExportSelectionAsync(store, picked, full, ct));
 
         logger.LogInformation(
             "exported bundle: {Configs} configs, {Routing} routing lists",
@@ -851,7 +853,7 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         return new IpcAck(true, PortableBundle.Serialize(bundle));
     }
 
-    // Import a selective bundle: recreates configs and routing lists under fresh names. All-or-nothing; no rollback of rows already written.
+    // Restores the choice only after the configs and routing lists are available.
     private async Task<IpcAck> ImportBundleAsync(IReadOnlyList<string> args, CancellationToken ct)
     {
         if (args.Count < 1 || string.IsNullOrWhiteSpace(args[0]))
@@ -892,6 +894,7 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
 
         var configNameMap = new Dictionary<string, string>(StringComparer.Ordinal);
         var renames = new List<string>();
+        var replacedLists = new HashSet<long>();
         var importedConfigs = 0;
         var importedLists = 0;
 
@@ -984,7 +987,12 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
                 {
                     await store.SetRoutingSettingsAsync(new RoutingSettings(existingList.Id, sE.Exclusions, sE.AllUdp, sE.Mode, sE.UseGlobalProxy), ct);
                 }
+                else if (!merge)
+                {
+                    await store.RemoveRoutingSettingsAsync(existingList.Id, ct);
+                }
 
+                replacedLists.Add(existingList.Id);
                 importedLists++;
                 continue;
             }
@@ -1002,6 +1010,20 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         if (bundle.Profiles is { Count: > 0 } legacy)
         {
             logger.LogInformation("the bundle carries {Count} profile(s) from an older build; their pairings are dropped, the configs and routing lists above came through", legacy.Count);
+        }
+
+        var restored = await BundleLists.RestoreSelectionAsync(store, bundle, ChangeRoutingAsync,
+                message => logger.LogInformation("{Message}", message),
+                message => logger.LogWarning("{Message}", message),
+                message => logger.LogError("{Message}", message), ct);
+        foreach (var id in replacedLists)
+        {
+            await MarkRoutingChangedAsync(id, ct);
+        }
+
+        if (!restored)
+        {
+            return new IpcAck(false, "The backup contents were imported, but the routing selection could not be restored.");
         }
 
         logger.LogInformation(
@@ -2092,7 +2114,8 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
                     await ListNameAsync(after.Count == 0 ? null : after[0], ct)));
             }
 
-            foreach (var member in RunningMembers())
+            var scope = CurrentScope;
+            foreach (var member in activeScope.IsOwnedBy(scope.UserRoot, scope.Sid) ? RunningMembers() : [])
             {
                 if (await ConfigRouting.AllowedAsync(store, member, ct).ConfigureAwait(false))
                 {
@@ -2843,7 +2866,11 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
     {
         try
         {
-            var path = await diagnostics.CollectAsync(ct);
+            var scope = CurrentScope;
+            IReadOnlyList<long> applied = activeScope.IsOwnedBy(scope.UserRoot, scope.Sid)
+                ? AppliedRouting().SelectMany(projection => projection.ListIds).Distinct().ToArray()
+                : [];
+            var path = await diagnostics.CollectAsync(scope.Store, applied, ct);
             return new IpcAck(true, path);
         }
         catch (Exception ex)

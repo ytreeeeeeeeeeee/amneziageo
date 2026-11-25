@@ -16,12 +16,13 @@ public sealed record BundleSources(
     Func<CancellationToken, Task<string>>? Runtime = null,
     Func<CancellationToken, Task<string>>? Cache = null,
     Func<CancellationToken, Task<IReadOnlyList<LogRow>>>? Recent = null,
-    BundleLibrary? Library = null);
+    BundleLibrary? Library = null,
+    IReadOnlyList<long>? AppliedRoutingListIds = null);
 
 /// <summary>
-/// The configurations and the list choice of a platform that keeps them outside the store.
+/// The configurations of a platform that keeps them outside the store.
 /// </summary>
-public sealed record BundleLibrary(IReadOnlyList<string> Names, Func<string, string?> Text, long? SelectedList);
+public sealed record BundleLibrary(IReadOnlyList<string> Names, Func<string, string?> Text);
 
 /// <summary>
 /// Builds a redacted diagnostics archive for support: the library summary, the effective configuration, the live
@@ -46,6 +47,20 @@ public sealed class DiagnosticsBundle(IStateStore store, SqliteLogStore logs)
         new(@"(?i)(--http-upgrade-credentials[=\s]+)\S+");
     private static readonly Regex CredentialLabel =
         new(@"(?i)((?:credentials|password|passwd)\s*[=:]\s*)\S+");
+
+    private static string RoutingUids(IReadOnlyList<long>? ids, IReadOnlyDictionary<long, string> uids, string missing)
+    {
+        if (ids is null)
+        {
+            return missing;
+        }
+
+        var distinct = ids.Distinct().ToArray();
+        var found = distinct.Where(uids.ContainsKey).Select(id => uids[id]).Order(StringComparer.Ordinal).ToArray();
+        var unknown = distinct.Length - found.Length;
+        var text = found.Length == 0 ? "(none)" : string.Join(", ", found);
+        return unknown == 0 ? text : $"{text} ({unknown} UID(s) unavailable)";
+    }
 
     // The structured log tables and their file names inside the archive.
     private static readonly (string Table, string Entry)[] LogTables =
@@ -79,7 +94,7 @@ public sealed class DiagnosticsBundle(IStateStore store, SqliteLogStore logs)
             File.Delete(zipPath);
         }
 
-        var summary = header + await LibraryAsync(parts.Note, parts.Library, ct).ConfigureAwait(false);
+        var summary = header + await LibraryAsync(parts.Note, parts.Library, parts.AppliedRoutingListIds, ct).ConfigureAwait(false);
 
         using (var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create))
         {
@@ -165,7 +180,8 @@ public sealed class DiagnosticsBundle(IStateStore store, SqliteLogStore logs)
     }
 
     // The library: every config with its transport, geo, dns and exclusions, then the routing lists with their rules.
-    private async Task<string> LibraryAsync(Func<string, CancellationToken, Task<string?>>? note, BundleLibrary? library, CancellationToken ct)
+    private async Task<string> LibraryAsync(Func<string, CancellationToken, Task<string?>>? note, BundleLibrary? library,
+        IReadOnlyList<long>? appliedRoutingListIds, CancellationToken ct)
     {
         var sb = new StringBuilder();
         var configs = library?.Names ?? await store.ListConfigNamesAsync(ct).ConfigureAwait(false);
@@ -226,7 +242,7 @@ public sealed class DiagnosticsBundle(IStateStore store, SqliteLogStore logs)
             sb.AppendLine($"[routing lists] ({lists.Count})");
             foreach (var list in lists)
             {
-                sb.AppendLine($"  [{list.Id}] {list.Name}: {list.Rules.Count} rule(s), {list.Routes.Count} route(s), {list.Domains.Count} domain(s)");
+                sb.AppendLine($"  [{list.Uid}] {list.Name}: {list.Rules.Count} rule(s), {list.Routes.Count} route(s), {list.Domains.Count} domain(s)");
                 foreach (var rule in list.Rules.Take(MaxRules))
                 {
                     sb.AppendLine($"    {RuleText(rule)}");
@@ -239,9 +255,12 @@ public sealed class DiagnosticsBundle(IStateStore store, SqliteLogStore logs)
             }
         }
 
-        var selected = library is null ? await store.GetSelectedRoutingListAsync(ct).ConfigureAwait(false) : library.SelectedList;
+        var selected = await store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false);
+        var uids = lists.Where(list => !string.IsNullOrEmpty(list.Uid)).ToDictionary(list => list.Id, list => list.Uid);
         sb.AppendLine();
-        sb.AppendLine($"[routing] {(selected is null ? "off (no list)" : $"list {selected}")}");
+        sb.AppendLine("[routing]");
+        sb.AppendLine($"  requested list UIDs: {RoutingUids(selected, uids, "unset")}");
+        sb.AppendLine($"  applied list UIDs: {RoutingUids(appliedRoutingListIds, uids, "unavailable")}");
 
         var sources = await store.ListGeoSourcesAsync(ct).ConfigureAwait(false);
         if (sources.Count > 0)

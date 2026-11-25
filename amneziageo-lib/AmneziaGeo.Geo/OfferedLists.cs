@@ -36,7 +36,8 @@ public sealed record TakenSources(IReadOnlyList<GeoSource> Added, IReadOnlyList<
 /// <param name="Taking">The lists the server keeps read-only whose newer version is to be taken at once.</param>
 /// <param name="Marked">How many lists the server made read-only or let go of being so.</param>
 /// <param name="KeptSelection">Whether defaults were offered and the existing selection was kept.</param>
-public sealed record TakenPresets(int Added, int Waiting, IReadOnlyList<long>? InUse, IReadOnlyList<long>? Taking = null, int Marked = 0, bool KeptSelection = false)
+/// <param name="Linked">How many existing local lists were matched by UID to a server preset.</param>
+public sealed record TakenPresets(int Added, int Waiting, IReadOnlyList<long>? InUse, IReadOnlyList<long>? Taking = null, int Marked = 0, bool KeptSelection = false, int Linked = 0)
 {
     /// <summary>
     /// Nothing taken.
@@ -51,7 +52,7 @@ public sealed record TakenPresets(int Added, int Waiting, IReadOnlyList<long>? I
     /// <summary>
     /// Whether anything was taken.
     /// </summary>
-    public bool Any => Added > 0 || Waiting > 0 || InUse is not null || TakeNow.Count > 0 || Marked > 0;
+    public bool Any => Added > 0 || Waiting > 0 || InUse is not null || TakeNow.Count > 0 || Marked > 0 || Linked > 0;
 }
 
 /// <summary>
@@ -154,8 +155,8 @@ public static class OfferedLists
     /// Takes the routing lists a server hands out. A list the store knows by the identifier of the server keeps what
     /// it holds, and a newer version waits for the owner, or is to be taken at once when the server keeps the list
     /// read-only; a list the store holds none of is added, and put in use when the server marks it so and no list is
-    /// in use; a list held under the name is tied to the list of the server. A server that names no identifiers has
-    /// its lists added by name. A list the server makes read-only takes the version of the server when it holds
+    /// in use; a local list held under the same UID is tied to the list of the server. A server that names no
+    /// identifiers has its lists added by name. A list the server makes read-only takes the version of the server when it holds
     /// another; a read-only list the server of the configuration no longer hands out becomes an ordinary one.
     /// </summary>
     public static async Task<TakenPresets> TakePresetsAsync(
@@ -183,6 +184,7 @@ public static class OfferedLists
         var added = 0;
         var waiting = 0;
         var marks = 0;
+        var linked = 0;
         var defaults = new HashSet<long>();
         var taking = new List<long>();
         foreach (var preset in offered)
@@ -244,13 +246,40 @@ public static class OfferedLists
                 continue;
             }
 
-            // A list is told apart by the id of the server: a list held under the same name stays apart from it.
-            names.Add(preset.Name);
-            var id = await AddListAsync(store, geo, preset.Name, preset.Rules, preset.AllUdp, preset.Full, preset.Id, ct).ConfigureAwait(false);
-            var fresh = new RoutingListOrigin(id, preset.Id, version.Source, when, ReadOnly: preset.ReadOnly, Config: config);
+            // A backup can restore the UID before the first hello supplies the origin.
+            var restored = lists.Find(list => string.Equals(list.Uid, preset.Id, StringComparison.Ordinal)
+                && origins.All(origin => origin.ListId != list.Id));
+            var id = restored?.Id
+                ?? await AddListAsync(store, geo, preset.Name, preset.Rules, preset.AllUdp, preset.Full, preset.Id, ct).ConfigureAwait(false);
+            var pending = restored is not null && !await SameAsync(store, restored, version, ct).ConfigureAwait(false)
+                ? version
+                : null;
+            var fresh = new RoutingListOrigin(id, preset.Id, version.Source, pending is null ? when : DateTimeOffset.MinValue,
+                Pending: pending, ReadOnly: preset.ReadOnly, Config: config);
             await store.SetRoutingListOriginAsync(fresh, ct).ConfigureAwait(false);
             origins.Add(fresh);
-            added++;
+            names.Add(preset.Name);
+            if (restored is null)
+            {
+                added++;
+            }
+            else
+            {
+                linked++;
+            }
+
+            if (pending is not null)
+            {
+                if (preset.ReadOnly)
+                {
+                    taking.Add(id);
+                }
+                else
+                {
+                    waiting++;
+                }
+            }
+
             if (preset.Default)
             {
                 defaults.Add(id);
@@ -271,7 +300,7 @@ public static class OfferedLists
             inUse = initialized ? selected : null;
         }
 
-        return new TakenPresets(added, waiting, inUse, taking, marks, KeptSelection: defaults.Count > 0 && inUse is null);
+        return new TakenPresets(added, waiting, inUse, taking, marks, KeptSelection: defaults.Count > 0 && inUse is null, Linked: linked);
     }
 
     /// <summary>

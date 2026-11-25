@@ -145,7 +145,8 @@ internal sealed partial class BundleExportViewModel : ViewModelBase
             var selection = new SelectionPayload(
                 [.. ConfigItems.Where(i => i.IsChecked).Select(i => i.Name)],
                 [.. RoutingItems.Where(i => i.IsChecked).Select(ListKey)],
-                routingRules.Count > 0 ? routingRules : null);
+                routingRules.Count > 0 ? routingRules : null,
+                IncludeRoutingSelection: ConfigItems.All(i => i.IsChecked) && RoutingItems.All(i => i.IsChecked) && routingRules.Count == 0);
             var json = JsonSerializer.Serialize(selection, _selectionOptions);
 
             var ack = await _connection.SendCommandAsync(new IpcCommand(IpcContract.OpExportBundle, [json]));
@@ -175,5 +176,6 @@ internal sealed partial class BundleExportViewModel : ViewModelBase
     private sealed record SelectionPayload(
         string[] Configs,
         string[] RoutingLists,
-        Dictionary<string, string[]>? RoutingRules);
+        Dictionary<string, string[]>? RoutingRules,
+        bool IncludeRoutingSelection);
 }

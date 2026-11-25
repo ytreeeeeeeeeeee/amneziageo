@@ -3,6 +3,7 @@ using AmneziaGeo.Decl;
 using AmneziaGeo.Geo;
 using AmneziaGeo.Ipc;
 using AmneziaGeo.Localization;
+using AmneziaGeo.Linux.App;
 using AmneziaGeo.Ui.Services;
 using AmneziaGeo.Ui.ViewModels;
 using Xunit;
@@ -88,6 +89,108 @@ public sealed class ServerListsOnlyTests : IAsyncLifetime
         var clear = await ServerListsOnly.ChangeSelectionAsync(_store, limit, new(RoutingSelectionChange.Replace, []), ct);
         Assert.NotNull(clear.Refusal);
         Assert.Equal([work], await _store.GetSelectedRoutingListsAsync(ct));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task HelloBindsAnImportedPresetToTheSameUidAndSelection(bool readOnly, bool contentsMatch)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var geo = new GeoConfigurator(_store, new NoFiles());
+        const string serverRule = "proxy|domain:server.example";
+        var importedRule = contentsMatch ? serverRule : "proxy|domain:backup.example";
+        var localId = await geo.ApplyToRoutingListAsync(0, "Office", [importedRule], First, ct);
+        await _store.UpdateSelectedRoutingListsAsync(_ => [localId], ct);
+
+        var preset = new OfferedPreset("Office", [serverRule], false, false, Id: First, ReadOnly: readOnly);
+        var offer = ServerOffer.Parse(Lists(true, preset.ToPayload()));
+        var taken = new List<long>();
+        var offers = new ServerOffers(_store,
+            ask: (_, _) => Task.FromResult(new HelloReply(offer, true)),
+            geo: geo,
+            take: async (ids, token) =>
+            {
+                foreach (var id in ids)
+                {
+                    var ack = await OfferedLists.AcceptPendingAsync(_store, id, async pending =>
+                    {
+                        await geo.ApplyToRoutingListAsync(id, pending.Name, pending.Rules, token);
+                        return new IpcAck(true, "");
+                    }, new IpcAck(false, "missing"), token);
+                    Assert.True(ack.Ok);
+                    taken.Add(id);
+                }
+            });
+
+        await offers.AskAsync("office", Text, ct);
+        await offers.AskAsync("office", Text, ct);
+
+        var list = Assert.Single(await _store.ListRoutingListsAsync(ct));
+        Assert.Equal(localId, list.Id);
+        Assert.Equal(First, list.Uid);
+        Assert.Equal([readOnly ? serverRule : importedRule], list.Rules.Select(GeoConfigurator.FormatWithRole));
+        var origin = Assert.Single(await _store.ListRoutingListOriginsAsync(ct));
+        Assert.Equal(localId, origin.ListId);
+        Assert.Equal(readOnly, origin.ReadOnly);
+        Assert.Equal(readOnly || contentsMatch, origin.Pending is null);
+        Assert.Equal(readOnly ? [localId] : Array.Empty<long>(), taken);
+
+        var limit = await ServerListsOnly.OfAsync(_store, "office", ct);
+        Assert.NotNull(limit);
+        Assert.Equal([localId], limit.Lists);
+        Assert.False(await ServerListsOnly.EnforceSelectionAsync(_store, limit, ct));
+        Assert.Equal([localId], await _store.GetSelectedRoutingListsAsync(ct));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task LinuxStartupRequiresThePendingReadOnlyVersion(bool acceptUpdate)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var geo = new GeoConfigurator(_store, new NoFiles());
+        const string serverRule = "block|domain:server.example";
+        var localId = await geo.ApplyToRoutingListAsync(0, "Office", ["proxy|domain:backup.example"], First, ct);
+        await _store.UpdateSelectedRoutingListsAsync(_ => [localId], ct);
+        var preset = new OfferedPreset("Office", [serverRule], true, true, Id: First, ReadOnly: true);
+        var offer = ServerOffer.Parse(Lists(true, preset.ToPayload()));
+        var offers = new ServerOffers(_store, ask: (_, _) => Task.FromResult(new HelloReply(offer, true)),
+            geo: geo, take: (_, _) => Task.CompletedTask);
+        await offers.BeforeConnectAsync("office", Text, null, ct);
+        var limit = await ServerListsOnly.OfAsync(_store, "office", ct);
+        Assert.True(limit?.Allows(localId));
+        Assert.NotNull((await _store.GetRoutingListOriginAsync(localId, ct))!.Pending);
+
+        async Task TakeAsync(long id, CancellationToken token)
+        {
+            await OfferedLists.AcceptPendingAsync(_store, id, async pending =>
+            {
+                if (!acceptUpdate)
+                {
+                    return new IpcAck(false, "update failed");
+                }
+
+                await geo.ApplyToRoutingListAsync(id, pending.Name, pending.Rules, token);
+                await _store.SetRoutingSettingsAsync(new(id, pending.Exclusions, pending.AllUdp, "full", pending.Full), token);
+                return new IpcAck(true, "");
+            }, new IpcAck(false, "missing"), token);
+        }
+
+        if (!acceptUpdate)
+        {
+            await Assert.ThrowsAsync<InvalidDataException>(() => TunnelRouting.LoadForConnectAsync(_store, geo, "office", TakeAsync, ct));
+            Assert.NotNull((await _store.GetRoutingListOriginAsync(localId, ct))!.Pending);
+            return;
+        }
+
+        var routing = await TunnelRouting.LoadForConnectAsync(_store, geo, "office", TakeAsync, ct);
+        Assert.Equal([localId], routing.ListIds);
+        Assert.Equal([serverRule], routing.Rules.Select(GeoConfigurator.FormatWithRole));
+        Assert.True(routing.AllUdp);
+        Assert.False(routing.Split);
+        Assert.Null((await _store.GetRoutingListOriginAsync(localId, ct))!.Pending);
     }
 
     [Fact]

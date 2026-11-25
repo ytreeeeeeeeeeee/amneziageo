@@ -430,6 +430,11 @@ public sealed class ServerOffers
                 _note?.Invoke($"{config}: of the routing lists of the server {lists.Added} added, {lists.Waiting} with a newer version{kept}{marks}{use}", null);
             }
 
+            if (lists.Linked > 0)
+            {
+                _debug?.Invoke($"{config}: [FIX] matched {lists.Linked} local routing list(s) to server presets by UID");
+            }
+
             if (lists.InUse is not null)
             {
                 _rerouted?.Invoke();

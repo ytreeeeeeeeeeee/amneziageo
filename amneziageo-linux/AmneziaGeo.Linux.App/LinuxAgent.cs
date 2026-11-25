@@ -148,7 +148,7 @@ internal sealed class LinuxAgent : IDisposable
         _diagnostics = new DiagnosticsBundle(_store, log.Store);
         _geo = new GeoConfigurator(_store, _geoFiles);
         _tunnel = new TunnelController(enginePath, interfaceName, log) { ServerAskedDown = ServerAskedDownAsync, FrontGone = FrontGoneAsync };
-        _bundles = new BundleCommands(_store, _geo);
+        _bundles = new BundleCommands(_store, _geo, _log, ChangeRoutingAsync);
         _updater = new LinuxUpdater(_httpClient, log, PushAsync, _store, UpdateServersAsync);
         _proxy = new LocalProxyServer(new DirectProxyOutbound(), line => _log.Info("proxy", line));
         _hotspot = new LinuxHotspot(log, interfaceName);
@@ -1153,7 +1153,9 @@ internal sealed class LinuxAgent : IDisposable
         TunnelRouting routing;
         try
         {
-            routing = await TunnelRouting.LoadAsync(_store, _geo, configName, ct).ConfigureAwait(false);
+            // The background update waits for the command gate held by this connection attempt.
+            routing = await TunnelRouting.LoadForConnectAsync(_store, _geo, configName,
+                (id, token) => UpdateRoutingListAsync([id.ToString(CultureInfo.InvariantCulture)], token), ct).ConfigureAwait(false);
         }
         catch (InvalidDataException ex)
         {
@@ -3408,6 +3410,11 @@ internal sealed class LinuxAgent : IDisposable
         {
             try
             {
+                if (await _store.GetRoutingListOriginAsync(id).ConfigureAwait(false) is not { ReadOnly: true, Pending: not null })
+                {
+                    continue;
+                }
+
                 var taken = await UpdateRoutingListAsync([id.ToString(CultureInfo.InvariantCulture)], CancellationToken.None).ConfigureAwait(false);
                 if (taken.Ok)
                 {
@@ -3509,7 +3516,8 @@ internal sealed class LinuxAgent : IDisposable
                     null,
                     async token => (await GetRuntimeConfigAsync(token).ConfigureAwait(false)).Message,
                     token => Task.FromResult(CacheText()),
-                    token => Task.FromResult(_log.Recent.Snapshot())),
+                    token => Task.FromResult(_log.Recent.Snapshot()),
+                    AppliedRoutingListIds: _tunnel.Running ? _tunnel.AppliedRouting?.ListIds ?? [] : []),
                 ct).ConfigureAwait(false);
             _log.Info("agent", $"diagnostics archive written to {path}; keys and credentials in it are masked");
             return new IpcAck(true, path);

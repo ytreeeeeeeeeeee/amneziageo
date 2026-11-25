@@ -10,27 +10,26 @@ namespace AmneziaGeo.Windows.App;
 /// <summary>
 /// Builds a redacted diagnostics bundle for support.
 /// </summary>
-internal sealed class DiagnosticsCollector(IStateStore store, SettingsStore settings, SqliteLogStore logStore, AgentControl control, RuntimeInspector inspector, RecentLog recent, SessionBook sessions, ILogger<DiagnosticsCollector> logger)
+internal sealed class DiagnosticsCollector(SettingsStore settings, SqliteLogStore logStore, AgentControl control, RuntimeInspector inspector, RecentLog recent, SessionBook sessions, ILogger<DiagnosticsCollector> logger)
 {
-    private readonly DiagnosticsBundle _bundle = new(store, logStore);
-
     /// <summary>
     /// Writes a diagnostics zip under the diagnostics directory and returns its full path.
     /// </summary>
-    public async Task<string> CollectAsync(CancellationToken ct = default)
+    public async Task<string> CollectAsync(IStateStore store, IReadOnlyList<long> appliedListIds, CancellationToken ct)
     {
         var target = control.RunningTarget ?? control.Target ?? string.Empty;
         var held = target.Length == 0 ? null : inspector.HeldSessions(target);
         var header = await HeaderAsync(target, held, ct);
-        var zipPath = await _bundle.WriteAsync(
+        var zipPath = await new DiagnosticsBundle(store, logStore).WriteAsync(
             TunnelPaths.DiagnosticsDirectory(),
             header,
             LogFormat.Render,
             new BundleSources(
                 (config, token) => store.GetSettingAsync(TunnelPaths.ConnectMessageKey(config), token),
-                token => RuntimeAsync(target, token),
+                token => RuntimeAsync(store, target, token),
                 _ => Task.FromResult(held is null ? "no configuration is selected" : RuntimeInspector.HeldText(held)),
-                _ => Task.FromResult(Recent(target))),
+                _ => Task.FromResult(Recent(target)),
+                AppliedRoutingListIds: appliedListIds),
             ct);
 
         logger.LogInformation("the diagnostics archive is ready at {Path}; keys and addresses in it are masked, so it can be sent for support", zipPath);
@@ -38,7 +37,7 @@ internal sealed class DiagnosticsCollector(IStateStore store, SettingsStore sett
     }
 
     // The configuration the tunnel runs on, or would run on at the next connect; keys are masked by the renderer.
-    private async Task<string> RuntimeAsync(string config, CancellationToken ct)
+    private async Task<string> RuntimeAsync(IStateStore store, string config, CancellationToken ct)
     {
         return config.Length == 0
             ? "no configuration is selected"
