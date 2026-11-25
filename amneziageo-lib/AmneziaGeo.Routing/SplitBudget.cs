@@ -1,3 +1,5 @@
+using AmneziaGeo.Decl;
+
 namespace AmneziaGeo.Routing;
 
 /// <summary>
@@ -19,7 +21,12 @@ public static class SplitBudget
     /// <summary>
     /// What these ranges and names weigh against the threshold.
     /// </summary>
-    public static int Weight(int routes, int names) => routes + (names * AddressesPerName);
+    public static int Weight(int routes, int names) => (int)Math.Min((long)routes + ((long)names * AddressesPerName), int.MaxValue);
+
+    /// <summary>Weights a settled policy once per remaining range or name.</summary>
+    public static int Weight(RoutingList list) => Weight(
+        list.Routes.Count + list.DirectRoutes.Count + list.BlockRoutes.Count,
+        list.Domains.Count + list.DirectDomains.Count + list.BlockDomains.Count);
 
     /// <summary>
     /// Whether these ranges and names stay within the threshold of the route table.

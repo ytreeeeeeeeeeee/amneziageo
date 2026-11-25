@@ -11,4 +11,23 @@ public sealed record RoutingSettings(
     string Exclusions,
     bool AllUdp,
     string Mode = "split",
-    bool UseGlobalProxy = false);
+    bool UseGlobalProxy = false)
+{
+    /// <summary>Combines list settings. A missing row does not supply an explicit exclusions override.</summary>
+    public static RoutingSettings? Combine(long listId, IReadOnlyList<RoutingSettings> settings)
+    {
+        if (settings.Count == 0)
+        {
+            return null;
+        }
+
+        var full = settings.Any(setting => setting.UseGlobalProxy);
+        var exclusions = settings.SelectMany(setting => ExclusionTokens(setting.Exclusions)).Distinct(StringComparer.Ordinal);
+        return new RoutingSettings(listId, string.Join('\n', exclusions), settings.Any(setting => setting.AllUdp),
+            full ? "full" : "split", full);
+    }
+
+    /// <summary>Individual addresses or domains stored in the exclusions field.</summary>
+    public static string[] ExclusionTokens(string text) =>
+        text.Split([',', ';', '\n', '\r', ' ', '\t'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+}

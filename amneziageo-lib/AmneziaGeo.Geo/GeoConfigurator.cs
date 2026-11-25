@@ -1,5 +1,7 @@
+using System.Net;
 using AmneziaGeo.Decl;
 using AmneziaGeo.Routing;
+using Microsoft.Extensions.Logging;
 
 namespace AmneziaGeo.Geo;
 
@@ -102,6 +104,146 @@ public sealed class GeoConfigurator(IStateStore store, IGeoFileStore files)
     /// </summary>
     public Task<IReadOnlyList<RuleUnfold>> UnfoldTokensAsync(IReadOnlyList<string> ruleTokens, CancellationToken ct = default) =>
         UnfoldEachAsync([.. ruleTokens.Select(ParseRoleRule).OfType<GeoRule>()], ct);
+
+    /// <summary>Builds a policy from the stored selection; an empty choice leaves the config's own routes.</summary>
+    public async Task<RoutingPolicy?> LoadSelectedPolicyAsync(ILogger? log = null, CancellationToken ct = default) =>
+        await LoadPolicyAsync(await store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false), log: log, ct: ct)
+            .ConfigureAwait(false);
+
+    /// <summary>Compiles original rules, keeping their list IDs even where the effective rules overlap.</summary>
+    public async Task<RoutingPolicy?> LoadPolicyAsync(IReadOnlyList<long>? ids, AppRulePlatform? appPlatform = null,
+        ILogger? log = null, CancellationToken ct = default)
+    {
+        if (ids is not { Count: > 0 })
+        {
+            return null;
+        }
+
+        var sources = new List<RoutingListStamp>();
+        var settings = new List<RoutingSettings>();
+        foreach (var id in ids.Distinct().Order())
+        {
+            if (await store.GetRoutingListStampAsync(id, ct).ConfigureAwait(false) is not { } source)
+            {
+                continue;
+            }
+
+            sources.Add(source);
+            if (await store.GetRoutingSettingsAsync(id, ct).ConfigureAwait(false) is { } setting)
+            {
+                settings.Add(setting);
+            }
+        }
+
+        if (sources.Count == 0)
+        {
+            return null;
+        }
+
+        var platform = appPlatform ?? AppRoutingRules.CurrentPlatform;
+        var finds = await AppFinds.ReadAsync(store, ct).ConfigureAwait(false);
+        var geoSources = await store.ListGeoSourcesAsync(ct).ConfigureAwait(false);
+        var geoFiles = await store.ListGeoFilesAsync(ct).ConfigureAwait(false);
+        var index = GeoIndex.Load(geoSources, files, geoFiles.Select(file => file.Name).ToHashSet(StringComparer.Ordinal));
+        var origins = new List<RoutingRuleOrigin>();
+        var unfolded = new Dictionary<GeoRule, RuleUnfold>();
+        foreach (var source in sources)
+        {
+            foreach (var (original, effective) in AppFinds.ResolveRules(source.Rules, finds))
+            {
+                AddOrigin(source.Id, original, effective);
+            }
+        }
+
+        foreach (var setting in settings)
+        {
+            foreach (var token in RoutingSettings.ExclusionTokens(setting.Exclusions))
+            {
+                var slash = token.IndexOf('/');
+                var address = slash < 0 ? token : token[..slash];
+                var rule = new GeoRule(IPAddress.TryParse(address, out _) ? GeoRuleKind.Cidr : GeoRuleKind.Domain,
+                    token, RouteRole.Direct);
+                AddOrigin(setting.ListId, rule, rule);
+            }
+        }
+
+        var idOfPolicy = sources.Count == 1 ? sources[0].Id : 0;
+        var list = ComposeList(idOfPolicy, sources, unfolded.Values.ToArray(), platform, out var blockApps, log);
+        var combined = RoutingSettings.Combine(idOfPolicy, settings);
+        var stamp = RoutingPlanStamp.ForPolicy(list, combined, sources, origins, platform, geoSources, geoFiles);
+        return new RoutingPolicy(list, combined, sources, origins, blockApps, stamp, platform);
+
+        void AddOrigin(long id, GeoRule original, GeoRule effective)
+        {
+            if (effective.Kind == GeoRuleKind.App && AppRoutingRules.Normalize(effective.Value, platform) is null)
+            {
+                return;
+            }
+
+            if (!unfolded.TryGetValue(effective, out var expansion))
+            {
+                var (routes, domains, _) = GeoMaterializer.Materialize([effective], index);
+                expansion = new RuleUnfold(effective, routes, domains);
+                unfolded.Add(effective, expansion);
+            }
+
+            origins.Add(new RoutingRuleOrigin(id, original, expansion));
+        }
+    }
+
+    private static RoutingList ComposeList(long id, IReadOnlyList<RoutingListStamp> sources, IReadOnlyList<RuleUnfold> rules,
+        AppRulePlatform platform, out IReadOnlyList<string> blockApps, ILogger? log)
+    {
+        var proxy = BucketRanges(RouteRole.Proxy);
+        var direct = BucketRanges(RouteRole.Direct);
+        var block = BucketRanges(RouteRole.Block);
+        var settled = RangeClaims.Settle(proxy, direct, block);
+        var ranges = (Proxy: settled.Proxy.Distinct(StringComparer.Ordinal).ToArray(),
+            Direct: settled.Direct.Distinct(StringComparer.Ordinal).ToArray(),
+            Block: settled.Block.Distinct(StringComparer.Ordinal).ToArray());
+        var nameClaims = rules.SelectMany(rule => rule.Domains.Select(domain => (Domain: NameRules.Key(domain), rule.Rule.Role)))
+            .Distinct().ToArray();
+        var domains = nameClaims.GroupBy(claim => claim.Domain).Select(group => group.MaxBy(claim => claim.Role)).ToArray();
+
+        var appClaims = rules.Where(rule => rule.Rule.Kind == GeoRuleKind.App)
+            .Select(rule => (Rule: rule.Rule, Key: AppRoutingRules.Normalize(rule.Rule.Value, platform)!.Value))
+            .DistinctBy(claim => (claim.Key, claim.Rule.Role)).ToArray();
+        var apps = appClaims.GroupBy(claim => claim.Key).Select(group => group.MaxBy(claim => claim.Rule.Role)).ToArray();
+        var blocked = apps.Where(claim => claim.Rule.Role == RouteRole.Block).ToArray();
+        var directApps = apps.Where(claim => claim.Rule.Role == RouteRole.Direct
+            && !blocked.Any(higher => higher.Key.Covers(claim.Key))).ToArray();
+        var tunneled = apps.Where(claim => claim.Rule.Role == RouteRole.Proxy
+            && !directApps.Any(higher => higher.Key.Covers(claim.Key))
+            && !blocked.Any(higher => higher.Key.Covers(claim.Key))).ToArray();
+        var proxyApps = tunneled.Select(claim => claim.Rule.Value).ToArray();
+        blockApps = blocked.Select(claim => claim.Rule.Value).ToArray();
+
+        log?.LogDebug("Compiled routing policy from {Lists} lists and {Rules} rules using current geodata and applications. "
+            + "Ranges {InputRanges} to {Ranges}; names {InputNames} to {Names}; app rules {InputApps} to {Apps}",
+            sources.Count, rules.Count, proxy.Length + direct.Length + block.Length,
+            ranges.Proxy.Length + ranges.Direct.Length + ranges.Block.Length, rules.Sum(rule => rule.Domains.Count),
+            domains.Length, rules.Count(rule => rule.Rule.Kind == GeoRuleKind.App),
+            proxyApps.Length + directApps.Length + blockApps.Count);
+
+        if (log?.IsEnabled(LogLevel.Debug) == true)
+        {
+            log.LogDebug("Routing conflicts included {Ranges} range, {Names} name and {Apps} application overlaps",
+                !proxy.SequenceEqual(settled.Proxy) || !direct.SequenceEqual(settled.Direct) || !block.SequenceEqual(settled.Block),
+                domains.Length != nameClaims.Length, proxyApps.Length + directApps.Length + blockApps.Count != appClaims.Length);
+        }
+
+        var effective = rules.Where(rule => rule.Rule.Kind != GeoRuleKind.App).Select(rule => rule.Rule)
+            .Concat(tunneled.Concat(directApps).Concat(blocked).Select(claim => claim.Rule)).ToArray();
+        return new RoutingList(id, string.Join(", ", sources.Select(source => source.Name)), effective,
+            ranges.Proxy, BucketDomains(RouteRole.Proxy), proxyApps, ranges.Direct, BucketDomains(RouteRole.Direct),
+            directApps.Select(claim => claim.Rule.Value).ToArray(), ranges.Block, BucketDomains(RouteRole.Block));
+
+        string[] BucketRanges(RouteRole role) => rules.Where(rule => rule.Rule.Role == role)
+            .SelectMany(rule => rule.Routes).Select(RangeClaims.Key).Distinct(StringComparer.Ordinal).ToArray();
+
+        GeoDomain[] BucketDomains(RouteRole role) =>
+            domains.Where(claim => claim.Role == role).Select(claim => claim.Domain).ToArray();
+    }
 
     // Bumped whenever a rule token starts covering something else, so stored lists are rebuilt against the new
     // expansion instead of keeping what an older version wrote.

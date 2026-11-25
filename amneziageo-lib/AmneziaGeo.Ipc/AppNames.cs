@@ -21,7 +21,7 @@ public static class AppNames
     /// Compares rule values using the platform's path semantics. Displayed names use a separate comparison.
     /// </summary>
     public static StringComparer RuleValueComparer { get; } =
-        OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+        OperatingSystem.IsLinux() || OperatingSystem.IsAndroid() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
 
     /// <summary>
     /// Tells whether an app rule value names a program to find: no kind before '=' and no folder in it.

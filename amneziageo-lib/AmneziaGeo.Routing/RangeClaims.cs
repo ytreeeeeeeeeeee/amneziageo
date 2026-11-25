@@ -1,18 +1,14 @@
+using System.Buffers.Binary;
 using System.Globalization;
-using System.Numerics;
+using System.Net;
+using System.Net.Sockets;
 
 namespace AmneziaGeo.Routing;
 
-/// <summary>
-/// Settles which of overlapping address rules decides: the narrower range, and on the same range the block, then the
-/// direct one, then the tunnel.
-/// </summary>
+/// <summary>Settles overlapping address rules by prefix length, then Block, Direct and Proxy.</summary>
 public static class RangeClaims
 {
-    /// <summary>
-    /// The three sets with every narrower range of another set cut out of the range it lies in and a range two sets
-    /// share left to the stronger one, so no address falls into two sets.
-    /// </summary>
+    /// <summary>Removes addresses claimed by a stronger rule from each bucket.</summary>
     public static (IReadOnlyList<string> Proxy, IReadOnlyList<string> Direct, IReadOnlyList<string> Block) Settle(
         IReadOnlyList<string> proxy, IReadOnlyList<string> direct, IReadOnlyList<string> block)
     {
@@ -25,98 +21,175 @@ public static class RangeClaims
             Carve(block, [.. proxySpans, .. directSpans], []));
     }
 
-    // The ranges of one set less the narrower ranges of the others inside them; a range a stronger set holds as well
-    // is dropped.
-    private static IReadOnlyList<string> Carve(IReadOnlyList<string> entries, List<(uint Start, uint End, int Bits)> others, HashSet<(uint, int)> stronger)
+    /// <summary>Canonical address and prefix, used to recognize duplicate rules.</summary>
+    public static string Key(string entry) => TryParse(entry, out var range)
+        ? Format(range.Start, range.Bits, range.Width) : entry.Trim();
+
+    /// <summary>Builds an address membership test over both address families.</summary>
+    public static Func<IPAddress, bool> Matcher(IReadOnlyList<string> entries)
+    {
+        var ipv4 = GeoIpRanges.Build(entries);
+        var ipv6 = new List<Range>();
+        foreach (var range in Parse(entries).Where(range => range.Width == 128).OrderBy(range => range.Start))
+        {
+            if (ipv6.Count > 0 && range.Start <= ipv6[^1].End)
+            {
+                ipv6[^1] = ipv6[^1] with { End = UInt128.Max(ipv6[^1].End, range.End) };
+            }
+            else
+            {
+                ipv6.Add(range);
+            }
+        }
+
+        return address =>
+        {
+            if (address.IsIPv4MappedToIPv6)
+            {
+                address = address.MapToIPv4();
+            }
+
+            if (GeoIpRanges.TryToNumeric(address, out var v4))
+            {
+                return ipv4.Contains(v4);
+            }
+
+            if (ipv6.Count == 0 || address.AddressFamily != AddressFamily.InterNetworkV6)
+            {
+                return false;
+            }
+
+            var value = NumericIpv6(address);
+            var at = LowerBound(ipv6, 128, value);
+            return (at < ipv6.Count && ipv6[at].Start == value) || (at > 0 && value <= ipv6[at - 1].End);
+        };
+    }
+
+    private readonly record struct Range(UInt128 Start, UInt128 End, int Bits, int Width);
+
+    private static IReadOnlyList<string> Carve(IReadOnlyList<string> entries, List<Range> others,
+        HashSet<(int Width, UInt128 Start, int Bits)> stronger)
     {
         if (entries.Count == 0 || others.Count == 0)
         {
             return entries;
         }
 
-        others.Sort(static (a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.Bits.CompareTo(b.Bits));
+        others.Sort(static (a, b) => a.Width != b.Width ? a.Width.CompareTo(b.Width) : a.Start.CompareTo(b.Start));
         var carved = new List<string>(entries.Count);
-        var cut = false;
         foreach (var entry in entries)
         {
-            if (!GeoIpRanges.TryParse(entry, out var start, out var end, out var bits))
+            if (!TryParse(entry, out var range))
             {
                 carved.Add(entry);
-                continue;
             }
-
-            if (stronger.Contains((start, bits)))
+            else if (!stronger.Contains((range.Width, range.Start, range.Bits)))
             {
-                cut = true;
-                continue;
+                CarveRange(carved, entry, range, others);
             }
-
-            var holes = Holes(others, start, end, bits);
-            if (holes.Count == 0)
-            {
-                carved.Add(entry);
-                continue;
-            }
-
-            cut = true;
-            AddPieces(carved, start, end, holes);
         }
 
-        return cut ? carved : entries;
+        return carved;
     }
 
-    private static List<(uint Start, uint End, int Bits)> Parse(IReadOnlyList<string> entries)
+    private static void CarveRange(List<string> carved, string original, Range range, List<Range> others)
     {
-        var spans = new List<(uint Start, uint End, int Bits)>(entries.Count);
+        var head = range.Start;
+        for (var at = LowerBound(others, range.Width, head); at < others.Count; at++)
+        {
+            var hole = others[at];
+            if (hole.Width != range.Width || hole.Start > range.End)
+            {
+                break;
+            }
+
+            if (hole.Bits <= range.Bits || hole.End < head)
+            {
+                continue;
+            }
+
+            if (hole.Start > head)
+            {
+                AddPrefixes(carved, head, hole.Start - 1, range.Width);
+            }
+
+            if (hole.End == range.End)
+            {
+                return;
+            }
+
+            head = hole.End + 1;
+        }
+
+        if (head == range.Start)
+        {
+            carved.Add(original);
+        }
+        else
+        {
+            AddPrefixes(carved, head, range.End, range.Width);
+        }
+    }
+
+    private static List<Range> Parse(IReadOnlyList<string> entries)
+    {
+        var spans = new List<Range>(entries.Count);
         foreach (var entry in entries)
         {
-            if (GeoIpRanges.TryParse(entry, out var start, out var end, out var bits))
+            if (TryParse(entry, out var range))
             {
-                spans.Add((start, end, bits));
+                spans.Add(range);
             }
         }
 
         return spans;
     }
 
-    private static HashSet<(uint, int)> Keys(params List<(uint Start, uint End, int Bits)>[] sets)
+    private static HashSet<(int, UInt128, int)> Keys(params List<Range>[] sets) =>
+        sets.SelectMany(set => set).Select(range => (range.Width, range.Start, range.Bits)).ToHashSet();
+
+    private static bool TryParse(string entry, out Range range)
     {
-        var keys = new HashSet<(uint, int)>();
-        foreach (var set in sets)
+        var text = entry.Trim();
+        if (GeoIpRanges.TryParse(text, out var start, out var end, out var bits))
         {
-            foreach (var (start, _, bits) in set)
-            {
-                keys.Add((start, bits));
-            }
+            range = new Range(start, end, bits, 32);
+            return true;
         }
 
-        return keys;
-    }
-
-    // The ranges of the other sets inside this one and narrower than it, low to high.
-    private static List<(uint Start, uint End)> Holes(List<(uint Start, uint End, int Bits)> others, uint start, uint end, int bits)
-    {
-        var holes = new List<(uint Start, uint End)>();
-        for (var at = LowerBound(others, start); at < others.Count && others[at].Start <= end; at++)
+        range = default;
+        var slash = text.IndexOf('/');
+        var host = slash < 0 ? text.AsSpan() : text.AsSpan(0, slash);
+        bits = 128;
+        if (!IPAddress.TryParse(host, out var address) || address.AddressFamily != AddressFamily.InterNetworkV6
+            || (slash >= 0 && (!int.TryParse(text.AsSpan(slash + 1), NumberStyles.None, CultureInfo.InvariantCulture, out bits)
+                || bits is < 0 or > 128)))
         {
-            if (others[at].Bits > bits)
-            {
-                holes.Add((others[at].Start, others[at].End));
-            }
+            return false;
         }
 
-        return holes;
+        var value = NumericIpv6(address);
+        var mask = bits == 0 ? UInt128.Zero : UInt128.MaxValue << (128 - bits);
+        range = new Range(value & mask, value | ~mask, bits, 128);
+        return true;
     }
 
-    // The first range starting at the address or above it.
-    private static int LowerBound(List<(uint Start, uint End, int Bits)> others, uint start)
+    private static UInt128 NumericIpv6(IPAddress address)
+    {
+        Span<byte> bytes = stackalloc byte[16];
+        address.TryWriteBytes(bytes, out _);
+        return BinaryPrimitives.ReadUInt128BigEndian(bytes);
+    }
+
+    private static int LowerBound(List<Range> spans, int width, UInt128 start)
     {
         var low = 0;
-        var high = others.Count;
+        var high = spans.Count;
         while (low < high)
         {
             var mid = low + ((high - low) / 2);
-            if (others[mid].Start < start)
+            var range = spans[mid];
+            if (range.Width < width || (range.Width == width && range.Start < start))
             {
                 low = mid + 1;
             }
@@ -129,39 +202,37 @@ public static class RangeClaims
         return low;
     }
 
-    // The range less its holes, as the fewest prefixes that cover it.
-    private static void AddPieces(List<string> carved, uint start, uint end, List<(uint Start, uint End)> holes)
+    private static void AddPrefixes(List<string> carved, UInt128 head, UInt128 end, int width)
     {
-        var head = (ulong)start;
-        foreach (var (holeStart, holeEnd) in holes)
+        while (true)
         {
-            if (holeStart > head)
+            var size = Math.Min(width, (int)UInt128.TrailingZeroCount(head));
+            var span = size == 128 ? UInt128.MaxValue : (UInt128.One << size) - 1;
+            while (span > end - head)
             {
-                AddPrefixes(carved, head, holeStart - 1UL);
+                size--;
+                span >>= 1;
             }
 
-            head = Math.Max(head, holeEnd + 1UL);
-        }
+            carved.Add(Format(head, width - size, width));
+            if (span == end - head)
+            {
+                return;
+            }
 
-        if (head <= end)
-        {
-            AddPrefixes(carved, head, end);
+            head += span + 1;
         }
     }
 
-    private static void AddPrefixes(List<string> carved, ulong start, ulong end)
+    private static string Format(UInt128 start, int prefix, int width)
     {
-        var head = start;
-        while (head <= end)
+        if (width == 32)
         {
-            var size = BitOperations.TrailingZeroCount((uint)head);
-            while (size > 0 && head + (1UL << size) - 1 > end)
-            {
-                size--;
-            }
-
-            carved.Add(GeoIpRanges.Format((uint)head) + "/" + (32 - size).ToString(CultureInfo.InvariantCulture));
-            head += 1UL << size;
+            return GeoIpRanges.Format((uint)start) + "/" + prefix.ToString(CultureInfo.InvariantCulture);
         }
+
+        Span<byte> bytes = stackalloc byte[16];
+        BinaryPrimitives.WriteUInt128BigEndian(bytes, start);
+        return new IPAddress(bytes) + "/" + prefix.ToString(CultureInfo.InvariantCulture);
     }
 }

@@ -97,20 +97,26 @@ public static class AppFinds
         ArgumentNullException.ThrowIfNull(rules);
         ArgumentNullException.ThrowIfNull(finds);
 
-        var expanded = new List<GeoRule>();
+        return [.. ResolveRules(rules, finds).Select(entry => entry.Effective)];
+    }
+
+    internal static IEnumerable<(GeoRule Original, GeoRule Effective)> ResolveRules(
+        IReadOnlyList<GeoRule> rules, IReadOnlyDictionary<string, IReadOnlyList<string>> finds)
+    {
         foreach (var rule in rules)
         {
             if (rule.Kind != GeoRuleKind.App || !AppNames.IsName(rule.Value))
             {
-                expanded.Add(rule);
+                yield return (rule, rule);
             }
             else if (finds.TryGetValue(rule.Value.Trim(), out var values))
             {
-                expanded.AddRange(values.Select(value => rule with { Value = value }));
+                foreach (var value in values)
+                {
+                    yield return (rule, rule with { Value = value });
+                }
             }
         }
-
-        return expanded;
     }
 
     /// <summary>

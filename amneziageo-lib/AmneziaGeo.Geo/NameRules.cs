@@ -167,7 +167,17 @@ public sealed class NameRules
         _ => 0,
     };
 
-    private static string Normalize(string value) => value.Trim().TrimEnd('.').ToLowerInvariant();
+    internal static GeoDomain Key(GeoDomain domain) => domain with
+    {
+        Value = domain.Kind switch
+        {
+            GeoDomainKind.Domain or GeoDomainKind.Full => Normalize(domain.Value),
+            GeoDomainKind.Plain => domain.Value.ToLowerInvariant(),
+            _ => domain.Value,
+        },
+    };
+
+    internal static string Normalize(string value) => value.Trim().TrimEnd('.').ToLowerInvariant();
 }
 
 /// <summary>

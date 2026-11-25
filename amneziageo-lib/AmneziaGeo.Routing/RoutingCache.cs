@@ -77,6 +77,7 @@ public sealed class RoutingCache
         public bool Routed;
         public bool Tunneled;
         public bool ByApp;
+        public bool AppClaimed;
         // Settled by a name, not by the ranges: a range covering the address must not take it back.
         public bool ByName;
         public uint InterfaceIndex;
@@ -363,25 +364,23 @@ public sealed class RoutingCache
         }
 
         var now = Environment.TickCount64;
-        if (_entries.TryGetValue(address, out var existing))
+        if (!_entries.TryGetValue(address, out var existing))
         {
-            Volatile.Write(ref existing.LastTouch, now);
-            if (app)
-            {
-                Promote(existing, now);
-                return;
-            }
-
-            if (Redecided(existing, now) || Installed(existing))
+            if (Admit(address, now, app) || !_entries.TryGetValue(address, out existing))
             {
                 return;
             }
-
-            Install(existing, now);
-            return;
         }
 
-        Admit(address, now, app);
+        Volatile.Write(ref existing.LastTouch, now);
+        if (app)
+        {
+            Promote(existing, now);
+        }
+        else if (!Redecided(existing, now) && !Installed(existing))
+        {
+            Install(existing, now);
+        }
     }
 
     /// <summary>
@@ -398,14 +397,19 @@ public sealed class RoutingCache
         var now = Environment.TickCount64;
         if (!_entries.TryGetValue(address, out var existing))
         {
-            Admit(address, now, false, verdict);
-            return;
+            if (Admit(address, now, false, verdict) || !_entries.TryGetValue(address, out existing))
+            {
+                return;
+            }
         }
 
         Volatile.Write(ref existing.LastTouch, now);
-        existing.ByName = true;
         var rules = Volatile.Read(ref _rules);
+        var decision = RouteDecision.Resolve(Evaluate(rules, address), verdict, RouteVerdict.None, RouteVerdict.None);
+        existing.ByName = decision.Source == RouteDecisionSource.Domain;
+        existing.ByApp = false;
         existing.Rules = rules.Generation;
+        verdict = decision.Verdict;
 
         // An adopted address belongs to the domain tracker; the two must not install competing routes for it.
         if (existing.Plan == RoutePlan.External || (existing.Verdict == verdict && !Replanned(rules, existing)))
@@ -440,6 +444,43 @@ public sealed class RoutingCache
         if (GeoIpRanges.TryToNumeric(address, out var value))
         {
             Note(value, verdict);
+        }
+    }
+
+    /// <summary>
+    /// Updates a host route from its current DNS associations. Conflicting names withdraw the inferred route.
+    /// </summary>
+    public void NoteDns(IPAddress address, IEnumerable<RouteVerdict> answers)
+    {
+        if (!GeoIpRanges.TryToNumeric(address, out var value))
+        {
+            return;
+        }
+
+        var inferred = RouteDecision.Infer(answers, out var conflict);
+        if (inferred != RouteVerdict.None)
+        {
+            Note(value, inferred);
+            return;
+        }
+
+        if (conflict)
+        {
+            _logger.LogDebug("Conflicting DNS verdicts for an address; falling back to application and range rules");
+        }
+
+        if (_entries.TryGetValue(value, out var entry) && entry.ByName && entry.Plan != RoutePlan.External)
+        {
+            var rules = Volatile.Read(ref _rules);
+            var range = Evaluate(rules, value);
+            entry.ByName = false;
+            entry.ByApp = entry.AppClaimed && range != RouteVerdict.Block;
+            entry.Rules = rules.Generation;
+            Reclassify(entry, range, Environment.TickCount64);
+        }
+        else
+        {
+            Note(value);
         }
     }
 
@@ -755,16 +796,19 @@ public sealed class RoutingCache
                 continue;
             }
 
-            var carried = Carried(route);
-            var verdict = carried ?? Evaluate(rules, value);
+            var decision = RouteDecision.Resolve(Evaluate(rules, value), Carried(route) ?? RouteVerdict.None,
+                RouteVerdict.None, RouteVerdict.None);
+            var byName = decision.Source == RouteDecisionSource.Domain;
+            var byApp = route.ByApp && !byName && decision.Verdict != RouteVerdict.Block;
             var entry = new Entry
             {
                 Address = address,
                 Numeric = value,
-                Verdict = verdict,
-                Plan = Decide(rules, verdict, value, route.ByApp),
-                ByApp = route.ByApp,
-                ByName = carried is not null,
+                Verdict = decision.Verdict,
+                Plan = Decide(rules, decision.Verdict, value, byApp),
+                AppClaimed = route.ByApp,
+                ByApp = byApp,
+                ByName = byName,
                 Rules = rules.Generation,
                 LastTouch = now - (long)Math.Max((stamp - route.SeenAt).TotalMilliseconds, 0),
             };
@@ -1055,8 +1099,9 @@ public sealed class RoutingCache
     // decision that replaced it.
     private void Promote(Entry entry, long now)
     {
+        entry.AppClaimed = true;
         var wanted = CarriesEverything ? RoutePlan.Bypass : RoutePlan.Tunnel;
-        if (entry.Plan == wanted || entry.Plan is RoutePlan.Drop or RoutePlan.External
+        if (entry.ByName || entry.Plan == wanted || entry.Plan is RoutePlan.Drop or RoutePlan.External
             || (!CarriesEverything && entry.Plan is RoutePlan.Tunnel)
             || Volatile.Read(ref _local).Contains(entry.Numeric))
         {
@@ -1073,6 +1118,11 @@ public sealed class RoutingCache
         var generation = _applier.Generation;
         lock (entry)
         {
+            if (entry.ByName || entry.Plan == RoutePlan.Drop)
+            {
+                return;
+            }
+
             Release(entry, generation, filters, withdrawn);
             entry.Plan = wanted;
             entry.ByApp = true;
@@ -1094,7 +1144,7 @@ public sealed class RoutingCache
         {
             Release(entry, generation, filters, withdrawn);
             entry.Verdict = verdict;
-            entry.Plan = Decide(Volatile.Read(ref _rules), verdict, entry.Numeric);
+            entry.Plan = Decide(Volatile.Read(ref _rules), verdict, entry.Numeric, entry.ByApp);
         }
 
         _applier.RemoveTunnel(withdrawn);
@@ -1112,15 +1162,17 @@ public sealed class RoutingCache
         {
             var entry = pair.Value;
             entry.Rules = rules.Generation;
-            if (entry.Plan == RoutePlan.External || entry.ByApp)
+            if (entry.Plan == RoutePlan.External)
             {
                 continue;
             }
 
             var named = byName?.Invoke(entry.Address) ?? RouteVerdict.None;
-            entry.ByName = named != RouteVerdict.None;
-            var verdict = entry.ByName ? named : Evaluate(rules, entry.Numeric);
-            if (verdict == entry.Verdict && !Replanned(rules, entry))
+            var decision = RouteDecision.Resolve(Evaluate(rules, entry.Numeric), named, RouteVerdict.None, RouteVerdict.None);
+            var verdict = decision.Verdict;
+            entry.ByName = decision.Source == RouteDecisionSource.Domain;
+            entry.ByApp = entry.AppClaimed && !entry.ByName && verdict != RouteVerdict.Block;
+            if (verdict == entry.Verdict && Decide(rules, verdict, entry.Numeric, entry.ByApp) == entry.Plan)
             {
                 continue;
             }
@@ -1152,7 +1204,21 @@ public sealed class RoutingCache
         }
 
         entry.Rules = rules.Generation;
-        if (entry.ByApp || entry.Plan == RoutePlan.External)
+        if (entry.Plan == RoutePlan.External)
+        {
+            return false;
+        }
+
+        var range = Evaluate(rules, entry.Numeric);
+        if (range == RouteVerdict.Block && (entry.ByName || entry.ByApp))
+        {
+            entry.ByName = false;
+            entry.ByApp = false;
+            Reclassify(entry, range, now);
+            return true;
+        }
+
+        if (entry.ByApp)
         {
             return false;
         }
@@ -1168,30 +1234,34 @@ public sealed class RoutingCache
             return true;
         }
 
-        var verdict = Evaluate(rules, entry.Numeric);
-        if (verdict == entry.Verdict)
+        if (range == entry.Verdict)
         {
             return false;
         }
 
-        Reclassify(entry, verdict, now);
+        Reclassify(entry, range, now);
         return true;
     }
 
     // Creates the entry for an address seen for the first time and applies what its verdict asks for.
-    private void Admit(uint address, long now, bool app = false, RouteVerdict? forced = null, bool datagrams = false)
+    private bool Admit(uint address, long now, bool app = false, RouteVerdict? forced = null, bool datagrams = false)
     {
         var rules = Volatile.Read(ref _rules);
-        var verdict = forced ?? Evaluate(rules, address);
+        var decision = RouteDecision.Resolve(Evaluate(rules, address), forced ?? RouteVerdict.None,
+            RouteVerdict.None, RouteVerdict.None);
+        var verdict = decision.Verdict;
+        var byName = decision.Source == RouteDecisionSource.Domain;
+        var byApp = app && !byName && verdict != RouteVerdict.Block;
         var entry = new Entry
         {
             Address = ToAddress(address),
             Numeric = address,
             Verdict = verdict,
-            Plan = Decide(rules, verdict, address, app),
-            ByApp = app,
+            Plan = Decide(rules, verdict, address, byApp),
+            AppClaimed = app,
+            ByApp = byApp,
             Datagrams = datagrams,
-            ByName = forced is not null,
+            ByName = byName,
             Rules = rules.Generation,
             LastTouch = now,
         };
@@ -1208,7 +1278,7 @@ public sealed class RoutingCache
                 Install(raced, now);
             }
 
-            return;
+            return false;
         }
 
         Interlocked.Increment(ref _size);
@@ -1216,6 +1286,8 @@ public sealed class RoutingCache
         {
             Install(entry, now);
         }
+
+        return true;
     }
 
     /// <summary>
@@ -1697,7 +1769,7 @@ public sealed class RoutingCache
     // that does not carry the default takes a route of its own for what its rules name.
     // Split: nothing rides the tunnel until a destination earns it, and the physical path is blocked until a
     // verdict exists - so Proxy earns the tunnel, Block stays dropped, and everything else earns a permit.
-    // app: claimed by an app rule, which outranks a range and a name: in a split its destination rides the tunnel
+    // app: claimed by an app rule when no name decides, which outranks a non-blocking range: in a split its destination rides the tunnel
     // where a direct rule names it too, and under a tunnel that carries everything the claim is of an application
     // the list keeps direct, whose destination leaves past the tunnel where a rule sends it through. A block still
     // wins: the route of the address stands for every program of the machine, and so would a lifted block. A network

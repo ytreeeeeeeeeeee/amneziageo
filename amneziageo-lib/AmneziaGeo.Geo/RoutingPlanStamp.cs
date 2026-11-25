@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using AmneziaGeo.Decl;
 
 namespace AmneziaGeo.Geo;
@@ -39,6 +40,30 @@ public static class RoutingPlanStamp
         Number(text, splitLimit);
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text.ToString())));
     }
+
+    /// <summary>Stamps an already compiled policy in its tunnel and resolver context.</summary>
+    public static string OfPolicy(RoutingPolicy? policy, IReadOnlyList<string> inbound,
+        bool useRouter, bool perApp, int ttlSeconds, int splitLimit) =>
+        Hash(new { Format, Policy = policy?.Stamp, inbound, useRouter, perApp, ttlSeconds, splitLimit });
+
+    internal static string ForPolicy(RoutingList list, RoutingSettings? settings, IReadOnlyList<RoutingListStamp> sources,
+        IReadOnlyList<RoutingRuleOrigin> origins, AppRulePlatform platform, IReadOnlyList<GeoSource> geoSources,
+        IReadOnlyList<GeoFileMetadata> geoFiles) =>
+        Hash(new
+        {
+            Format,
+            list,
+            settings,
+            Sources = sources.Select(source => new { source.Id, source.Generation }),
+            Rules = origins.Select(origin => new { origin.ListId, origin.Original, origin.Unfolded.Rule }),
+            Expansions = origins.Select(origin => origin.Unfolded).Distinct(),
+            platform,
+            GeoSources = geoSources.OrderBy(source => source.Position).ThenBy(source => source.Name, StringComparer.Ordinal)
+                .Select(source => new { source.Name, source.Kind, source.Position }),
+            Files = geoFiles.OrderBy(file => file.Name, StringComparer.Ordinal).Select(file => new { file.Name, file.Sha256 }),
+        });
+
+    private static string Hash<T>(T value) => Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(value)));
 
     private static void Number(StringBuilder text, long value)
     {

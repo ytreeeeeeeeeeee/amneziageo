@@ -1365,6 +1365,44 @@ public sealed class RoutingCacheTests
         Assert.Equal(new[] { Numeric(YandexAddress) }, applier.Dropped);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ANameShieldsItsVerdictFromAppsUntilDnsNamesDisagree(bool appFirst)
+    {
+        var applier = new FakeApplier { Generation = 1 };
+        var cache = Cache(applier, split: true);
+        var address = IPAddress.Parse(YandexAddress);
+        if (appFirst)
+        {
+            cache.Note(Numeric(YandexAddress), app: true);
+        }
+
+        cache.NoteDns(address, [RouteVerdict.Direct]);
+        cache.Note(Numeric(YandexAddress), app: true);
+        var named = Assert.Single(cache.Snapshot());
+        Assert.True(named.ByName);
+        Assert.False(named.ByApp);
+        Assert.Equal(RoutePlan.Permit, named.Plan);
+
+        cache.NoteDns(address, [RouteVerdict.Proxy, RouteVerdict.Direct]);
+        var fallback = Assert.Single(cache.Snapshot());
+        Assert.False(fallback.ByName);
+        Assert.True(fallback.ByApp);
+        Assert.Equal(RoutePlan.Tunnel, fallback.Plan);
+    }
+
+    [Fact]
+    public void AnAddressBlockWinsOverBothDnsAndApps()
+    {
+        var applier = new FakeApplier { Generation = 1 };
+        var cache = Cache(applier, split: true, block: [YandexRange]);
+        var address = IPAddress.Parse(YandexAddress);
+        cache.NoteDns(address, [RouteVerdict.Proxy]);
+        cache.Note(Numeric(YandexAddress), app: true);
+        Assert.Equal(RoutePlan.Drop, Assert.Single(cache.Snapshot()).Plan);
+    }
+
     [Fact]
     public void WhereTheDirectRangesStand_AnAddressANameTunnelsPastOne_TakesARouteOfItsOwn()
     {

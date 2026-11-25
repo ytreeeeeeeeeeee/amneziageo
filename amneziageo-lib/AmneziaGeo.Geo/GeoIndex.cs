@@ -10,23 +10,25 @@ public sealed class GeoIndex
     private readonly IGeoFileStore _files;
     private readonly List<string> _geoip;
     private readonly List<string> _geosite;
+    private readonly IReadOnlySet<string>? _expectedFiles;
     // Per-key parse memo: each Cidrs/Domains lookup re-scans the whole protobuf, and RematerializeAll queries the
     // same country/category across many lists on one shared index, so caching the result avoids the repeat scans.
     private readonly Dictionary<string, IReadOnlyList<string>> _cidrCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, IReadOnlyList<GeoDomain>> _domainCache = new(StringComparer.OrdinalIgnoreCase);
 
-    private GeoIndex(IGeoFileStore files, List<string> geoip, List<string> geosite)
+    private GeoIndex(IGeoFileStore files, List<string> geoip, List<string> geosite, IReadOnlySet<string>? expectedFiles)
     {
         _files = files;
         _geoip = geoip;
         _geosite = geosite;
+        _expectedFiles = expectedFiles;
     }
 
     /// <summary>
     /// Takes the source names for the given sources, ordered by position. The files stay on disk and are scanned
     /// per query - a geo database runs to tens of megabytes and holding one costs more than re-reading it.
     /// </summary>
-    public static GeoIndex Load(IReadOnlyList<GeoSource> sources, IGeoFileStore files)
+    public static GeoIndex Load(IReadOnlyList<GeoSource> sources, IGeoFileStore files, IReadOnlySet<string>? expectedFiles = null)
     {
         var geoip = new List<string>();
         var geosite = new List<string>();
@@ -42,7 +44,7 @@ public sealed class GeoIndex
             }
         }
 
-        return new GeoIndex(files, geoip, geosite);
+        return new GeoIndex(files, geoip, geosite, expectedFiles);
     }
 
     /// <summary>
@@ -134,6 +136,11 @@ public sealed class GeoIndex
         using var stream = _files.OpenRead(name);
         if (stream is null)
         {
+            if (_expectedFiles?.Contains(name) == true)
+            {
+                throw new InvalidDataException("A downloaded geodata file needed by the routing policy is unavailable.");
+            }
+
             return [];
         }
 
@@ -143,6 +150,11 @@ public sealed class GeoIndex
         }
         catch (Exception ex) when (ex is InvalidDataException or ArgumentException or FormatException or EndOfStreamException or NotSupportedException or IOException)
         {
+            if (_expectedFiles?.Contains(name) == true)
+            {
+                throw new InvalidDataException("A downloaded geodata file needed by the routing policy could not be read.", ex);
+            }
+
             return [];
         }
     }

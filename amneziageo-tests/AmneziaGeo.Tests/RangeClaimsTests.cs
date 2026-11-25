@@ -1,3 +1,4 @@
+using System.Net;
 using AmneziaGeo.Dal;
 using AmneziaGeo.Decl;
 using AmneziaGeo.Geo;
@@ -44,6 +45,24 @@ public sealed class RangeClaimsTests : IAsyncLifetime
         }
 
         return ValueTask.CompletedTask;
+    }
+
+    [Fact]
+    public void Ipv6DefaultCanBeCarvedAtBothAddressBoundaries()
+    {
+        const string last = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
+        var ranges = RangeClaims.Settle(["::/0", "192.0.2.0/24"], ["::", last], [last + "/128"]);
+        var proxy = RangeClaims.Matcher(ranges.Proxy);
+        var direct = RangeClaims.Matcher(ranges.Direct);
+        var block = RangeClaims.Matcher(ranges.Block);
+
+        Assert.False(proxy(IPAddress.IPv6Any));
+        Assert.True(direct(IPAddress.IPv6Any));
+        Assert.False(proxy(IPAddress.Parse(last)));
+        Assert.False(direct(IPAddress.Parse(last)));
+        Assert.True(block(IPAddress.Parse(last)));
+        Assert.True(proxy(IPAddress.IPv6Loopback));
+        Assert.True(proxy(IPAddress.Parse("192.0.2.3")));
     }
 
     [Fact]
