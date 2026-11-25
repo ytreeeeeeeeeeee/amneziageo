@@ -645,7 +645,8 @@ internal sealed class NetworkFlowTracker : IDisposable
             return;
         }
 
-        _noteV4(BinaryPrimitives.ReverseEndianness(networkOrderAddress), MatchesPidCached(pid));
+        var address = BinaryPrimitives.ReverseEndianness(networkOrderAddress);
+        _noteV4(address, MatchesPidCached(pid));
     }
 
     // Routes a UDP destination: all-UDP routes it plainly, an app match also promotes its domain.
@@ -848,13 +849,18 @@ internal sealed class NetworkFlowTracker : IDisposable
     // Cached per-pid app match; recomputes at most every PidCacheTtlMs so repeated events skip the snapshot.
     private bool MatchesPidCached(uint pid)
     {
+        if (_matcher is null)
+        {
+            return false;
+        }
+
         var now = Environment.TickCount64;
         if (_pidMatch.TryGetValue(pid, out var entry) && entry.Expiry > now)
         {
             return entry.Match;
         }
 
-        var match = _matcher is not null && _matcher.MatchesPid(pid);
+        var match = _matcher.MatchesPid(pid);
         if (_pidMatch.Count >= 4096)
         {
             _pidMatch.Clear();

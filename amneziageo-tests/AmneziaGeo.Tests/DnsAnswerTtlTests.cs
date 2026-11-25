@@ -109,7 +109,7 @@ public sealed class DnsAnswerTtlTests
     {
         var proxy = new DnsProxy([YouTube], [], Resolver, Resolver, null, [], true, [], [], null, NullLogger<DnsProxy>.Instance, stripV6: false, listen: false);
         proxy.SetLentNames(
-            name => name.EndsWith("lent.example", StringComparison.Ordinal) ? "second" : null,
+            (name, local) => local is null && name.EndsWith("lent.example", StringComparison.Ordinal) ? "second" : null,
             (_, _) =>
             {
                 Interlocked.Increment(ref _asked);

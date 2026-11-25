@@ -191,7 +191,7 @@ public sealed class GeoConfigurator(IStateStore store, IGeoFileStore files)
         }
     }
 
-    private static RoutingList ComposeList(long id, IReadOnlyList<RoutingListStamp> sources, IReadOnlyList<RuleUnfold> rules,
+    internal static RoutingList ComposeList(long id, IReadOnlyList<RoutingListStamp> sources, IReadOnlyList<RuleUnfold> rules,
         AppRulePlatform platform, out IReadOnlyList<string> blockApps, ILogger? log)
     {
         var proxy = BucketRanges(RouteRole.Proxy);

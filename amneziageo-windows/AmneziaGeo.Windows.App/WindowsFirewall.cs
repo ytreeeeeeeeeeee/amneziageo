@@ -584,6 +584,12 @@ internal sealed partial class WindowsFirewall(ILogger<WindowsFirewall> logger) :
         _others.Clear();
         _otherServers.Clear();
         _offTunnel.Clear();
+        _blockedApps.Clear();
+        foreach (var (address, permit) in _namePermits.ToArray())
+        {
+            _namePermits[address] = permit with { Filter = 0 };
+        }
+
         _tunnelLuid = 0;
         logger.LogInformation("leak protection is off; traffic is no longer restricted to the tunnel");
     }

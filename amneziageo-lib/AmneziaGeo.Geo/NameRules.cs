@@ -159,6 +159,36 @@ public sealed class NameRules
         }
     }
 
+    /// <summary>Compares matching rules by the same priority used by <see cref="Match"/>.</summary>
+    public static int Compare(NameMatch left, NameMatch right)
+    {
+        var specificity = Specificity(left).CompareTo(Specificity(right));
+        if (specificity != 0)
+        {
+            return specificity;
+        }
+
+        if (left.Kind is GeoDomainKind.Domain or GeoDomainKind.Plain)
+        {
+            var width = left.Value.Length.CompareTo(right.Value.Length);
+            if (width != 0)
+            {
+                return width;
+            }
+        }
+
+        return Rank(left.Verdict).CompareTo(Rank(right.Verdict));
+    }
+
+    private static int Specificity(NameMatch match) => match.Kind switch
+    {
+        GeoDomainKind.Domain when match.Named => 5,
+        GeoDomainKind.Full => 4,
+        GeoDomainKind.Domain => 3,
+        GeoDomainKind.Plain => 2,
+        _ => 1,
+    };
+
     private static int Rank(RouteVerdict verdict) => verdict switch
     {
         RouteVerdict.Block => 3,
@@ -167,7 +197,8 @@ public sealed class NameRules
         _ => 0,
     };
 
-    internal static GeoDomain Key(GeoDomain domain) => domain with
+    /// <summary>The canonical identity of a materialized name rule.</summary>
+    public static GeoDomain Key(GeoDomain domain) => domain with
     {
         Value = domain.Kind switch
         {

@@ -138,11 +138,15 @@ internal sealed class ScopedStateStore(IStateStore machine, IStateStore user) : 
     public Task SaveTunnelGeoAsync(TunnelGeo geo, CancellationToken ct = default) => user.SaveTunnelGeoAsync(geo, ct);
 
     /// <inheritdoc/>
-    public Task SaveTunnelProjectionAsync(string name, bool split, IReadOnlyList<string> routes, IReadOnlyList<GeoDomain> domains, IReadOnlyList<string> apps, IReadOnlyList<string> directRoutes, IReadOnlyList<GeoDomain> directDomains, IReadOnlyList<string> blockRoutes, IReadOnlyList<GeoDomain> blockDomains, long? routingListId, CancellationToken ct = default)
-        => user.SaveTunnelProjectionAsync(name, split, routes, domains, apps, directRoutes, directDomains, blockRoutes, blockDomains, routingListId, ct);
+    public Task SaveTunnelProjectionAsync(string name, bool split, IReadOnlyList<string> routes, IReadOnlyList<GeoDomain> domains, IReadOnlyList<string> apps, IReadOnlyList<string> directRoutes, IReadOnlyList<GeoDomain> directDomains, IReadOnlyList<string> blockRoutes, IReadOnlyList<GeoDomain> blockDomains, long? routingListId, CancellationToken ct = default, TunnelRoutingProjection? policy = null)
+        => user.SaveTunnelProjectionAsync(name, split, routes, domains, apps, directRoutes, directDomains, blockRoutes, blockDomains, routingListId, ct, policy);
 
     /// <inheritdoc/>
     public Task ClearTunnelProjectionAsync(string name, CancellationToken ct = default) => user.ClearTunnelProjectionAsync(name, ct);
+
+    /// <inheritdoc/>
+    public Task<TunnelRoutingProjection?> GetTunnelRoutingProjectionAsync(string name, CancellationToken ct = default) =>
+        user.GetTunnelRoutingProjectionAsync(name, ct);
 
     /// <inheritdoc/>
     public Task<long?> GetActiveRoutingListIdAsync(string name, CancellationToken ct = default) => user.GetActiveRoutingListIdAsync(name, ct);

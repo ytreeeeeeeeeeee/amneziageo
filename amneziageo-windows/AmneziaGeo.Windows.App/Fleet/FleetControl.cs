@@ -583,7 +583,10 @@ internal sealed class FleetControl(FleetLive live) : TunnelDutyRoster
             foreach (var key in _targets.Keys.Order(StringComparer.Ordinal))
             {
                 hash.Add(key, StringComparer.Ordinal);
-                hash.Add(ShareOfLocked(key, name, roundTrips, fallen));
+                var route = _targets[key];
+                hash.Add(route);
+                hash.Add(ResolveLocked(route.Target, roundTrips, fallen), StringComparer.Ordinal);
+                hash.Add(ResolveLocked(route.Fallback, roundTrips, fallen), StringComparer.Ordinal);
             }
 
             return hash.ToHashCode();
@@ -676,6 +679,18 @@ internal sealed class FleetControl(FleetLive live) : TunnelDutyRoster
     public override Task<IReadOnlyList<GeoRule>> ShareAsync(IStateStore store, string name, long listId, IReadOnlyList<GeoRule> rules, CancellationToken ct)
     {
         return Task.FromResult(Share(name, listId, rules));
+    }
+
+    /// <inheritdoc/>
+    public override Task<IReadOnlyList<(RuleUnfold Rule, string? Target)>> AssignAsync(
+        IStateStore store, string name, IReadOnlyList<RoutingRuleOrigin> origins, CancellationToken ct)
+    {
+        var roundTrips = live.RoundTrips();
+        var fallen = live.Fallen();
+        lock (_gate)
+        {
+            return Task.FromResult(Assign(origins, TargetOfLocked, target => ResolveLocked(target, roundTrips, fallen), CarrierLocked()));
+        }
     }
 
     /// <summary>
@@ -855,24 +870,6 @@ internal sealed class FleetControl(FleetLive live) : TunnelDutyRoster
 
         _roles[newName] = role;
         return true;
-    }
-
-    // How one rule reads on a tunnel: its own, kept off the tunnel, dropped, or somebody else's.
-    private int ShareOfLocked(string key, string name, IReadOnlyDictionary<string, int> roundTrips, IReadOnlySet<string> fallen)
-    {
-        var route = _targets[key];
-        var rides = ResolveLocked(route.Target, roundTrips, fallen) ?? ResolveLocked(route.Fallback, roundTrips, fallen);
-        if (string.Equals(rides, name, StringComparison.Ordinal))
-        {
-            return 1;
-        }
-
-        if (rides == RuleTarget.Block)
-        {
-            return 2;
-        }
-
-        return rides == RuleTarget.Direct ? 3 : 0;
     }
 
     private RuleRoute TargetOfLocked(string key)

@@ -30,6 +30,7 @@ internal sealed class AppDestinationMemory
     private readonly ILogger _logger;
     private readonly object _lock = new();
     // Insertion order, oldest first, so the cap drops what has not been seen for longest.
+    private readonly string? _policyStamp;
     private readonly List<string> _known = [];
     private readonly HashSet<string> _index = new(StringComparer.Ordinal);
     private long _listId;
@@ -39,12 +40,13 @@ internal sealed class AppDestinationMemory
     /// <summary>
     /// ctor
     /// </summary>
-    public AppDestinationMemory(IStateStore store, DomainTracker tracker, string tunnelName, IReadOnlyList<string> appRules, ILogger logger)
+    public AppDestinationMemory(IStateStore store, DomainTracker tracker, string tunnelName, IReadOnlyList<string> appRules, ILogger logger, string? policyStamp = null)
     {
         _store = store;
         _tracker = tracker;
         _tunnelName = tunnelName;
         _key = Key(appRules);
+        _policyStamp = policyStamp;
         _logger = logger;
     }
 
@@ -168,6 +170,12 @@ internal sealed class AppDestinationMemory
                 return;
             }
 
+            if (stored.PolicyStamp != _policyStamp)
+            {
+                _logger.LogDebug("{Tunnel}: ignored remembered application addresses from another routing version", _tunnelName);
+                return;
+            }
+
             var taken = 0;
             lock (_lock)
             {
@@ -234,7 +242,7 @@ internal sealed class AppDestinationMemory
 
         try
         {
-            await _store.SaveDomainResolutionAsync(_tunnelName, new DomainResolution(_key, snapshot), _listId, ct).ConfigureAwait(false);
+            await _store.SaveDomainResolutionAsync(_tunnelName, new DomainResolution(_key, snapshot, PolicyStamp: _policyStamp), _listId, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

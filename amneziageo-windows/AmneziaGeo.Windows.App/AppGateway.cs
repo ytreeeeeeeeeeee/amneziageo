@@ -55,7 +55,9 @@ internal sealed class AppGateway : IDisposable
         GeoIpRanges block,
         IReadOnlyList<string> kept,
         int mtu,
-        ILogger logger)
+        ILogger logger,
+        Func<string, RouteVerdict>? nameRule = null,
+        Func<IPAddress, RouteVerdict>? dnsRule = null)
     {
         if (apps.Count == 0 || owner is null)
         {
@@ -85,7 +87,7 @@ internal sealed class AppGateway : IDisposable
 
         var unknownRidesTunnel = UnknownRidesTunnel(Environment.GetEnvironmentVariable("AMNEZIAGEO_APP_GATEWAY_UNKNOWN"));
         var outbound = new GatewayProxyOutbound(owner, unknownRidesTunnel, proxy, direct, block,
-            () => Index(tunnelAdapter), () => Physical(tunnelAdapter), logger);
+            () => Index(tunnelAdapter), () => Physical(tunnelAdapter), logger, nameRule, dnsRule);
         var server = new LocalProxyServer(outbound, line => logger.LogDebug("apps: {Line}", line), outbound);
         var options = new LocalProxyOptions { Enabled = true, SocksPort = port, HttpPort = port, AllowAnonymous = true };
         if (!server.Apply(options) || !server.Running)

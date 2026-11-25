@@ -1,7 +1,9 @@
 using System.Net;
 using AmneziaGeo.Decl;
+using AmneziaGeo.Geo;
 using AmneziaGeo.Routing;
 using AmneziaGeo.Windows.App;
+using AmneziaGeo.Windows.App.Fleet;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -22,6 +24,54 @@ public sealed class DnsProxyRulesTests
     {
         var pool = lan is null ? Array.Empty<IPAddress>() : new[] { lan };
         return new DnsProxy([GitHub, YouTube], block ?? [], Resolver, Resolver, lan, pool, lan is not null, [], direct, null, NullLogger<DnsProxy>.Instance, stripV6: false, listen: false);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task APeerWithANarrowerRuleAnswersBeforeALocalBlockOrDirectRule(bool block)
+    {
+        const string name = "download.example.test";
+        var parent = new GeoDomain(GeoDomainKind.Domain, "example.test", Named: true);
+        var child = new GeoDomain(GeoDomainKind.Domain, name, Named: true);
+        var proxy = Proxy(block ? [] : [parent], block ? [parent] : [], lan: Resolver);
+        Assert.Equal(block ? RouteVerdict.Block : RouteVerdict.Direct, proxy.NameVerdict(name));
+        IReadOnlyList<FleetLentOwner> owners = [new("bravo", new NameRules([child], [], []))];
+        var calls = 0;
+        proxy.SetLentNames((host, local) => FleetLentNames.OwnerOf(owners, host, local),
+            (owner, host) =>
+            {
+                Assert.Equal("bravo", owner);
+                Assert.Equal(name, host);
+                calls++;
+                return Task.FromResult<IReadOnlyList<string>>(["192.0.2.7"]);
+            });
+
+        var answer = await proxy.AnswerAsync(DnsMessage.BuildQuery(name, 1), TestContext.Current.CancellationToken);
+        Assert.NotNull(answer);
+        Assert.Equal([IPAddress.Parse("192.0.2.7")], DnsMessage.Addresses(answer));
+        Assert.Equal(1, calls);
+        Assert.Equal(block ? RouteVerdict.Block : RouteVerdict.Direct, proxy.NameVerdict("other.example.test"));
+        if (block)
+        {
+            var blocked = await proxy.AnswerAsync(DnsMessage.BuildQuery("other.example.test", 1), TestContext.Current.CancellationToken);
+            Assert.NotNull(blocked);
+            Assert.Equal(3, blocked[3] & 15);
+        }
+    }
+
+    [Fact]
+    public async Task AnUnavailableNarrowerPeerDoesNotFallBackToALocalRule()
+    {
+        const string name = "download.example.test";
+        var proxy = Proxy([], [new(GeoDomainKind.Domain, "example.test", Named: true)]);
+        IReadOnlyList<FleetLentOwner> owners = [new("bravo", new NameRules([new(GeoDomainKind.Domain, name, Named: true)], [], []))];
+        proxy.SetLentNames((host, local) => FleetLentNames.OwnerOf(owners, host, local),
+            (_, _) => Task.FromResult<IReadOnlyList<string>>([]));
+
+        var answer = await proxy.AnswerAsync(DnsMessage.BuildQuery(name, 1), TestContext.Current.CancellationToken);
+        Assert.NotNull(answer);
+        Assert.Equal(2, answer[3] & 15);
     }
 
     [Fact]

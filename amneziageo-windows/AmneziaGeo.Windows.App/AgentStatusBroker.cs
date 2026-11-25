@@ -1113,7 +1113,11 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
 
         var on = args[1].Equals("on", StringComparison.OrdinalIgnoreCase);
         var (rules, routes, domains, skipped) = await geo.ApplyAsync(args[0], on, args.Skip(2).ToList(), ct);
-        AnnounceRules();
+        if (IsRunningMember(args[0]) && (await store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false)) is not { Count: > 0 })
+        {
+            MarkRestartRequired(args[0]);
+        }
+
         logger.LogInformation("{Name}: {Rules} rule(s) saved, giving {Routes} address range(s) and {Domains} domain(s); only the named traffic goes through the tunnel: {On} - takes effect on reconnect", args[0], rules, routes, domains, on);
         var summary = $"saved: {rules} rules, {routes} routes, {domains} domains";
         return new IpcAck(true, skipped > 0 ? $"{summary}, {skipped} tokens ignored (applies on reconnect)" : $"{summary} (applies on reconnect)");
@@ -1471,7 +1475,8 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
             return new IpcAck(false, IpcMessage.Key("Agent_NoConfigSelected"));
         }
 
-        return new IpcAck(true, await inspector.RenderAsync(store, config, applied, ct));
+        var planned = applied ? null : await RoutingProjection.BuildAsync(store, geo, Roster, config, logger, ct).ConfigureAwait(false);
+        return new IpcAck(true, await inspector.RenderAsync(store, config, applied, ct, planned).ConfigureAwait(false));
     }
 
     // The channel ladder, run for the config this window reports on.
@@ -1674,20 +1679,17 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
             }
 
             logger.LogInformation("programs found again for {Names}", string.Join(", ", search.Changed.Select(name => "app:" + name)));
-            if (activeScope.IsOwnedBy(scope.UserRoot, scope.Sid)
-                && await scope.Store.GetSelectedRoutingListAsync().ConfigureAwait(false) is { } listId
-                && await scope.Store.GetRoutingListStampAsync(listId).ConfigureAwait(false) is { } stamp
-                && AppFinds.NamesOf(stamp.Rules).Intersect(search.Changed, StringComparer.OrdinalIgnoreCase).Any())
+            if (activeScope.IsOwnedBy(scope.UserRoot, scope.Sid))
             {
-                foreach (var member in RunningMembers())
+                var selected = await scope.Store.GetSelectedRoutingListsAsync().ConfigureAwait(false);
+                foreach (var id in selected ?? [])
                 {
-                    if (await scope.Store.GetActiveRoutingListIdAsync(member).ConfigureAwait(false) == listId)
+                    if (await scope.Store.GetRoutingListStampAsync(id).ConfigureAwait(false) is { } stamp
+                        && AppFinds.NamesOf(stamp.Rules).Intersect(search.Changed, StringComparer.OrdinalIgnoreCase).Any())
                     {
-                        await RoutingProjection.ProjectAsync(scope.Store, scope.Geo, Roster, member, logger, CancellationToken.None).ConfigureAwait(false);
+                        await MarkRoutingChangedAsync(id, CancellationToken.None, scope).ConfigureAwait(false);
                     }
                 }
-
-                AnnounceRules();
             }
 
             await BroadcastIfChangedAsync(CancellationToken.None).ConfigureAwait(false);
@@ -1733,11 +1735,11 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
     protected virtual async Task<(string Config, bool Applied)> InspectTargetAsync(CancellationToken ct)
     {
         var scope = CurrentScope;
-        var applied = control.Running && activeScope.IsOwnedBy(scope.UserRoot, scope.Sid);
-        var name = applied
+        var running = control.Running && activeScope.IsOwnedBy(scope.UserRoot, scope.Sid);
+        var name = running
             ? control.RunningTarget ?? control.Target ?? string.Empty
             : await store.GetSettingAsync(AgentControl.SelectedTargetKey, ct) ?? string.Empty;
-        return (name, applied);
+        return (name, running && control.Connected);
     }
 
     // Apps + services for per-app tunneling; enumerated as SYSTEM to read restricted paths. Rows are tab-separated: kind, label, value, detail.
@@ -1776,26 +1778,6 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
 
     // Rules that only take effect on a fresh tunnel: any app rule, whose matcher is built at bring-up. Ranges are
     // re-decided by the routing cache and names by the proxy, both on the rule announcement.
-    private static bool RequiresReconnect(string rule, bool directIsEager)
-    {
-        if (IsAppRule(rule))
-        {
-            return true;
-        }
-
-        var bar = rule.IndexOf('|');
-        var role = bar > 0 ? rule[..bar].ToLowerInvariant() : "proxy";
-        // Every bucket is resolved per destination and re-decided live, so only app rules still need a fresh tunnel.
-        return role switch
-        {
-            "direct" or "exclude" => directIsEager,
-            _ => false,
-        };
-    }
-
-    // Nothing is materialized at bring-up any more; kept so the reconnect rule reads the same on both sides.
-    private static bool DirectIsEager(RoutingList? list) => false;
-
     private async Task<IpcAck> SaveRoutingListAsync(IReadOnlyList<string> args, CancellationToken ct)
     {
         if (args.Count < 2)
@@ -1824,17 +1806,7 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
             return new IpcAck(false, IpcMessage.Key("Agent_RoutingListOwnApp", own));
         }
 
-        // Proxy geo (domains/geoip) applies live; app rules and the Block bucket need a fresh tunnel, and so does
-        // Direct while its bucket is small enough to be materialized at bring-up. The eager flag is read on both
-        // sides: a bucket that crosses the threshold either way leaves stale routes behind or lacks fresh ones.
-        var previous = id > 0 ? await store.GetRoutingListAsync(id, ct) : null;
-        var previousEager = DirectIsEager(previous);
-        var previousReconnect = previous is null
-            ? new HashSet<string>(StringComparer.Ordinal)
-            : previous.Rules.Select(GeoConfigurator.FormatWithRole)
-                .Where(r => RequiresReconnect(r, previousEager))
-                .ToHashSet(StringComparer.Ordinal);
-
+        var previous = id > 0 ? await store.GetRoutingListStampAsync(id, ct).ConfigureAwait(false) : null;
         var resultId = await geo.ApplyToRoutingListAsync(id, name, args.Skip(2).ToList(), ct);
 
         // The first list applies at once.
@@ -1843,45 +1815,38 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
             await store.UpdateSelectedRoutingListsAsync(current => current is null ? [resultId] : null, ct).ConfigureAwait(false);
         }
 
-        // Flag a reconnect only when the running tunnel routes through this list and a connect-time rule changed.
-        if (RunningMembers().Count > 0)
+        var current = await store.GetRoutingListStampAsync(resultId, ct).ConfigureAwait(false);
+        if (previous is null || current is null || previous.Name != current.Name || !previous.Rules.SequenceEqual(current.Rules))
         {
-            var listId = await store.GetSelectedRoutingListAsync(ct);
-            var eager = DirectIsEager(await store.GetRoutingListAsync(resultId, ct));
-            var newReconnect = args.Skip(2).Where(r => RequiresReconnect(r, eager)).ToHashSet(StringComparer.Ordinal);
-            if (listId == resultId && !newReconnect.SetEquals(previousReconnect))
-            {
-                MarkRestartRequired();
-            }
+            await MarkRoutingChangedAsync(resultId, ct).ConfigureAwait(false);
         }
 
         await KeepAddressesAsync(resultId, await TunnelTokensAsync(resultId, ct).ConfigureAwait(false), ct).ConfigureAwait(false);
-        await ReprojectAsync(resultId, ct);
-        AnnounceRules();
         logger.LogInformation("saved routing list {Id} '{Name}' ({Rules} rules)", resultId, name, args.Count - 2);
         return new IpcAck(true, resultId.ToString(System.Globalization.CultureInfo.InvariantCulture));
     }
 
-    // Each tunnel carries its own share of the list, so the shares are cut afresh before the edit is announced.
-    private async Task ReprojectAsync(long listId, CancellationToken ct)
+    private async Task MarkRoutingChangedAsync(long id, CancellationToken ct, BrokerScope? scope = null)
     {
-        if (await store.GetSelectedRoutingListAsync(ct) != listId)
+        var owner = scope ?? CurrentScope;
+        if (!activeScope.IsOwnedBy(owner.UserRoot, owner.Sid))
         {
             return;
         }
 
+        var scoped = owner.Store;
+        var selected = (await scoped.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false))?.Contains(id) == true;
         foreach (var member in RunningMembers())
         {
-            if (await store.GetActiveRoutingListIdAsync(member, ct) == listId)
+            var applied = await scoped.GetTunnelRoutingProjectionAsync(member, ct).ConfigureAwait(false);
+            var used = applied?.ListIds.Contains(id) ?? (await scoped.GetActiveRoutingListIdAsync(member, ct).ConfigureAwait(false) == id);
+            if (used || (selected && await ConfigRouting.AllowedAsync(scoped, member, ct).ConfigureAwait(false)))
             {
-                await RoutingProjection.ProjectAsync(store, geo, Roster, member, logger, ct);
+                logger.LogInformation("{Config}: changed routing list {List} will be applied on reconnect", member, id);
+                MarkRestartRequired(member);
             }
         }
     }
-
-    // The tunnel runs in its own process and polls for nothing: a rule change is announced to it here, and it
-    // decides every destination in use against the new rules.
-    private void AnnounceRules() => Announce(RuntimeSnapshotPipe.OpRules);
 
     // Each tunnel decides its own destinations, so every one that is up hears it.
     private void Announce(string op)
@@ -1926,6 +1891,7 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
             return refusal;
         }
 
+        await MarkRoutingChangedAsync(id, ct).ConfigureAwait(false);
         await KeepAddressesAsync(id, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
         logger.LogInformation("removed routing list {Id}", id);
         return new IpcAck(true, $"removed routing list {id}");
@@ -2044,13 +2010,9 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
             await store.SetRoutingSettingsAsync(new RoutingSettings(id, exclusions, allUdp, mode, useGlobalProxy), ct);
         }
 
-        // Settings apply on a fresh tunnel; flag a reconnect when the running tunnel routes through this list.
-        if (changed && RunningMembers().Count > 0)
+        if (changed)
         {
-            if (await store.GetSelectedRoutingListAsync(ct) == id)
-            {
-                MarkRestartRequired();
-            }
+            await MarkRoutingChangedAsync(id, ct).ConfigureAwait(false);
         }
 
         logger.LogInformation("routing list {Id} saved: exclusions {Len} characters, all UDP through the tunnel: {Udp}, mode {Mode}, everything through the tunnel except the direct list: {Global}", id, exclusions.Length, allUdp, mode, useGlobalProxy);
@@ -2676,39 +2638,29 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         if (changed)
         {
             Interlocked.Increment(ref _geoUpdatedTick);
+            await MarkGeoRoutingChangedAsync(CancellationToken.None).ConfigureAwait(false);
             await BroadcastIfChangedAsync(CancellationToken.None);
-            await ReprojectRunningAsync(CancellationToken.None);
         }
 
         logger.LogDebug("geo refresh session done: changed={Changed}, re-resolve triggered={Bumped} [{Ms} ms]",
             changed, forceResolve || changed, geoSw.ElapsedMilliseconds);
     }
 
-    // A base that changed reaches the running tunnel without a reconnect: its share is cut afresh from the rebuilt
-    // lists of the user who raised it and announced, as a saved list is. The tunnel reads only the share it was
-    // handed, so without this a list that sends a category through it lets what the category gained go past it.
-    private async Task ReprojectRunningAsync(CancellationToken ct)
+    private async Task MarkGeoRoutingChangedAsync(CancellationToken ct)
     {
-        var members = RunningMembers();
-        if (members.Count == 0)
+        var owner = activeScope.Store;
+        if (await owner.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false) is not { Count: > 0 })
         {
             return;
         }
 
-        try
+        foreach (var member in RunningMembers())
         {
-            var owner = activeScope.Store;
-            var ownerGeo = new GeoConfigurator(owner, geoFiles);
-            foreach (var member in members)
+            if (await ConfigRouting.AllowedAsync(owner, member, ct).ConfigureAwait(false))
             {
-                await RoutingProjection.ProjectAsync(owner, ownerGeo, Roster, member, logger, ct);
+                logger.LogInformation("{Config}: updated geodata will be used on reconnect", member);
+                MarkRestartRequired(member);
             }
-
-            AnnounceRules();
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            logger.LogWarning(ex, "the refreshed rule databases could not be handed to the running tunnel; they take effect on the next connect");
         }
     }
 

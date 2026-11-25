@@ -40,7 +40,7 @@ internal sealed class FleetLentNames(IStateStore store, string tunnel, ILogger l
                 continue;
             }
 
-            owners.Add(new FleetLentOwner(peer, new DomainMatcher(domains)));
+            owners.Add(new FleetLentOwner(peer, new NameRules(domains, [], [])));
             logger.LogInformation("{Peer}: {Count} name(s) are named by rules riding it, so this tunnel hands their lookups over instead of answering them", peer, domains.Count);
         }
 
@@ -50,25 +50,24 @@ internal sealed class FleetLentNames(IStateStore store, string tunnel, ILogger l
     /// <summary>
     /// The tunnel a rule named the name on, or null.
     /// </summary>
-    public string? Owner(string name)
-    {
-        return OwnerOf(_owners, name);
-    }
+    public string? Owner(string name, NameMatch? local) => OwnerOf(_owners, name, local);
 
-    /// <summary>
-    /// The tunnel out of the given ones a rule named the name on, or null.
-    /// </summary>
-    public static string? OwnerOf(IReadOnlyList<FleetLentOwner> owners, string name)
+    /// <summary>Chooses the best peer match when it outranks the local rule.</summary>
+    public static string? OwnerOf(IReadOnlyList<FleetLentOwner> owners, string name, NameMatch? local = null)
     {
+        var best = local;
+        string? selected = null;
         foreach (var owner in owners)
         {
-            if (owner.Matcher.IsTunneled(name))
+            if (owner.Matcher.Match(name) is { } match &&
+                (best is null || NameRules.Compare(match, best.Value) > 0))
             {
-                return owner.Tunnel;
+                best = match;
+                selected = owner.Tunnel;
             }
         }
 
-        return null;
+        return selected;
     }
 
     /// <summary>
@@ -79,7 +78,7 @@ internal sealed class FleetLentNames(IStateStore store, string tunnel, ILogger l
         var answer = await Task.Run(() => RuntimeSnapshotPipe.Send(owner, RuntimeSnapshotPipe.Carry(name), logger));
         if (answer is null)
         {
-            Forget(owner);
+            logger.LogWarning("[FIX] {Owner}: the Fleet DNS owner for {Name} did not answer", owner, name);
             return [];
         }
 
@@ -90,20 +89,6 @@ internal sealed class FleetLentNames(IStateStore store, string tunnel, ILogger l
 
         return answer.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     }
-
-    // Drops a tunnel that stopped serving its pipe, so the next name is not held up waiting for it again. It
-    // comes back with the next reload, which every connect of the set brings.
-    private void Forget(string owner)
-    {
-        var kept = _owners.Where(known => !string.Equals(known.Tunnel, owner, StringComparison.Ordinal)).ToArray();
-        if (kept.Length == _owners.Count)
-        {
-            return;
-        }
-
-        _owners = kept;
-        logger.LogWarning("{Owner} no longer answers, so the names its rules name are looked up here until it is back", owner);
-    }
 }
 
 /// <summary>
@@ -111,4 +96,4 @@ internal sealed class FleetLentNames(IStateStore store, string tunnel, ILogger l
 /// </summary>
 /// <param name="Tunnel">The tunnel the names ride.</param>
 /// <param name="Matcher">The names its rules matched.</param>
-internal sealed record FleetLentOwner(string Tunnel, DomainMatcher Matcher);
+internal sealed record FleetLentOwner(string Tunnel, NameRules Matcher);

@@ -136,7 +136,7 @@ internal sealed class FleetStatusBroker(
 
         // Every server runs a tunnel of its own, so a question about the tunnel is about the picked server.
         var name = Control.Target ?? await CurrentScope.Store.GetSettingAsync(AgentControl.SelectedTargetKey, ct) ?? string.Empty;
-        return (name, live.Of(name) is { Running: true });
+        return (name, live.Of(name) is { Connected: true });
     }
 
     /// <inheritdoc/>

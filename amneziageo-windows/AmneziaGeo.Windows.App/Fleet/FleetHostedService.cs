@@ -363,75 +363,47 @@ internal sealed class FleetHostedService(
         }
     }
 
-    // Cuts a running tunnel's share of the rules afresh and hands it over. An app rule is matched by a matcher
-    // built at bring-up, so a share that gains or loses one is dialled again.
+    // A real assignment change goes through startup, so filters, routes and matchers use the same share.
     private async Task ReaddressAsync(FleetMember member, long stamp, CancellationToken ct)
     {
         try
         {
-            var before = await AppsOfAsync(member.Name, ct);
-            var stood = await RangesOfAsync(member.Name, ct);
-            await RoutingProjection.ProjectAsync(store, geo, fleet, member.Name, logger, ct);
-            if (!(await AppsOfAsync(member.Name, ct)).SetEquals(before))
+            if (member.Control.RestartRequired)
             {
-                logger.LogInformation("{Name}: the app rules addressed to it changed, so it is connected again to take them up", member.Name);
-                await StopAsync(member.Name);
-                Start(member.Name, ct);
+                member.Took(stamp);
+                logger.LogDebug("{Name}: retaining the running share while a routing change awaits reconnect", member.Name);
                 return;
             }
 
-            // A range a rule names outright stands on the adapter from bring-up, so a share that gains or loses one
-            // is dialled again.
-            if (!(await RangesOfAsync(member.Name, ct)).SetEquals(stood))
+            var applied = await store.GetTunnelRoutingProjectionAsync(member.Name, ct).ConfigureAwait(false);
+            var next = await RoutingProjection.BuildAsync(store, geo, fleet, member.Name, logger, ct).ConfigureAwait(false);
+            if (member.Control.RestartRequired || applied is null || applied.InputStamp != next.InputStamp)
             {
-                logger.LogInformation("{Name}: the address ranges addressed to it changed, so it is connected again to take them up", member.Name);
-                await StopAsync(member.Name);
-                Start(member.Name, ct);
+                member.Control.SetRestartRequired();
+                member.Took(stamp);
+                logger.LogInformation("{Name}: the current routing share stays until reconnect", member.Name);
                 return;
             }
 
-            if (await Task.Run(() => RuntimeSnapshotPipe.Send(member.Name, RuntimeSnapshotPipe.OpRules, logger), ct) is null)
+            if (applied.Stamp == next.Stamp)
             {
-                logger.LogInformation("{Name}: the readdressed rules did not reach it, so it is connected again to take them up", member.Name);
-                await StopAsync(member.Name);
-                Start(member.Name, ct);
+                member.Took(stamp);
                 return;
             }
 
-            member.Took(stamp);
-            logger.LogInformation("{Name}: the rules addressed to it changed and it took them up without reconnecting", member.Name);
+            logger.LogInformation("{Name}: reconnecting to apply its changed routing share", member.Name);
+            await StopAsync(member.Name).ConfigureAwait(false);
+            Start(member.Name, ct);
         }
         catch (OperationCanceledException)
         {
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "{Name}: the readdressed rules could not be handed over, so it is connected again to take them up", member.Name);
-            await StopAsync(member.Name);
-            Start(member.Name, ct);
+            member.Control.SetRestartRequired();
+            member.Took(stamp);
+            logger.LogError(ex, "{Name}: could not prepare the changed share; the running policy was kept", member.Name);
         }
-    }
-
-    // The applications the tunnel's share names.
-    private async Task<HashSet<string>> AppsOfAsync(string name, CancellationToken ct)
-    {
-        var projected = await store.GetActiveTunnelGeoAsync(name, ct);
-        return projected is null ? [] : new HashSet<string>(projected.Apps, StringComparer.OrdinalIgnoreCase);
-    }
-
-    // The address ranges the tunnel's share names outright.
-    private async Task<HashSet<string>> RangesOfAsync(string name, CancellationToken ct)
-    {
-        var projected = await store.GetActiveTunnelGeoAsync(name, ct);
-        if (projected is null)
-        {
-            return [];
-        }
-
-        var listId = await store.GetActiveRoutingListIdAsync(name, ct);
-        var list = listId is null ? null : await store.GetRoutingListAsync(listId.Value, ct);
-        var named = GeoMaterializer.NamedRanges(list?.Rules ?? projected.Rules, RouteRole.Proxy, projected.Routes);
-        return new HashSet<string>(named, StringComparer.Ordinal);
     }
 
     // The mode's own state is written once a request has moved the set: a start that did not raise what it

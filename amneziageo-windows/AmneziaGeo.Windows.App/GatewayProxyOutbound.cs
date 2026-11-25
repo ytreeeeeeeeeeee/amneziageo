@@ -8,8 +8,7 @@ namespace AmneziaGeo.Windows.App;
 /// <summary>
 /// Where a session handed over by the gateway goes. The pair it was opened for names the program behind it, so a
 /// rule on that program decides the whole session, and nothing of another program goes with it. The program
-/// outranks an address rule, a block too: only a session of a program no rule names is decided by the ranges. The
-/// way out is
+/// follows a recognized name, while an explicit address block stays in force. The way out is
 /// pinned to an interface rather than left to the routing table, or a session meant to leave the tunnel would come
 /// back into the adapter it was terminated on.
 /// </summary>
@@ -21,7 +20,9 @@ internal sealed class GatewayProxyOutbound(
     GeoIpRanges block,
     Func<uint> tunnelInterface,
     Func<uint> physicalInterface,
-    ILogger logger) : IProxyOutbound, IDatagramOutbound
+    ILogger logger,
+    Func<string, RouteVerdict>? nameRule = null,
+    Func<IPAddress, RouteVerdict>? dnsRule = null) : IProxyOutbound, IDatagramOutbound
 {
     private const int ConnectTimeoutMs = 8000;
 
@@ -42,13 +43,13 @@ internal sealed class GatewayProxyOutbound(
 
             var numeric = Numeric(address);
             var pid = source is null || owner is null ? (uint?)null : TcpTableProbe.OwnerOf(source, new IPEndPoint(address, port));
-            var named = pid is { } id ? Named(id) : null;
-            if (named is null && block.Contains(numeric))
+            var decision = Decide(numeric, address, IPAddress.TryParse(host, out _) ? null : host, pid);
+            if (decision == RouteVerdict.Block)
             {
                 return (null, ProxyOutcome.Blocked);
             }
 
-            var tunnelled = named ?? Tunnelled(numeric, pid);
+            var tunnelled = decision == RouteVerdict.Proxy || (decision == RouteVerdict.None && Tunnelled(numeric, pid));
             var link = await OpenAsync(address, port, tunnelled, ct).ConfigureAwait(false);
             if (link is not null)
             {
@@ -113,8 +114,8 @@ internal sealed class GatewayProxyOutbound(
 
         var numeric = Numeric(destination.Address);
         var pid = source is null || owner is null ? (uint?)null : TcpTableProbe.OwnerOfDatagram(source);
-        var named = pid is { } id ? Named(id) : null;
-        if (named is null && block.Contains(numeric))
+        var decision = Decide(numeric, destination.Address, null, pid);
+        if (decision == RouteVerdict.Block)
         {
             return null;
         }
@@ -122,7 +123,8 @@ internal sealed class GatewayProxyOutbound(
         var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         try
         {
-            var index = (named ?? Tunnelled(numeric, pid)) ? tunnelInterface() : physicalInterface();
+            var tunnelled = decision == RouteVerdict.Proxy || (decision == RouteVerdict.None && Tunnelled(numeric, pid));
+            var index = tunnelled ? tunnelInterface() : physicalInterface();
             if (index > 0)
             {
                 UnicastInterface.Pin(socket, index);
@@ -136,6 +138,22 @@ internal sealed class GatewayProxyOutbound(
             socket.Dispose();
             return null;
         }
+    }
+
+    private RouteVerdict Decide(uint numeric, IPAddress address, string? host, uint? pid)
+    {
+        var range = block.Contains(numeric) ? RouteVerdict.Block
+            : direct.Contains(numeric) ? RouteVerdict.Direct
+            : proxy.Contains(numeric) ? RouteVerdict.Proxy : RouteVerdict.None;
+        var domain = host is not null ? nameRule?.Invoke(host) ?? RouteVerdict.None : RouteVerdict.None;
+        var inferred = host is null ? dnsRule?.Invoke(address) ?? RouteVerdict.None : RouteVerdict.None;
+        var app = pid is { } id ? Named(id) : null;
+        if (nameRule is null)
+        {
+            return app is true ? RouteVerdict.Proxy : app is false ? RouteVerdict.Direct : range;
+        }
+
+        return RouteDecision.Resolve(range, domain, inferred, app == true ? RouteVerdict.Proxy : RouteVerdict.None).Verdict;
     }
 
     // The side a rule on the program behind a pid sends it; null where no rule names the program.

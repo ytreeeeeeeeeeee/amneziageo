@@ -42,18 +42,21 @@ internal sealed class RuntimeInspector(SettingsStore settings, UapiClient uapi, 
     /// Renders the effective configuration report. Applied reads the live device, otherwise the report covers
     /// what the next connect would use.
     /// </summary>
-    public async Task<string> RenderAsync(IStateStore store, string config, bool applied, CancellationToken ct)
+    public async Task<string> RenderAsync(IStateStore store, string config, bool applied, CancellationToken ct, TunnelRoutingProjection? planned = null)
     {
         var text = new StringBuilder();
         var configText = await store.GetConfigTextAsync(config, ct) ?? string.Empty;
         var transport = await store.GetConfigTransportAsync(config, ct);
-        var geo = await store.GetActiveTunnelGeoAsync(config, ct);
-        var listId = await store.GetActiveRoutingListIdAsync(config, ct);
-        var list = listId is long bucketId ? await store.GetRoutingListAsync(bucketId, ct) : null;
-        var routing = listId is long settingsId ? await store.GetRoutingSettingsAsync(settingsId, ct) : null;
-        var materialization = await store.GetActiveRoutingListMaterializationAsync(config, ct);
+        var projection = applied ? await store.GetTunnelRoutingProjectionAsync(config, ct).ConfigureAwait(false) : planned;
+        var geo = projection?.Geo(config) ?? await store.GetActiveTunnelGeoAsync(config, ct).ConfigureAwait(false);
+        var listId = projection is null ? await store.GetActiveRoutingListIdAsync(config, ct).ConfigureAwait(false) : null;
+        var list = projection is not null ? projection.ListIds.Count > 0 ? projection.List : null
+            : listId is long id ? await store.GetRoutingListAsync(id, ct).ConfigureAwait(false) : null;
+        var routing = projection is not null ? projection.Settings
+            : listId is long settingsId ? await store.GetRoutingSettingsAsync(settingsId, ct).ConfigureAwait(false) : null;
+        var materialization = projection is null ? await store.GetActiveRoutingListMaterializationAsync(config, ct).ConfigureAwait(false) : null;
         var app = await settings.LoadAsync(ct);
-        var split = list is not null ? !(routing?.UseGlobalProxy ?? false) : geo?.GeoSplit ?? false;
+        var split = projection?.Split ?? (list is not null ? !(routing?.UseGlobalProxy ?? false) : geo?.GeoSplit ?? false);
         var device = applied ? ReadDevice(config) : null;
 
         Section(text, "state");
@@ -62,8 +65,14 @@ internal sealed class RuntimeInspector(SettingsStore settings, UapiClient uapi, 
 
         Section(text, "routing");
         Row(text, "mode", split ? "split" : "global proxy");
-        Row(text, "routing list", list is null ? "-" : $"{list.Name} (id {list.Id})");
-        Row(text, "generation", materialization is null ? "-" : materialization.Generation.ToString(CultureInfo.InvariantCulture));
+        var ids = projection?.ListIds ?? (listId is long selectedId ? [selectedId] : []);
+        Row(text, "routing lists", list is null ? "-" : $"{list.Name} (IDs {string.Join(", ", ids)})");
+        Row(text, "routing version", projection?.Stamp[..12] ?? materialization?.Generation.ToString(CultureInfo.InvariantCulture) ?? "-");
+        if (applied && projection is not null)
+        {
+            var selected = await store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false);
+            Row(text, "selected routing list IDs", string.Join(", ", selected ?? []));
+        }
         Row(text, "all udp", (split && (routing?.AllUdp ?? app.TunnelAllUdp)) ? "on" : "off");
         Row(text, "proxy", $"{geo?.Routes.Count ?? 0} ranges, {geo?.Domains.Count ?? 0} domains");
         Row(text, "direct", $"{(geo?.DirectRoutes ?? list?.DirectRoutes)?.Count ?? 0} ranges, {(geo?.DirectDomains ?? list?.DirectDomains)?.Count ?? 0} domains");

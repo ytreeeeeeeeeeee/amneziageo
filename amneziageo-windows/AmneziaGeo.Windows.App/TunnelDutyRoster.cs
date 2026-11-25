@@ -45,6 +45,53 @@ internal class TunnelDutyRoster
         return Alone(name, listId, rules, targets);
     }
 
+    /// <summary>Resolves the original assignment of every rule before taking a tunnel's share.</summary>
+    public virtual async Task<IReadOnlyList<(RuleUnfold Rule, string? Target)>> AssignAsync(
+        IStateStore store, string name, IReadOnlyList<RoutingRuleOrigin> origins, CancellationToken ct)
+    {
+        var targets = FleetTargets.Parse(await store.GetSettingAsync(FleetKeys.Targets, ct).ConfigureAwait(false));
+        return Assign(origins, key => targets.TryGetValue(key, out var route) ? route : RuleRoute.Default,
+            target => Resolve(target, name), name);
+    }
+
+    protected static IReadOnlyList<(RuleUnfold Rule, string? Target)> Assign(
+        IReadOnlyList<RoutingRuleOrigin> origins, Func<string, RuleRoute> targetOf, Func<RuleTarget, string?> resolve,
+        string? automatic)
+    {
+        var assigned = new List<(RuleUnfold Rule, string? Target)>();
+        assigned.AddRange(origins.Where(origin => origin.Unfolded.Rule.Role != RouteRole.Proxy)
+            .Select(origin => (origin.Unfolded, (string?)null)));
+
+        // Group the effective rule, but read the target by the exact original key saved by the user.
+        var candidates = origins.Where(origin => origin.Unfolded.Rule.Role == RouteRole.Proxy).Select(origin =>
+        {
+            var route = targetOf(FleetTargets.Key(origin.ListId, GeoConfigurator.Format(origin.Original)));
+            var target = route.Target.IsAuto ? null : resolve(route.Target);
+            var fallback = route.Fallback.IsAuto ? null : resolve(route.Fallback);
+            return (Origin: origin, Target: target ?? fallback ?? automatic, Rank: target is not null ? 2 : fallback is not null ? 1 : 0);
+        });
+        foreach (var group in candidates.OrderByDescending(item => item.Rank).ThenBy(item => item.Origin.ListId)
+            .GroupBy(item => item.Origin.WindowsKey()))
+        {
+            var winner = group.First();
+            var rule = winner.Origin.Unfolded;
+            switch (winner.Target)
+            {
+                case RuleTarget.Block:
+                    assigned.Add((rule with { Rule = rule.Rule with { Role = RouteRole.Block } }, null));
+                    break;
+                case RuleTarget.Direct:
+                    assigned.Add((rule with { Rule = rule.Rule with { Role = RouteRole.Direct } }, null));
+                    break;
+                case not null:
+                    assigned.Add((rule, winner.Target));
+                    break;
+            }
+        }
+
+        return assigned;
+    }
+
     /// <summary>
     /// The share of the only tunnel on a machine: a rule addressed to another configuration takes its fallback, and
     /// one whose both ends name other configurations leaves the tunnel.

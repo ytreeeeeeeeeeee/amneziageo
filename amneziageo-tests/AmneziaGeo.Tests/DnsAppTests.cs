@@ -103,7 +103,7 @@ public sealed class DnsAppTests
         var tracker = new AppDnsTracker(new AppMatcher([rule], NullLogger<AppMatcher>.Instance), NullLogger<AppDnsTracker>.Instance);
         var proxy = new DnsProxy([], [], Nowhere, Nowhere, null, [], true, [], [], null, NullLogger<DnsProxy>.Instance, stripV6: false, appDns: tracker, listen: false, dnsTransport: DnsTransports.Plain);
         var lent = new Lent();
-        proxy.SetLentNames(name => name.EndsWith("lent.example", StringComparison.Ordinal) ? "second" : null, lent.CarryAsync);
+        proxy.SetLentNames((name, local) => local is null && name.EndsWith("lent.example", StringComparison.Ordinal) ? "second" : null, lent.CarryAsync);
         return (proxy, tracker, lent);
     }
 

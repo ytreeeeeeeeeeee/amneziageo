@@ -225,7 +225,8 @@ internal sealed class TunnelRunner(
 
         WsTunnelTransport? wsTransport = null;
 
-        var geo = await store.GetActiveTunnelGeoAsync(name);
+        var projection = await store.GetTunnelRoutingProjectionAsync(name).ConfigureAwait(false);
+        var geo = projection?.Geo(name) ?? await store.GetActiveTunnelGeoAsync(name).ConfigureAwait(false);
         // The ranges of this tunnel's share, cut around the networks this machine stands in.
         var aroundLocal = PrivateNetworks.AroundLocal(geo?.Routes ?? [], routes.LocalSubnets());
         var carriedRoutes = aroundLocal.Carried;
@@ -245,28 +246,32 @@ internal sealed class TunnelRunner(
 
         // Routing list owns DNS/exclusions/AllUdp/IPv6/global-proxy when assigned; else per-config defaults.
         // Loaded early because the IPv6 opt-in below gates the v6-strip, and the global-proxy flag decides split.
-        var activeRoutingListId = await store.GetActiveRoutingListIdAsync(name);
-        var routingSettings = activeRoutingListId is long activeListId
-            ? await store.GetRoutingSettingsAsync(activeListId)
-            : null;
-        // The assigned list's Direct/Block buckets (its Proxy bucket already rode the projection into geo).
-        var activeList = activeRoutingListId is long bucketListId
-            ? await store.GetRoutingListAsync(bucketListId)
-            : null;
+        var activeRoutingListId = projection is null ? await store.GetActiveRoutingListIdAsync(name).ConfigureAwait(false)
+            : projection.ListIds.Count == 1 ? projection.ListIds[0] : null;
+        var routingSettings = projection is not null ? projection.Settings
+            : activeRoutingListId is long id ? await store.GetRoutingSettingsAsync(id).ConfigureAwait(false) : null;
+        var activeList = projection is not null ? projection.ListIds.Count > 0 ? projection.List : null
+            : activeRoutingListId is long bucketId ? await store.GetRoutingListAsync(bucketId).ConfigureAwait(false) : null;
 
         // A program the list names stands for what this machine found for it last; the search runs again behind the
         // connect, and what it finds is put in force on the tunnel standing.
         var namesApps = activeList is not null && AppFinds.NamesOf(activeList.Rules).Count > 0;
-        if (activeList is not null)
+        if (projection is null && activeList is not null)
         {
             activeList = await AppFinds.ExpandListAsync(store, activeList);
         }
 
         // Global proxy on = full tunnel minus the Direct bucket; off = split (tunnel only the Proxy bucket). A
         // routing list's flag wins over the config's own split; without a list the config's split stands.
-        var geoSplit = activeList is not null
+        var geoSplit = projection?.Split ?? (activeList is not null
             ? !(routingSettings?.UseGlobalProxy ?? false)
-            : (geo?.GeoSplit ?? false);
+            : geo?.GeoSplit ?? false);
+
+        if (projection is not null)
+        {
+            logger.LogDebug("{Name}: restored routing projection {Version}; remembered routes must match this version",
+                name, projection.Stamp[..12]);
+        }
 
         logger.LogDebug("{Name}: rules loaded - {Routes} address range(s), {Domains} domain(s), {Apps} app(s); only what they name goes through the tunnel: {Split} [{Elapsed} ms in]",
             name, geoRoutes.Count, domains.Count, apps.Count, geoSplit, connectSw.ElapsedMilliseconds);
@@ -300,17 +305,26 @@ internal sealed class TunnelRunner(
 
         // Domain tracking in split mode, and on a tunnel of the set that carries only what names it: there the
         // full tunnel belongs to another one, and a name its own rule matched reaches it by route alone.
-        var trackDomains = domains.Count > 0 && (geoSplit || !duties.CarriesDefault);
+        var trackDomains = domains.Count > 0 && (projection is not null || geoSplit || !duties.CarriesDefault);
 
-        // App tracking only in split mode.
-        var trackApps = geoSplit && (apps.Count > 0 || namesApps);
+        // A Fleet member without the default route can still carry an app explicitly assigned to it.
+        var proxyApps = geoSplit || !duties.CarriesDefault;
+        var trackApps = proxyApps && (apps.Count > 0 || namesApps);
 
         // The applications the list keeps direct leave past the tunnel that carries the machine.
-        IReadOnlyList<string> passApps = !geoSplit && duties.CarriesDefault ? activeList?.DirectApps ?? [] : [];
+        IReadOnlyList<string> passApps = projection is null && !geoSplit && duties.CarriesDefault ? activeList?.DirectApps ?? [] : [];
         var passNames = !geoSplit && duties.CarriesDefault && namesApps;
-        _appRole = geoSplit ? RouteRole.Proxy : duties.CarriesDefault ? RouteRole.Direct : (RouteRole?)null;
+        var blockImages = duties.CarriesDefault ? BlockedImages(projection?.BlockApps ?? []) : [];
+        _appRole = proxyApps ? RouteRole.Proxy : RouteRole.Direct;
 
         var appSettings = await settings.LoadAsync();
+        if (projection is { ListIds.Count: > 0 })
+        {
+            RoutingProjection.ValidateDirectApps(name, projection.List, !geoSplit,
+                TakesAllUdp(geoSplit, duties.CarriesDefault, routingSettings?.AllUdp, appSettings.TunnelAllUdp), logger);
+        }
+
+        using var ipv6Blocks = firewall.InstallIpv6PolicyBlocks(blockRoutes);
 
         // Tunnel resolver = what the config picks for the names through the tunnel, else what its server picked, else
         // the config DNS, reached through the tunnel; add its /32 to routes. The network of the machine answers them
@@ -409,7 +423,8 @@ internal sealed class TunnelRunner(
         var ownNetworks = geoSplit ? PrivateNetworks.ForTunnel(config, routes.LocalSubnets()) : [];
         // The ranges the list keeps on the adapter beside the infrastructure.
         var listRules = activeList?.Rules ?? geo?.Rules ?? [];
-        var standing = StandingRanges.Of(carriedRoutes, listRules, geoSplit, inboundRoutes.Count > 0, ownNetworks, resolverRoutes);
+        var standing = StandingRanges.Of(carriedRoutes, listRules, geoSplit, inboundRoutes.Count > 0, ownNetworks, resolverRoutes,
+            projection is null ? null : RangeClaims.Intersect(projection.NamedProxyRoutes, carriedRoutes), projection?.NamedOffTunnelRoutes);
         var inboundReturn = standing.Return;
         foreach (var route in inboundReturn)
         {
@@ -450,7 +465,7 @@ internal sealed class TunnelRunner(
         // A direct or block rule holds a network of the configuration off the tunnel on purpose: say so, or the
         // network going quiet by IP looks like a fault of the tunnel.
         var heldOff = ownNetworks.Where(network => PrivateNetworks.Overlaps(network,
-            [.. GeoMaterializer.NamedRanges(listRules, RouteRole.Direct), .. GeoMaterializer.NamedRanges(listRules, RouteRole.Block)])).ToList();
+            projection?.NamedOffTunnelRoutes ?? [.. GeoMaterializer.NamedRanges(listRules, RouteRole.Direct), .. GeoMaterializer.NamedRanges(listRules, RouteRole.Block)])).ToList();
         if (heldOff.Count > 0)
         {
             logger.LogInformation("{Name}: {Ranges} stay off the tunnel: a direct or block rule of the list names them, so they keep the physical path", name, string.Join(", ", heldOff));
@@ -511,7 +526,8 @@ internal sealed class TunnelRunner(
         string? storedExclusions;
         if (routingSettings is not null)
         {
-            storedExclusions = routingSettings.Exclusions;
+            // Versioned list exclusions are already settled in the Direct bucket.
+            storedExclusions = projection is null ? routingSettings.Exclusions : string.Empty;
         }
         else
         {
@@ -667,7 +683,7 @@ internal sealed class TunnelRunner(
         // What the rules and the connection itself send through the tunnel stays open to the programs the list
         // keeps direct.
         _throughPinned = [.. pinnedRoutes];
-        _throughTunnel = [.. proxyRanges, .. _throughPinned];
+        _throughTunnel = projection is null ? [.. proxyRanges, .. _throughPinned] : _throughPinned;
         // The server and the own network's resolvers keep the routes set up for them.
         var bypassed = new List<string>(lanResolverRoutes);
         if (underlayProbe is { AddressFamily: AddressFamily.InterNetwork } serverAddress)
@@ -685,7 +701,7 @@ internal sealed class TunnelRunner(
         routing.Stand(aroundLocal.Kept);
         // What the previous session used most is taken back from the store: the verdicts an address settled are
         // taken again under the list in force now, and each takes its path with the connection.
-        routing.SetMemory(new StoredRouteMemory(store, name, geoSplit ? apps : passApps, domains, directDomains, blockDomains));
+        routing.SetMemory(new StoredRouteMemory(store, name, proxyApps ? apps : passApps, domains, directDomains, blockDomains, projection?.Stamp));
         // The tunnel that holds the leak protection routes a dropped datagram to an address no list names into itself.
         var flows = default(NetworkFlowTracker);
         if (allUdp && killSwitch)
@@ -699,7 +715,7 @@ internal sealed class TunnelRunner(
             WgConfigEditor.GetAllowedIps(config));
         // The agent answers the UI from its own process, where these caches do not exist, and a rule change is
         // announced the same way instead of being polled for.
-        _ = Task.Run(() => RuntimeSnapshotPipe.ServeAsync(name, (op, ct) => ServeAsync(op, routing, name, ct), logger, sessionCts.Token));
+        _ = Task.Run(() => RuntimeSnapshotPipe.ServeAsync(name, (op, ct) => ServeAsync(op, routing, name, projection is not null, ct), logger, sessionCts.Token));
         _ = Task.Run(() => routing.RunAsync(sessionCts.Token));
         _ = Task.Run(() => routing.PumpAsync(sessionCts.Token));
         var ranges = routing.RangeCounts;
@@ -708,7 +724,7 @@ internal sealed class TunnelRunner(
 
         // Tracker when there's live work or a routing list drives the split.
         DomainTracker? tracker = null;
-        if (trackDomains || trackApps || allUdp || (geoSplit && activeRoutingListId is not null))
+        if (trackDomains || trackApps || allUdp || (geoSplit && activeList is not null))
         {
             var peer = WgConfigEditor.GetPeerPublicKey(config);
             if (peer is not null)
@@ -719,7 +735,7 @@ internal sealed class TunnelRunner(
                 // destination by the cache.
                 var trackerStatic = geoSplit ? startupRoutes : geoRoutes;
                 var trackerList = geoSplit ? standing.All.ToList() : listRoutes;
-                tracker = new DomainTracker(store, routes, uapi, loggerFactory.CreateLogger<DomainTracker>(), name, peer, trackerStatic, trackerList, appSettings.RouteTtlSeconds, stripV6, routing, synReset);
+                tracker = new DomainTracker(store, routes, uapi, loggerFactory.CreateLogger<DomainTracker>(), name, peer, trackerStatic, trackerList, appSettings.RouteTtlSeconds, stripV6, routing, synReset, projection?.Stamp);
                 session.SetTracker(tracker);
                 routing.SetAdoptionCheck(tracker.Holds);
             }
@@ -735,7 +751,8 @@ internal sealed class TunnelRunner(
             // The image of every program is held from its start, so one that ends before its traffic is decided is
             // matched by the rules all the same.
             _processImages = new ProcessImages();
-            var candidate = new AppMatcher(apps, loggerFactory.CreateLogger<AppMatcher>(), _processImages);
+            IReadOnlyList<string> excludedApps = [.. activeList?.DirectApps ?? [], .. projection?.BlockApps ?? []];
+            var candidate = new AppMatcher(apps, loggerFactory.CreateLogger<AppMatcher>(), _processImages, excluded: excludedApps);
             if (candidate.HasMatchers || namesApps)
             {
                 matcher = candidate;
@@ -754,7 +771,7 @@ internal sealed class TunnelRunner(
                 _processImages = null;
             }
         }
-        else if (passApps.Count > 0 || passNames)
+        else if (projection is null && (passApps.Count > 0 || passNames))
         {
             _processImages = new ProcessImages();
             var candidate = new AppMatcher(passApps, loggerFactory.CreateLogger<AppMatcher>(), _processImages, past: true);
@@ -792,6 +809,7 @@ internal sealed class TunnelRunner(
                 keptOut.Add(underlay + "/32");
             }
 
+            var appNames = projection is null ? null : NameRules.Of(projection.List);
             _appGateway = AppGateway.TryStart(
                 TunnelDevice.NameOf(name),
                 apps,
@@ -801,7 +819,9 @@ internal sealed class TunnelRunner(
                 GeoIpRanges.Build(blockRoutes),
                 keptOut,
                 effectiveMtu,
-                loggerFactory.CreateLogger<AppGateway>());
+                loggerFactory.CreateLogger<AppGateway>(),
+                appNames is null ? null : appNames.Verdict,
+                appNames is null ? null : routing.NameVerdict);
             if (_appGateway is not null && WgConfigEditor.GetPeerPublicKey(config) is { } carrier)
             {
                 // A session taken onto the adapter leaves through the tunnel without the cache having decided its
@@ -837,7 +857,7 @@ internal sealed class TunnelRunner(
         // moment one of them reappears the rest go with it.
         if (matcher is not null && tracker is not null)
         {
-            var appMemory = new AppDestinationMemory(store, tracker, name, apps, loggerFactory.CreateLogger<AppDestinationMemory>());
+            var appMemory = new AppDestinationMemory(store, tracker, name, apps, loggerFactory.CreateLogger<AppDestinationMemory>(), projection?.Stamp);
             routing.AppDestination += appMemory.Note;
             tracker.SetAppDestinationSink(appMemory.Note);
             tracker.SetAppMemoryCheck(appMemory.Holds);
@@ -851,7 +871,25 @@ internal sealed class TunnelRunner(
         // The names the network of the machine answers leave by the routing table, over plain DNS, and follow it when
         // the machine moves to another network.
         var networkAnswers = vpnDns.Network;
-        var proxy = StartProxy(trackDomains ? domains : [], blockDomains, stripV6, geoSplit, tunnelResolver, localResolver, lanResolvers, exclusionDomains, directDomains, tracker, appDns, passDns, routing, duties.HoldsResolver, networkAnswers ? () => null : TunnelInterface, networkAnswers ? AmneziaGeo.Ipc.DnsTransports.Plain : appSettings.DnsTransport, appSettings.RouteTtlSeconds, networkAnswers);
+        var proxy = StartProxy(trackDomains ? domains : [], blockDomains, stripV6, geoSplit, tunnelResolver, localResolver, lanResolvers, exclusionDomains, directDomains, tracker, appDns, passDns, routing, duties.HoldsResolver, networkAnswers ? () => null : TunnelInterface, networkAnswers ? AmneziaGeo.Ipc.DnsTransports.Plain : appSettings.DnsTransport, appSettings.RouteTtlSeconds, networkAnswers,
+            projection is null ? null : (address, verdict) =>
+            {
+                if (blockImages.Count > 0)
+                {
+                    firewall.SetPolicyNameVerdict(address, verdict, blockImages.Count > 0, routing.TtlSeconds);
+                }
+            });
+        if (projection is not null && blockImages.Count > 0)
+        {
+            _ = Task.Run(async () =>
+            {
+                using var ticks = new PeriodicTimer(TimeSpan.FromSeconds(5));
+                while (await ticks.WaitForNextTickAsync(sessionCts.Token).ConfigureAwait(false))
+                {
+                    firewall.RefreshPolicyNamePermits();
+                }
+            }, sessionCts.Token);
+        }
         session.SetProxy(proxy);
 
         // The names kept on the own network with these suffixes.
@@ -1075,7 +1113,7 @@ internal sealed class TunnelRunner(
 
         // Whitelist wstunnel under the kill-switch.
         var underlayAppPath = useWebSocket ? TunnelPaths.WsTunnelExe() : null;
-        _ = Task.Run(() => ArmFirewallAsync(name, killSwitch, !stripV6, underlayAppPath, bypassCidrs, peers, endpoint, routing, transport?.AllowInbound != true, signal, otherVpns, sessionCts.Token));
+        _ = Task.Run(() => ArmFirewallAsync(name, killSwitch, !stripV6, underlayAppPath, bypassCidrs, peers, endpoint, routing, transport?.AllowInbound != true, signal, otherVpns, blockImages, sessionCts.Cancel, sessionCts.Token));
 
         // Re-flush after the adapter appears to drop bring-up-window poison.
         if (applied)
@@ -1291,7 +1329,7 @@ internal sealed class TunnelRunner(
         }
     }
 
-    private DnsProxy? StartProxy(IReadOnlyList<GeoDomain> domains, IReadOnlyList<GeoDomain> blockDomains, bool stripV6, bool localIsLan, IReadOnlyList<string> tunnelUpstream, IReadOnlyList<string> localUpstream, IReadOnlyList<string> lanUpstream, IReadOnlyList<string> localDomains, IReadOnlyList<GeoDomain> directDomains, DomainTracker? tracker, AppDnsTracker? appDns, AppDnsTracker? passDns, RoutingCache? routing, bool listen, Func<uint?> tunnelInterface, string dnsTransport, int routeTtlSeconds, bool networkAnswers = false)
+    private DnsProxy? StartProxy(IReadOnlyList<GeoDomain> domains, IReadOnlyList<GeoDomain> blockDomains, bool stripV6, bool localIsLan, IReadOnlyList<string> tunnelUpstream, IReadOnlyList<string> localUpstream, IReadOnlyList<string> lanUpstream, IReadOnlyList<string> localDomains, IReadOnlyList<GeoDomain> directDomains, DomainTracker? tracker, AppDnsTracker? appDns, AppDnsTracker? passDns, RoutingCache? routing, bool listen, Func<uint?> tunnelInterface, string dnsTransport, int routeTtlSeconds, bool networkAnswers = false, Action<IPAddress, RouteVerdict>? resolvedRoute = null)
     {
         var tunnelIp = ParseFirst(tunnelUpstream, IPAddress.Parse("1.1.1.1"));
         var tunnelSecondary = tunnelUpstream.Count > 1 && IPAddress.TryParse(tunnelUpstream[1], out var ts) ? ts : null;
@@ -1299,6 +1337,11 @@ internal sealed class TunnelRunner(
         var (lanIp, lanPool) = LanResolvers(lanUpstream);
         var proxy = new DnsProxy(domains, blockDomains, tunnelIp, localIp, lanIp, lanPool, localIsLan, localDomains, directDomains, tracker, loggerFactory.CreateLogger<DnsProxy>(), stripV6, tunnelSecondary, appDns, routing, listen, tunnelInterface, dnsTransport, passDns, networkAnswers);
         proxy.SetRouteTtl(routeTtlSeconds);
+        if (resolvedRoute is not null)
+        {
+            proxy.UseRoutingProjection(resolvedRoute);
+        }
+
         if (!listen)
         {
             // It answers the holder of the machine's lookups over the pipe, so it serves no socket of its own.
@@ -2026,11 +2069,16 @@ internal sealed class TunnelRunner(
     // only runs in split mode, while the cache owns the Direct and Block buckets in both. The current generation
     // is seeded first so the freshly built rule set is not dropped and reinstalled on the first tick.
     // Answers the agent: the cache snapshot it renders, or a rule change it just persisted.
-    private async Task<string> ServeAsync(string op, RoutingCache routing, string tunnelName, CancellationToken ct)
+    private async Task<string> ServeAsync(string op, RoutingCache routing, string tunnelName, bool versioned, CancellationToken ct)
     {
         if (op == RuntimeSnapshotPipe.OpRules)
         {
-            await ApplyRulesAsync(routing, tunnelName, ct);
+            if (versioned)
+            {
+                return "-";
+            }
+
+            await ApplyRulesAsync(routing, tunnelName, ct).ConfigureAwait(false);
             return "ok";
         }
 
@@ -2230,6 +2278,31 @@ internal sealed class TunnelRunner(
         }
     }
 
+    private IReadOnlyList<string> BlockedImages(IReadOnlyList<string> tokens)
+    {
+        if (tokens.Count == 0)
+        {
+            return [];
+        }
+
+        var log = loggerFactory.CreateLogger<AppMatcher>();
+        var matcher = new AppMatcher(tokens, log);
+        var images = matcher.Images(OffTunnelImages + 1);
+        var families = tokens
+            .Select(token => AmneziaGeo.Ipc.AppPathToken.PackageFamilyFromPath(token))
+            .Concat(tokens.Where(token => token.StartsWith("pkg=", StringComparison.OrdinalIgnoreCase)).Select(token => token[4..]))
+            .OfType<string>().ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var packages = families.Count == 0 ? [] : InstalledPackages.Snapshot(AppRuleAudit.Publishers(tokens), log)
+            .Where(package => families.Contains(package.Family)).SelectMany(package => package.Executables);
+        var blocked = images.Concat(packages).Distinct(StringComparer.OrdinalIgnoreCase).Take(OffTunnelImages + 1).ToArray();
+        if (blocked.Length > OffTunnelImages)
+        {
+            throw new NotSupportedException("The selected routing policy exceeds the Windows application block limit.");
+        }
+
+        return blocked;
+    }
+
     // How many programs a list keeps direct are refused the tunnel adapter at most, and how many ranges stay open
     // to them.
     private const int OffTunnelImages = 256;
@@ -2239,7 +2312,8 @@ internal sealed class TunnelRunner(
     // itself sends through the tunnel.
     private void KeepOffTunnel(string tunnelName)
     {
-        if (_appRole != RouteRole.Direct || _appMatcher is not { } matcher)
+        var matcher = _appRole == RouteRole.Direct ? _appMatcher : null;
+        if (matcher is null)
         {
             return;
         }
@@ -2402,7 +2476,7 @@ internal sealed class TunnelRunner(
         }
     }
 
-    private async Task ArmFirewallAsync(string name, bool killSwitch, bool dualStack, string? underlayAppPath, IReadOnlyList<string> extraLanCidrs, IReadOnlyList<string> peers, IPAddress? endpoint, RoutingCache? routing, bool blockInbound, SignalPlace? signal, OtherVpnKeeper? otherVpns, CancellationToken ct)
+    private async Task ArmFirewallAsync(string name, bool killSwitch, bool dualStack, string? underlayAppPath, IReadOnlyList<string> extraLanCidrs, IReadOnlyList<string> peers, IPAddress? endpoint, RoutingCache? routing, bool blockInbound, SignalPlace? signal, OtherVpnKeeper? otherVpns, IReadOnlyList<string> blockedApps, Action failPolicy, CancellationToken ct)
     {
         try
         {
@@ -2410,6 +2484,11 @@ internal sealed class TunnelRunner(
             if (index is null)
             {
                 logger.LogWarning("{Name}: the tunnel adapter never appeared, so the leak protection could not be set up; if the tunnel does come up, traffic may leave past it", name);
+                if (blockedApps.Count > 0)
+                {
+                    failPolicy();
+                }
+
                 return;
             }
 
@@ -2453,6 +2532,14 @@ internal sealed class TunnelRunner(
                 // Arming rebuilds the filter set, so host permits from the previous generation are gone with it.
                 routing?.Reinstall();
                 KeepOffTunnel(name);
+                if (blockedApps.Count > 0 && !firewall.BlockPolicyApplications(blockedApps))
+                {
+                    logger.LogError("{Name}: the application block filters could not be installed", name);
+                    failPolicy();
+                    return;
+                }
+
+                firewall.RefreshPolicyNamePermits();
                 otherVpns?.Square();
 
                 // A destination dropped before its verdict exists is announced by the drop itself; nothing else
@@ -2464,7 +2551,11 @@ internal sealed class TunnelRunner(
             }
             else
             {
-                logger.LogError("{Name}: the leak protection did not take after {Attempts} attempts; the tunnel is running unprotected, so if it drops, traffic goes out in the clear - reconnect to restore it", name, attempts);
+                logger.LogError("{Name}: the leak protection did not take after {Attempts} attempts", name, attempts);
+                if (blockedApps.Count > 0)
+                {
+                    failPolicy();
+                }
             }
         }
         catch (OperationCanceledException)

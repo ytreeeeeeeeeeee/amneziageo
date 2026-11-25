@@ -42,7 +42,7 @@ internal sealed class DiagnosticsCollector(IStateStore store, SettingsStore sett
     {
         return config.Length == 0
             ? "no configuration is selected"
-            : await inspector.RenderAsync(store, config, control.Running, ct);
+            : await inspector.RenderAsync(store, config, control.Connected, ct);
     }
 
     // The rows this process keeps and the ones the process of the running tunnel keeps, by time.

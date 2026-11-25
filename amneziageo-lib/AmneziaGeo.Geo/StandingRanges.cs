@@ -23,7 +23,8 @@ public sealed record StandingRanges(IReadOnlyList<string> Return, IReadOnlyList<
     /// stays off the tunnel; one a proxy rule names stands with it while the tunnel carries the rule, and on its
     /// own when the tunnel does not, so the networks of the configuration keep a route of their own.
     /// </summary>
-    public static StandingRanges Of(IReadOnlyList<string> carried, IReadOnlyList<GeoRule> rules, bool split, bool inbound, IReadOnlyList<string> ownNetworks, IReadOnlyCollection<string> infrastructure)
+    public static StandingRanges Of(IReadOnlyList<string> carried, IReadOnlyList<GeoRule> rules, bool split, bool inbound, IReadOnlyList<string> ownNetworks, IReadOnlyCollection<string> infrastructure,
+        IReadOnlyList<string>? namedProxy = null, IReadOnlyList<string>? namedOffTunnel = null)
     {
         var taken = new HashSet<string>(infrastructure, StringComparer.Ordinal);
         var returned = inbound ? Take(carried.Where(PrivateNetworks.IsNetwork), taken) : [];
@@ -32,8 +33,9 @@ public sealed record StandingRanges(IReadOnlyList<string> Return, IReadOnlyList<
             return new StandingRanges(returned, [], []);
         }
 
-        var named = Take(GeoMaterializer.NamedRanges(rules, RouteRole.Proxy, carried), taken);
-        IReadOnlyList<string> keptOff = [.. GeoMaterializer.NamedRanges(rules, RouteRole.Direct), .. GeoMaterializer.NamedRanges(rules, RouteRole.Block)];
+        var named = Take(namedProxy ?? GeoMaterializer.NamedRanges(rules, RouteRole.Proxy, carried), taken);
+        IReadOnlyList<string> keptOff = namedOffTunnel ??
+            [.. GeoMaterializer.NamedRanges(rules, RouteRole.Direct), .. GeoMaterializer.NamedRanges(rules, RouteRole.Block)];
         var networks = Take(ownNetworks.Where(network =>
             !PrivateNetworks.Overlaps(network, keptOff)
             && !PrivateNetworks.Overlaps(network, named)), taken);

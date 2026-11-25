@@ -48,7 +48,6 @@ internal sealed class DnsProxy
     // Negative cache: how long a name proven to match NO geo rule is remembered as "bypass" so the matcher
     // isn't re-run on every query. Bounded, and cleared wholesale on a matcher rebuild (list edit), so a
     // domain newly added to a list is re-evaluated promptly.
-    private const int BypassTtlSeconds = 600;
     // How long before a query an ask of its name still counts as the ask behind it, and how long an answer waits
     // for the report of its asker.
     private const int PassWindowMs = 100;
@@ -83,6 +82,8 @@ internal sealed class DnsProxy
 
     private readonly List<UdpClient> _servers = [];
     private readonly ConcurrentDictionary<string, CacheEntry> _cache = new(StringComparer.Ordinal);
+    private DnsRouteNames? _routeNames;
+    private Action<IPAddress, RouteVerdict>? _resolvedRoute;
     // Longest an answer is kept, here or by the client: the lifetime of the routes it puts in place.
     private volatile int _routeTtlSeconds = int.MaxValue;
     // Coalesces concurrent identical (name,type) misses onto a single upstream query.
@@ -91,21 +92,19 @@ internal sealed class DnsProxy
     private readonly ConcurrentDictionary<string, long> _lastRevalidate = new(StringComparer.Ordinal);
     // Names proven to match no geo rule -> resolved locally and never tunneled/re-resolved. Value is the
     // Environment.TickCount64 expiry. Short-circuits the matcher on repeat queries; cleared on matcher rebuild.
-    private readonly ConcurrentDictionary<string, long> _bypass = new(StringComparer.Ordinal);
     // Bounds concurrent background revalidations so a burst of first-served domains cannot park many pool
     // threads (each Forward blocks up to UpstreamTimeoutMs) and starve the Handle path.
     private readonly SemaphoreSlim _revalidateSlots = new(4, 4);
     // Hard caps so a long session cannot grow these per-domain sets unboundedly; overflow clears wholesale (a
     // miss just re-forwards or re-runs the matcher). Otherwise cleared only on matcher rebuild / reconnect.
     private const int MaxCacheEntries = 8192;
-    private const int MaxBypassEntries = 8192;
     // Volatile: read on the hot query path, replaced on the poll thread; the matcher is immutable.
     private volatile IReadOnlyList<GeoDomain> _domains;
     // One decision over the three buckets: the narrowest rule that holds a name.
     private volatile NameRules _names;
     // Names another tunnel of the set carries: which one owns a name, and how it is asked to carry it. Both
     // stay empty on a machine that keeps one tunnel.
-    private volatile Func<string, string?>? _lentOwner;
+    private volatile Func<string, NameMatch?, string?>? _lentOwner;
     private volatile Func<string, string, Task<IReadOnlyList<string>>>? _lentCarry;
     // Block bucket: names refused with NXDOMAIN before any tunnel/bypass decision; never tunneled or resolved.
     private volatile IReadOnlyList<GeoDomain> _blockDomains;
@@ -295,12 +294,29 @@ internal sealed class DnsProxy
     public void ClearCache()
     {
         _cache.Clear();
-        _bypass.Clear();
     }
 
     /// <summary>
     /// Sets the lifetime of the routes an answer puts in place and drops the cached answers.
     /// </summary>
+    internal void UseRoutingProjection(Action<IPAddress, RouteVerdict> resolvedRoute)
+    {
+        _routeNames = new DnsRouteNames();
+        _resolvedRoute = resolvedRoute;
+    }
+
+    private void ApplyNameEvidence(string name, IPAddress address, RouteVerdict verdict, bool tunnelApp)
+    {
+        var evidence = _routeNames!.Observe(address, name, verdict, Environment.TickCount64, _routeTtlSeconds);
+        if (tunnelApp && GeoIpRanges.TryToNumeric(address, out var numeric))
+        {
+            _routing?.Note(numeric, true);
+        }
+
+        _routing?.NoteDns(address, evidence);
+        _resolvedRoute?.Invoke(address, RouteDecision.Infer(evidence, out _));
+    }
+
     public void SetRouteTtl(int seconds)
     {
         _routeTtlSeconds = Math.Max(seconds, 0);
@@ -399,10 +415,10 @@ internal sealed class DnsProxy
     /// Points the names another tunnel of the set carries at it: the first delegate names that tunnel, the
     /// second has it look the name up and put the addresses on its own path.
     /// </summary>
-    public void SetLentNames(Func<string, string?> owner, Func<string, string, Task<IReadOnlyList<string>>> carry)
+    public void SetLentNames(Func<string, NameMatch?, string?> owner, Func<string, string, Task<IReadOnlyList<string>>> carry)
     {
-        _lentOwner = owner;
         _lentCarry = carry;
+        _lentOwner = owner;
         ClearCache();
     }
 
@@ -422,7 +438,7 @@ internal sealed class DnsProxy
         await CollectAddressesAsync(name, TypeA, ips).ConfigureAwait(false);
         if (ips.Count == 0)
         {
-            _logger.LogWarning("{Name}: the resolver in this tunnel did not answer, so what a rule sent here leaves directly until the next query", name);
+            _logger.LogWarning("{Name}: the resolver in this tunnel did not answer the Fleet DNS request", name);
             return [];
         }
 
@@ -433,7 +449,7 @@ internal sealed class DnsProxy
     }
 
     /// <summary>
-    /// Drops any cached local answer and negative-cache entry for a name, so a name just marked app-tunneled is
+    /// Drops any cached local answer for a name, so a name just marked app-tunneled is
     /// re-resolved through the tunnel on its next query instead of serving a pre-mark local (poisoned) result.
     /// </summary>
     public void InvalidateName(string name)
@@ -442,36 +458,6 @@ internal sealed class DnsProxy
         _cache.TryRemove(CacheKey(key, TypeA), out _);
         _cache.TryRemove(CacheKey(key, TypeAaaa), out _);
         _cache.TryRemove(CacheKey(key, TypeHttps), out _);
-        _bypass.TryRemove(key, out _);
-    }
-
-    // Whether a name is currently negative-cached as matching no geo rule.
-    private bool IsBypassed(string name)
-    {
-        var key = name.TrimEnd('.').ToLowerInvariant();
-        if (_bypass.TryGetValue(key, out var expiry))
-        {
-            if (expiry > Environment.TickCount64)
-            {
-                return true;
-            }
-
-            _bypass.TryRemove(new KeyValuePair<string, long>(key, expiry));
-        }
-
-        return false;
-    }
-
-    // Records a name as matching no geo rule, so the matcher is skipped until the entry expires or the lists change.
-    private void MarkBypassed(string name)
-    {
-        var key = name.TrimEnd('.').ToLowerInvariant();
-        if (_bypass.Count >= MaxBypassEntries)
-        {
-            _bypass.Clear();
-        }
-
-        _bypass[key] = Environment.TickCount64 + (BypassTtlSeconds * 1000L);
     }
 
     /// <summary>
@@ -483,7 +469,7 @@ internal sealed class DnsProxy
         lock (_localGate)
         {
             var locals = WithDirect(_staticLocalDomains, directDomains);
-            if (_blockDomains.SequenceEqual(blockDomains) && _localDomains.SequenceEqual(locals, StringComparer.Ordinal))
+            if (_blockDomains.SequenceEqual(blockDomains) && _directDomains.SequenceEqual(directDomains))
             {
                 return false;
             }
@@ -493,10 +479,9 @@ internal sealed class DnsProxy
             _names = new NameRules(_domains, directDomains, blockDomains);
             _localDomains = locals;
 
-            // Drop cached answers and the negative cache: a name refused or kept local now may hold a verdict from
+            // Drop cached answers: a name refused or kept local now may hold a verdict from
             // before the edit.
             _cache.Clear();
-            _bypass.Clear();
 
             _logger.LogInformation("direct and blocked names reloaded without reconnecting: {Local} local suffix(es), {Block} blocked rule(s) now in effect", locals.Count, blockDomains.Count);
         }
@@ -540,7 +525,6 @@ internal sealed class DnsProxy
 
             // Drops the answers taken under the resolvers and suffixes of before.
             _cache.Clear();
-            _bypass.Clear();
         }
 
         return true;
@@ -575,9 +559,16 @@ internal sealed class DnsProxy
     }
 
     /// <summary>
-    /// What the name rules settle for a name: the narrowest rule that holds it.
+    /// The winning local name verdict, or None when the lookup belongs to a peer.
     /// </summary>
-    public RouteVerdict NameVerdict(string name) => _names.Verdict(name);
+    public RouteVerdict NameVerdict(string name) => ResolveName(name).Local?.Verdict ?? RouteVerdict.None;
+
+    private (NameMatch? Local, string? Peer) ResolveName(string name)
+    {
+        var local = _names.Match(name);
+        var peer = _lentOwner?.Invoke(name, local);
+        return peer is null ? (local, null) : (null, peer);
+    }
 
     /// <summary>
     /// The verdict a name hands the addresses it answers with; a name of the own network keeps them on that network.
@@ -675,7 +666,31 @@ internal sealed class DnsProxy
             return RouteVerdict.None;
         }
 
-        var verdict = NameVerdict(key);
+        var (rule, peer) = ResolveName(key);
+        var verdict = rule?.Verdict ?? RouteVerdict.None;
+        var path = PathOf(key, verdict);
+        if (peer is not null && path != NamePath.Lan)
+        {
+            return RouteVerdict.None;
+        }
+
+        if (_routeNames is not null)
+        {
+            var byName = AnswerVerdict(verdict, path == NamePath.Lan);
+            var canUseApp = byName == RouteVerdict.None && path == NamePath.Open;
+            var tunnelApp = canUseApp && _appDns?.IsTunneled(key) == true;
+            foreach (var address in addresses.Where(address => _substituted?.Contains(address) != true && !foreign(address)))
+            {
+                ApplyNameEvidence(key, address, byName, tunnelApp);
+                if (address.AddressFamily == AddressFamily.InterNetworkV6 && byName == RouteVerdict.Proxy)
+                {
+                    _tracker?.Add(key, [address.ToString()], late: true);
+                }
+            }
+
+            return byName;
+        }
+
         if (verdict is RouteVerdict.Direct or RouteVerdict.Block)
         {
             foreach (var address in addresses)
@@ -687,7 +702,7 @@ internal sealed class DnsProxy
         }
 
         // Names of the own network and names another tunnel of the set carries stay where the system sends them.
-        var open = PathOf(key) == NamePath.Open && _lentOwner?.Invoke(key) is null;
+        var open = path == NamePath.Open;
         var app = open && verdict == RouteVerdict.None && _appDns is not null && _appDns.IsTunneled(key);
         var tunneled = open && (verdict == RouteVerdict.Proxy || app);
         if (tunneled)
@@ -756,14 +771,17 @@ internal sealed class DnsProxy
     /// The path of a lookup ahead of the tunnel rules; a Direct name stays off the tunnel with or without the own
     /// network's resolver.
     /// </summary>
-    internal NamePath PathOf(string name)
+    internal NamePath PathOf(string name) => PathOf(name, NameVerdict(name));
+
+    private NamePath PathOf(string name, RouteVerdict verdict)
     {
-        if (_lanUpstream is not null && IsLocalName(name))
+        var direct = verdict == RouteVerdict.Direct;
+        if (_lanUpstream is not null && IsLocalName(name, direct))
         {
             return NamePath.Lan;
         }
 
-        return _names.Verdict(name) == RouteVerdict.Direct ? NamePath.Direct : NamePath.Open;
+        return direct ? NamePath.Direct : NamePath.Open;
     }
 
     // Suffixes as the local check wants them: trimmed, dotless at the ends, lower case.
@@ -798,7 +816,6 @@ internal sealed class DnsProxy
         // Drop cached answers: a newly matched name may have a pre-match entry from the local resolver.
         _cache.Clear();
         // Drop negative-cache entries: a name previously bypassed may now be in a rule (or vice versa).
-        _bypass.Clear();
 
         _logger.LogInformation("domain rules reloaded without reconnecting: {Count} rule(s) now in effect", domains.Count);
         if (RouteLog.Enabled)
@@ -1018,9 +1035,9 @@ internal sealed class DnsProxy
                 return;
             }
 
-            // Block bucket wins over everything: a matched name is refused (NXDOMAIN) before any tunnel/bypass
-            // decision, so it never resolves and its connection is dropped.
-            if (name is not null && _names.Verdict(name) == RouteVerdict.Block)
+            var (localRule, peer) = name is null ? default : ResolveName(name);
+            var verdict = localRule?.Verdict ?? RouteVerdict.None;
+            if (verdict == RouteVerdict.Block)
             {
                 var blocked = DnsMessage.BuildNxDomain(query);
                 respond(blocked);
@@ -1044,38 +1061,24 @@ internal sealed class DnsProxy
                 return;
             }
 
-            // Local/LAN names resolve via the LAN resolver and stay off the tunnel, and so does a Direct name
-            // whatever proxy rule names it too.
-            var path = name is null ? NamePath.Open : PathOf(name);
+            // Keep local-network lookups and names whose winning rule is Direct off the tunnel.
+            var path = name is null ? NamePath.Open : PathOf(name, verdict);
             var isLocal = path == NamePath.Lan;
             var direct = path == NamePath.Direct;
             var kept = path != NamePath.Open;
-
-            // Negative cache: a name already proven to be in no geo rule bypasses the matcher and the tunnel.
-            var bypassed = name is not null && IsBypassed(name);
 
             // App-tunnel: a name recently queried by a matched app resolves through the tunnel and routes its
             // answer, even with no geo rule. Its decision comes from DNS-Client ETW, not the geo matcher, so it
             // overrides the bypass negative-cache; the ask behind this very query is waited for, so the first
             // answer the app gets already takes the tunnel.
-            var appDns = name is not null && !kept && _appDns is not null && await AskedByAsync(_appDns, name, started).ConfigureAwait(false);
-
-            // Matched names resolve via the clean tunnel resolver; others use the local resolver.
-            var geoMatch = !kept && !bypassed && name is not null && _names.Match(name) is { Verdict: RouteVerdict.Proxy } rule
+            // Local and Fleet domain rules are considered before a program's DNS attribution.
+            var geoMatch = !kept && localRule is { Verdict: RouteVerdict.Proxy } rule
                 ? new DomainMatcher.GeoMatch(rule.Kind, rule.Value)
                 : (DomainMatcher.GeoMatch?)null;
+            var lentTo = kept ? null : peer;
+            var appDns = name is not null && !kept && geoMatch is null && lentTo is null && _appDns is not null
+                && await AskedByAsync(_appDns, name, started).ConfigureAwait(false);
             var matched = geoMatch is not null || appDns;
-
-            // A name no rule here matches may still be named by a rule riding another tunnel of the set. This
-            // machine looks addresses up in one place, so that tunnel never sees the name: it is handed over.
-            var lentTo = !kept && !bypassed && !matched && name is not null ? _lentOwner?.Invoke(name) : null;
-
-            // Remember a non-local miss so the matcher isn't re-run for it until the lists change. An app-tunnel
-            // name is matched, so it is never bypassed.
-            if (name is not null && !kept && !bypassed && !matched && lentTo is null)
-            {
-                MarkBypassed(name);
-            }
 
             // Why this name is treated the way it is, spelled out for the log line below.
             var decision = DecisionLabel(isLocal, direct, appDns, geoMatch);
@@ -1131,11 +1134,15 @@ internal sealed class DnsProxy
                 TriggerReachabilityRefresh(name!, hydrated);
                 outcome = $"restored {hydrated.Count} address(es) saved from an earlier session and put them back in the tunnel";
             }
-            else if (lentTo is not null && type == TypeA
-                     && await AskOwnerAsync(lentTo, name!).ConfigureAwait(false) is { Count: > 0 } lent)
+            else if (lentTo is not null && type == TypeA)
             {
-                // The owner looked it up through its own tunnel and put the addresses there; this side only
-                // answers the client.
+                var lent = await AskOwnerAsync(lentTo, name!).ConfigureAwait(false);
+                if (lent.Count == 0)
+                {
+                    respond(DnsMessage.BuildServFail(query));
+                    return;
+                }
+
                 response = DnsMessage.BuildAAnswer(query, lent, ServeKnownTtlSeconds);
                 StoreInCache(name, type, response);
                 outcome = $"looked up on {lentTo}, the tunnel its rule names, and its {lent.Count} address(es) go through that one";
@@ -1260,20 +1267,24 @@ internal sealed class DnsProxy
 
             // Install Direct host routes before the answer leaves, so the client's first packet already egresses the
             // physical path. Runs for cached answers too: a route reclaimed while idle is restored on the next query.
-            if (_routing is not null)
+            if (_routing is not null && (lentTo is null || (_routeNames is null && _passDns is not null)))
             {
                 try
                 {
                     // A name in the Direct or Block bucket decides for the addresses it answers with, so a range
                     // covering one of them cannot pull it back into the tunnel.
-                    var byName = AnswerVerdict(name is null ? RouteVerdict.None : NameVerdict(name), isLocal);
+                    var byName = AnswerVerdict(verdict, isLocal);
                     var addresses = DnsMessage.Addresses(response);
                     // A program kept off the tunnel asked: its addresses take their route past the tunnel before it
                     // opens them.
                     var passed = byName == RouteVerdict.None && name is not null && addresses.Count > 0 && _passDns is not null && await AskedByAsync(_passDns, name, started).ConfigureAwait(false);
                     foreach (var address in addresses)
                     {
-                        if (byName is RouteVerdict.Direct or RouteVerdict.Block)
+                        if (_routeNames is not null && name is not null)
+                        {
+                            ApplyNameEvidence(name, address, byName, appDns);
+                        }
+                        else if (byName is RouteVerdict.Direct or RouteVerdict.Block)
                         {
                             _routing.Note(address, byName);
                         }
@@ -1281,7 +1292,7 @@ internal sealed class DnsProxy
                         {
                             _routing.Note(numeric, true);
                         }
-                        else
+                        else if (lentTo is null)
                         {
                             _routing.Note(address);
                         }
@@ -1498,7 +1509,7 @@ internal sealed class DnsProxy
     }
 
     // Whether a name resolves via the LAN resolver and stays off the tunnel.
-    private bool IsLocalName(string name)
+    private bool IsLocalName(string name, bool direct)
     {
         var n = name.TrimEnd('.').ToLowerInvariant();
         if (n.Length == 0)
@@ -1517,7 +1528,7 @@ internal sealed class DnsProxy
             return IsPrivateReverseV4(n);
         }
 
-        foreach (var suffix in BuiltinLocalSuffixes.Concat(_localDomains))
+        foreach (var suffix in BuiltinLocalSuffixes.Concat(direct ? _localDomains : _staticLocalDomains))
         {
             if (n == suffix || n.EndsWith("." + suffix, StringComparison.Ordinal))
             {
@@ -1973,7 +1984,10 @@ internal sealed class DnsProxy
         var ips = new List<string>();
         foreach (var ip in DnsMessage.Addresses(response))
         {
-            ips.Add(ip.ToString());
+            if (_routeNames is null || ip.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                ips.Add(ip.ToString());
+            }
         }
 
         // Re-check membership at Add time: the rules may have swapped (a list edit) between the match that routed

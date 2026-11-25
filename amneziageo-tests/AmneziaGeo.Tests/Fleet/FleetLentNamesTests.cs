@@ -16,8 +16,8 @@ public sealed class FleetLentNamesTests
     {
         var owners = new List<FleetLentOwner>
         {
-            new("bravo", new DomainMatcher([new GeoDomain(GeoDomainKind.Domain, "youtube.com")])),
-            new("charlie", new DomainMatcher([new GeoDomain(GeoDomainKind.Full, "rutracker.org")])),
+            new("bravo", new NameRules([new GeoDomain(GeoDomainKind.Domain, "youtube.com")], [], [])),
+            new("charlie", new NameRules([new GeoDomain(GeoDomainKind.Full, "rutracker.org")], [], [])),
         };
 
         Assert.Equal("bravo", FleetLentNames.OwnerOf(owners, "www.youtube.com"));
@@ -27,5 +27,18 @@ public sealed class FleetLentNamesTests
         Assert.Null(FleetLentNames.OwnerOf(owners, "example.com"));
         Assert.Null(FleetLentNames.OwnerOf(owners, "forum.rutracker.org"));
         Assert.Null(FleetLentNames.OwnerOf([], "www.youtube.com"));
+    }
+
+    [Fact]
+    public void NarrowerPeerBeatsABroaderPeerRegardlessOfPeerOrder()
+    {
+        const string name = "download.example.test";
+        var parent = new FleetLentOwner("bravo", new NameRules([new(GeoDomainKind.Domain, "example.test")], [], []));
+        var child = new FleetLentOwner("charlie", new NameRules([new(GeoDomainKind.Domain, name)], [], []));
+
+        Assert.Equal("charlie", FleetLentNames.OwnerOf([parent, child], name));
+        Assert.Equal("charlie", FleetLentNames.OwnerOf([child, parent], name));
+        var localBlock = new NameRules([], [], [new(GeoDomainKind.Domain, name)]);
+        Assert.Null(FleetLentNames.OwnerOf([parent, child], name, localBlock.Match(name)));
     }
 }

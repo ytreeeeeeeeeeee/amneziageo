@@ -39,6 +39,10 @@ public sealed class RoutingPolicy
     public string Stamp { get; }
     public int Weight => SplitBudget.Weight(List);
 
+    /// <summary>Composes the assigned rules with the same precedence as the original policy.</summary>
+    public RoutingList ComposeShare(IReadOnlyList<RuleUnfold> rules, out IReadOnlyList<string> blockApps) =>
+        GeoConfigurator.ComposeList(List.Id, Sources, rules, _platform, out blockApps, null);
+
     /// <summary>Decides a connection, using DNS associations only when its own name is unknown.</summary>
     public RouteDecision Decide(IPAddress address, string? host, string? application, IEnumerable<string>? resolvedNames = null)
     {
@@ -75,4 +79,19 @@ public sealed class RoutingPolicy
 }
 
 /// <summary>The originating list and exact source rule, with its expansion in this policy.</summary>
-public sealed record RoutingRuleOrigin(long ListId, GeoRule Original, RuleUnfold Unfolded);
+public sealed record RoutingRuleOrigin(long ListId, GeoRule Original, RuleUnfold Unfolded)
+{
+    /// <summary>The normalized identity of a Windows rule, independent of its stored assignment key.</summary>
+    public (GeoRuleKind Kind, string Value) WindowsKey()
+    {
+        var rule = Unfolded.Rule;
+        var value = rule.Kind switch
+        {
+            GeoRuleKind.App when AppRoutingRules.Normalize(rule.Value, AppRulePlatform.Windows) is { } app => app.Kind + "=" + app.Value,
+            GeoRuleKind.Cidr => RangeClaims.Key(rule.Value),
+            GeoRuleKind.Domain => NameRules.Normalize(rule.Value),
+            _ => rule.Value.Trim().ToLowerInvariant(),
+        };
+        return (rule.Kind, value);
+    }
+}

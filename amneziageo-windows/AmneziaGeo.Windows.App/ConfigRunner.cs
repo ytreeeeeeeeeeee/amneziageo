@@ -252,13 +252,15 @@ internal sealed class ConfigRunner(
             return;
         }
 
-        if (!await ProjectRoutingAsync(config, ct))
+        var projection = await PrepareRoutingAsync(config, ct).ConfigureAwait(false);
+        if (projection is null)
         {
             return;
         }
 
         ReapForeignTunnels(roster.Standing(config));
         Stop(config);
+        await RoutingProjection.SaveAsync(store, config, projection, logger, ct).ConfigureAwait(false);
 
         _launchStreak = 0;
         await SetStateAsync("connecting");
@@ -355,17 +357,17 @@ internal sealed class ConfigRunner(
                 await SetStateAsync("connecting");
                 Stop(config);
 
-                // A live config rename may have moved the config; re-resolve and re-project before re-dialing.
                 var current = await ReresolveConfigAsync(config, ct);
                 if (!string.Equals(current, config, StringComparison.Ordinal))
                 {
                     logger.LogInformation("configuration {Old} was renamed to {New} while connected; reconnecting under the new name", config, current);
-                    if (!await ProjectRoutingAsync(current, ct))
-                    {
-                        return;
-                    }
-
                     config = current;
+                }
+
+                logger.LogDebug("[FIX] {Config}: refreshing routing before restarting the tunnel service", config);
+                if (!await RoutingProjection.RefreshAsync(store, config, PrepareRoutingAsync, logger, ct).ConfigureAwait(false))
+                {
+                    return;
                 }
 
                 var redialled = await ConnectWithRetryAsync(config, ct);
@@ -470,7 +472,7 @@ internal sealed class ConfigRunner(
             {
                 logger.LogInformation("configuration {Old} was renamed to {New} while it was being dialled; the next attempt goes under the new name", config, renamed);
                 Stop(config);
-                if (!await ProjectRoutingAsync(renamed, ct))
+                if (!await RoutingProjection.RefreshAsync(store, renamed, PrepareRoutingAsync, logger, ct).ConfigureAwait(false))
                 {
                     return (false, renamed);
                 }
@@ -581,7 +583,7 @@ internal sealed class ConfigRunner(
     }
 
     // The server is asked before the list is cut, so a ban it sets holds from this connect on.
-    private async Task<bool> ProjectRoutingAsync(string config, CancellationToken ct)
+    private async Task<TunnelRoutingProjection?> PrepareRoutingAsync(string config, CancellationToken ct)
     {
         var text = await store.GetConfigTextAsync(config, ct).ConfigureAwait(false);
         var offers = new ServerOffers(
@@ -597,7 +599,7 @@ internal sealed class ConfigRunner(
         if (!available)
         {
             control.FailConnect(ConnectFailureReason.TunnelSetupFailed, ServerListsOnly.UnavailableDetail);
-            return false;
+            return null;
         }
 
         if (changed)
@@ -605,8 +607,16 @@ internal sealed class ConfigRunner(
             broker.RerouteOthers(config);
         }
 
-        await RoutingProjection.ProjectAsync(store, geo, roster, config, logger, ct).ConfigureAwait(false);
-        return true;
+        try
+        {
+            return await RoutingProjection.BuildAsync(store, geo, roster, config, logger, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException)
+        {
+            logger.LogError(ex, "{Config}: the selected routing policy could not be prepared", config);
+            control.FailConnect(ConnectFailureReason.TunnelSetupFailed, ex.Message);
+            return null;
+        }
     }
 
     // What asking the server has to say, at the level its news deserves.
@@ -677,6 +687,11 @@ internal sealed class ConfigRunner(
             control.FailDisconnect(state);
             await SetStateAsync("connected");
             return;
+        }
+
+        if (config.Length > 0 && state is "ABSENT" or "STOPPED")
+        {
+            await store.ClearTunnelProjectionAsync(config).ConfigureAwait(false);
         }
 
         control.ClearDisconnectFail();

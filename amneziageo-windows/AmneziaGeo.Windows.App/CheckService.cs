@@ -377,6 +377,11 @@ internal sealed class CheckService(AgentControl control, RuntimeInspector inspec
     // The list the tunnel decides by: the one the running tunnel materialized, else the one the next connect uses.
     private static async Task<(RoutingList? List, bool Split)> ActiveListAsync(IStateStore store, string config, CancellationToken ct)
     {
+        if (await store.GetTunnelRoutingProjectionAsync(config, ct).ConfigureAwait(false) is { } projection)
+        {
+            return (projection.ListIds.Count > 0 ? projection.List : null, projection.Split);
+        }
+
         var listId = await store.GetActiveRoutingListIdAsync(config, ct).ConfigureAwait(false)
             ?? (await ConfigRouting.AllowedAsync(store, config, ct).ConfigureAwait(false)
                 ? await store.GetSelectedRoutingListAsync(ct).ConfigureAwait(false)

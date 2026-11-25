@@ -128,6 +128,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
                         proj_block_routes_json   TEXT NOT NULL DEFAULT '[]',
                         proj_block_domains_json  TEXT NOT NULL DEFAULT '[]',
                         proj_routing_list_id INTEGER,
+                        proj_policy_json     TEXT,
                         updated_at        TEXT NOT NULL
                     );
 
@@ -302,6 +303,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
 
             // Routing list a live projection came from (null for full-tunnel / no-list).
             await AddColumnAsync(connection, schema, "tunnel_geo", "proj_routing_list_id", "INTEGER", ct).ConfigureAwait(false);
+            await AddColumnAsync(connection, schema, "tunnel_geo", "proj_policy_json", "TEXT", ct).ConfigureAwait(false);
 
             // HTTP validators for conditional update-checks.
             await AddColumnAsync(connection, schema, "geo_files", "etag", "TEXT NOT NULL DEFAULT ''", ct).ConfigureAwait(false);
@@ -363,6 +365,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
 
             // Routing list a cached resolution belongs to (0 = none/unknown); lets a list's cache be cleaned on removal.
             await AddColumnAsync(connection, schema, "domain_ips", "list_id", "INTEGER NOT NULL DEFAULT 0", ct).ConfigureAwait(false);
+            await AddColumnAsync(connection, schema, "domain_ips", "policy_stamp", "TEXT", ct).ConfigureAwait(false);
 
             // Per-list IPv6 opt-in (#149); off keeps the tunnel v4-only.
             await AddColumnAsync(connection, schema, "routing_settings", "use_ipv6", "INTEGER NOT NULL DEFAULT 0", ct).ConfigureAwait(false);
@@ -873,7 +876,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
                     SELECT projected, geo_split, rules_json, routes_json, domains_json,
                            proj_split, proj_routes_json, proj_domains_json, proj_apps_json,
                            proj_direct_routes_json, proj_direct_domains_json,
-                           proj_block_routes_json, proj_block_domains_json
+                           proj_block_routes_json, proj_block_domains_json, proj_policy_json
                     FROM tunnel_geo
                     WHERE name = $name;
                     """;
@@ -890,6 +893,11 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
                     // A live projection wins; otherwise the config's own split. Projections carry no rules.
                     if (reader.GetInt32(0) != 0)
                     {
+                        if (!reader.IsDBNull(13) && JsonSerializer.Deserialize<TunnelRoutingProjection>(reader.GetString(13)) is { } policy)
+                        {
+                            return policy.Geo(name);
+                        }
+
                         var projRoutes = JsonSerializer.Deserialize<List<string>>(reader.GetString(6)) ?? [];
                         var projDomains = JsonSerializer.Deserialize<List<GeoDomain>>(reader.GetString(7)) ?? [];
                         var projApps = JsonSerializer.Deserialize<List<string>>(reader.GetString(8)) ?? [];
@@ -911,7 +919,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
     }
 
     /// <inheritdoc/>
-    public async Task SaveTunnelProjectionAsync(string name, bool split, IReadOnlyList<string> routes, IReadOnlyList<GeoDomain> domains, IReadOnlyList<string> apps, IReadOnlyList<string> directRoutes, IReadOnlyList<GeoDomain> directDomains, IReadOnlyList<string> blockRoutes, IReadOnlyList<GeoDomain> blockDomains, long? routingListId, CancellationToken ct = default)
+    public async Task SaveTunnelProjectionAsync(string name, bool split, IReadOnlyList<string> routes, IReadOnlyList<GeoDomain> domains, IReadOnlyList<string> apps, IReadOnlyList<string> directRoutes, IReadOnlyList<GeoDomain> directDomains, IReadOnlyList<string> blockRoutes, IReadOnlyList<GeoDomain> blockDomains, long? routingListId, CancellationToken ct = default, TunnelRoutingProjection? policy = null)
     {
         var lease = await LeaseAsync(ct).ConfigureAwait(false);
         await using (lease.ConfigureAwait(false))
@@ -924,8 +932,8 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
                 // Insert keeps user columns at defaults; conflict path preserves the config's own split.
                 command.CommandText =
                     """
-                    INSERT INTO tunnel_geo (name, geo_split, rules_json, routes_json, domains_json, projected, proj_split, proj_routes_json, proj_domains_json, proj_apps_json, proj_direct_routes_json, proj_direct_domains_json, proj_block_routes_json, proj_block_domains_json, proj_routing_list_id, updated_at)
-                    VALUES ($name, 0, '[]', '[]', '[]', 1, $split, $routes, $domains, $apps, $directRoutes, $directDomains, $blockRoutes, $blockDomains, $list, $updated)
+                    INSERT INTO tunnel_geo (name, geo_split, rules_json, routes_json, domains_json, projected, proj_split, proj_routes_json, proj_domains_json, proj_apps_json, proj_direct_routes_json, proj_direct_domains_json, proj_block_routes_json, proj_block_domains_json, proj_routing_list_id, proj_policy_json, updated_at)
+                    VALUES ($name, 0, '[]', '[]', '[]', 1, $split, $routes, $domains, $apps, $directRoutes, $directDomains, $blockRoutes, $blockDomains, $list, $policy, $updated)
                     ON CONFLICT(name) DO UPDATE SET
                         projected                = 1,
                         proj_split               = excluded.proj_split,
@@ -937,6 +945,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
                         proj_block_routes_json   = excluded.proj_block_routes_json,
                         proj_block_domains_json  = excluded.proj_block_domains_json,
                         proj_routing_list_id     = excluded.proj_routing_list_id,
+                        proj_policy_json          = excluded.proj_policy_json,
                         updated_at               = excluded.updated_at;
                     """;
                 command.Parameters.AddWithValue("$name", name);
@@ -949,6 +958,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
                 command.Parameters.AddWithValue("$blockRoutes", JsonSerializer.Serialize(blockRoutes));
                 command.Parameters.AddWithValue("$blockDomains", JsonSerializer.Serialize(blockDomains));
                 command.Parameters.AddWithValue("$list", (object?)routingListId ?? DBNull.Value);
+                command.Parameters.AddWithValue("$policy", policy is null ? DBNull.Value : JsonSerializer.Serialize(policy));
                 command.Parameters.AddWithValue("$updated", Timestamp());
                 await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
@@ -980,6 +990,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
                         proj_block_routes_json   = '[]',
                         proj_block_domains_json  = '[]',
                         proj_routing_list_id     = NULL,
+                        proj_policy_json          = NULL,
                         updated_at               = $updated
                     WHERE name = $name;
                     """;
@@ -1009,6 +1020,20 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
                 return result is null or DBNull ? null : Convert.ToInt64(result, CultureInfo.InvariantCulture);
             }
         }
+    }
+
+    /// <inheritdoc/>
+    public async Task<TunnelRoutingProjection?> GetTunnelRoutingProjectionAsync(string name, CancellationToken ct = default)
+    {
+        var lease = await LeaseAsync(ct).ConfigureAwait(false);
+        await using var leaseScope = lease.ConfigureAwait(false);
+        var command = lease.Connection.CreateCommand();
+        await using var commandScope = command.ConfigureAwait(false);
+        command.CommandText = "SELECT proj_policy_json FROM tunnel_geo WHERE name = $name AND projected = 1;";
+        command.Parameters.AddWithValue("$name", name);
+        return await command.ExecuteScalarAsync(ct).ConfigureAwait(false) is string payload
+            ? JsonSerializer.Deserialize<TunnelRoutingProjection>(payload)
+            : null;
     }
 
     /// <inheritdoc/>
@@ -1648,12 +1673,13 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
                         insert.Transaction = transaction;
                         insert.CommandText =
                             """
-                            INSERT INTO domain_ips (tunnel, list_id, domain, ip, updated_at)
-                            VALUES ($tunnel, $list, $domain, $ip, $updated);
+                            INSERT INTO domain_ips (tunnel, list_id, domain, ip, updated_at, policy_stamp)
+                            VALUES ($tunnel, $list, $domain, $ip, $updated, $policy);
                             """;
                         insert.Parameters.AddWithValue("$tunnel", tunnel);
                         insert.Parameters.AddWithValue("$list", listId);
                         insert.Parameters.AddWithValue("$domain", resolution.Domain);
+                        insert.Parameters.AddWithValue("$policy", (object?)resolution.PolicyStamp ?? DBNull.Value);
                         insert.Parameters.AddWithValue("$ip", ip);
                         insert.Parameters.AddWithValue("$updated", timestamp);
                         await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
@@ -1869,6 +1895,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
     {
         var ips = new List<string>();
         DateTimeOffset? resolvedAt = null;
+        string? policy = null;
 
         var lease = await LeaseAsync(ct).ConfigureAwait(false);
         await using (lease.ConfigureAwait(false))
@@ -1879,7 +1906,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
             await using (command.ConfigureAwait(false))
             {
                 // Point lookup served by the (tunnel, domain) prefix of the UNIQUE(tunnel, domain, ip) index.
-                command.CommandText = "SELECT ip, updated_at FROM domain_ips WHERE tunnel = $tunnel AND domain = $domain;";
+                command.CommandText = "SELECT ip, updated_at, policy_stamp FROM domain_ips WHERE tunnel = $tunnel AND domain = $domain;";
                 command.Parameters.AddWithValue("$tunnel", tunnel);
                 command.Parameters.AddWithValue("$domain", domain);
 
@@ -1894,13 +1921,14 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
                         if (resolvedAt is null || rowResolvedAt > resolvedAt)
                         {
                             resolvedAt = rowResolvedAt;
+                            policy = reader.IsDBNull(2) ? null : reader.GetString(2);
                         }
                     }
                 }
             }
         }
 
-        return ips.Count > 0 ? new DomainResolution(domain, ips, resolvedAt) : null;
+        return ips.Count > 0 ? new DomainResolution(domain, ips, resolvedAt, policy) : null;
     }
 
     /// <inheritdoc/>

@@ -308,6 +308,11 @@ public sealed class RoutingCache
         return GeoIpRanges.TryToNumeric(address, out var value) ? Classify(value) : RouteVerdict.None;
     }
 
+    /// <summary>Returns the current unambiguous name decision, if any, for a connection to this address.</summary>
+    public RouteVerdict NameVerdict(IPAddress address) =>
+        GeoIpRanges.TryToNumeric(address, out var value) && _entries.TryGetValue(value, out var entry) && entry.ByName
+            ? entry.Verdict : RouteVerdict.None;
+
     /// <summary>
     /// Names the networks this machine stands in that a range of the list covers: an application rule leaves their
     /// addresses on the path of the machine.
@@ -412,7 +417,7 @@ public sealed class RoutingCache
         verdict = decision.Verdict;
 
         // An adopted address belongs to the domain tracker; the two must not install competing routes for it.
-        if (existing.Plan == RoutePlan.External || (existing.Verdict == verdict && !Replanned(rules, existing)))
+        if (existing.Plan == RoutePlan.External || (existing.Verdict == verdict && PlanFor(rules, verdict, existing) == existing.Plan))
         {
             if (!Installed(existing))
             {
@@ -648,12 +653,10 @@ public sealed class RoutingCache
             {
                 try
                 {
-                    if (reported.Datagram && SettledAsDatagram(reported.Address))
+                    if (!reported.Datagram || !SettledAsDatagram(reported.Address))
                     {
-                        continue;
+                        Note(reported.Address, Matches(reported.App, _appMatch));
                     }
-
-                    Note(reported.Address, Matches(reported.App));
                 }
                 catch (Exception ex)
                 {
@@ -1075,9 +1078,9 @@ public sealed class RoutingCache
     }
 
     // Whether a dropped image is covered by the app rules.
-    private bool Matches(string? app)
+    private bool Matches(string? app, Func<string, bool>? match)
     {
-        if (app is null || _appMatch is not { } match)
+        if (app is null || match is null)
         {
             return false;
         }
@@ -1144,7 +1147,7 @@ public sealed class RoutingCache
         {
             Release(entry, generation, filters, withdrawn);
             entry.Verdict = verdict;
-            entry.Plan = Decide(Volatile.Read(ref _rules), verdict, entry.Numeric, entry.ByApp);
+            entry.Plan = PlanFor(Volatile.Read(ref _rules), verdict, entry);
         }
 
         _applier.RemoveTunnel(withdrawn);
@@ -1172,7 +1175,7 @@ public sealed class RoutingCache
             var verdict = decision.Verdict;
             entry.ByName = decision.Source == RouteDecisionSource.Domain;
             entry.ByApp = entry.AppClaimed && !entry.ByName && verdict != RouteVerdict.Block;
-            if (verdict == entry.Verdict && Decide(rules, verdict, entry.Numeric, entry.ByApp) == entry.Plan)
+            if (verdict == entry.Verdict && PlanFor(rules, verdict, entry) == entry.Plan)
             {
                 continue;
             }
@@ -1774,6 +1777,9 @@ public sealed class RoutingCache
     // the list keeps direct, whose destination leaves past the tunnel where a rule sends it through. A block still
     // wins: the route of the address stands for every program of the machine, and so would a lifted block. A network
     // this machine stands in keeps the path of the machine for an application too.
+    private RoutePlan PlanFor(RuleSet rules, RouteVerdict verdict, Entry entry) =>
+        Decide(rules, verdict, entry.Numeric, entry.ByApp);
+
     private RoutePlan Decide(RuleSet rules, RouteVerdict verdict, uint address, bool app = false)
     {
         if (verdict == RouteVerdict.Block)

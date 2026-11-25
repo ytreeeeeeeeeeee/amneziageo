@@ -165,7 +165,7 @@ public sealed class DnsPassTests
         var tracker = Tracker(rule);
         var proxy = new DnsProxy([], [], Resolver, Resolver, null, [], true, [], [], null, NullLogger<DnsProxy>.Instance, stripV6: false, routing: routing, listen: false, passDns: tracker);
         proxy.SetLentNames(
-            name => name.EndsWith("lent.example", StringComparison.Ordinal) ? "second" : null,
+            (name, local) => local is null && name.EndsWith("lent.example", StringComparison.Ordinal) ? "second" : null,
             (_, _) => Task.FromResult<IReadOnlyList<string>>([Address]));
         return (proxy, tracker);
     }

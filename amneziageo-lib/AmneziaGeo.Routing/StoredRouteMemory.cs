@@ -17,11 +17,11 @@ public sealed class StoredRouteMemory : IRouteMemory
     /// <summary>
     /// ctor
     /// </summary>
-    public StoredRouteMemory(IStateStore store, string tunnel, IReadOnlyList<string> apps, IReadOnlyList<GeoDomain> proxyDomains, IReadOnlyList<GeoDomain> directDomains, IReadOnlyList<GeoDomain> blockDomains)
+    public StoredRouteMemory(IStateStore store, string tunnel, IReadOnlyList<string> apps, IReadOnlyList<GeoDomain> proxyDomains, IReadOnlyList<GeoDomain> directDomains, IReadOnlyList<GeoDomain> blockDomains, string? policyStamp = null)
     {
         _store = store;
         _tunnel = tunnel;
-        _rules = Signature(apps, proxyDomains, directDomains, blockDomains);
+        _rules = policyStamp ?? Signature(apps, proxyDomains, directDomains, blockDomains);
     }
 
     /// <inheritdoc/>

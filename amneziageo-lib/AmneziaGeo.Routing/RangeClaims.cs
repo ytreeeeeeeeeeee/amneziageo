@@ -25,6 +25,26 @@ public static class RangeClaims
     public static string Key(string entry) => TryParse(entry, out var range)
         ? Format(range.Start, range.Bits, range.Width) : entry.Trim();
 
+    /// <summary>Returns the parts of the original prefixes that are still carried after rule settlement.</summary>
+    public static IReadOnlyList<string> Intersect(IReadOnlyList<string> prefixes, IReadOnlyList<string> carried)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        var ranges = Parse(carried);
+        foreach (var original in Parse(prefixes))
+        {
+            foreach (var range in ranges)
+            {
+                if (range.Width == original.Width && range.Start <= original.End && original.Start <= range.End)
+                {
+                    var part = range.Bits >= original.Bits ? range : original;
+                    result.Add(Format(part.Start, part.Bits, part.Width));
+                }
+            }
+        }
+
+        return result.Order(StringComparer.Ordinal).ToArray();
+    }
+
     /// <summary>Builds an address membership test over both address families.</summary>
     public static Func<IPAddress, bool> Matcher(IReadOnlyList<string> entries)
     {

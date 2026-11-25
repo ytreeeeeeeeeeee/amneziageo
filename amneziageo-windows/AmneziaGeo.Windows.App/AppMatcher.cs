@@ -17,6 +17,7 @@ internal sealed class AppMatcher
 
     // Whether the rules keep their applications past the tunnel instead of carrying them through it.
     private readonly bool _past;
+    private readonly AppMatcher? _excluded;
 
     // The rules in force, parsed. Replaced whole on a reload, so a reader sees one set or the other.
     private volatile RuleSet _set;
@@ -40,11 +41,12 @@ internal sealed class AppMatcher
     /// <summary>
     /// ctor
     /// </summary>
-    public AppMatcher(IReadOnlyList<string> matchers, ILogger logger, ProcessImages? images = null, bool past = false)
+    public AppMatcher(IReadOnlyList<string> matchers, ILogger logger, ProcessImages? images = null, bool past = false, IReadOnlyList<string>? excluded = null)
     {
         _logger = logger;
         _images = images;
         _past = past;
+        _excluded = excluded is { Count: > 0 } ? new AppMatcher(excluded, logger, images) : null;
         _set = Parse(matchers, logger);
     }
 
@@ -193,7 +195,8 @@ internal sealed class AppMatcher
     /// <summary>
     /// Whether a PID matches the app rules.
     /// </summary>
-    internal bool MatchesPid(uint pid) => ResolveServicePids().Contains(pid) || MatchesByImageOrAncestor(pid, SnapshotProcessTree(), new Dictionary<uint, (string? Path, long Created)>());
+    internal bool MatchesPid(uint pid) => _excluded?.MatchesPid(pid) != true &&
+        (ResolveServicePids().Contains(pid) || MatchesByImageOrAncestor(pid, SnapshotProcessTree(), new Dictionary<uint, (string? Path, long Created)>()));
 
     /// <summary>
     /// Filters PIDs to those matching the app rules, snapshotting the process tree once.
@@ -206,12 +209,13 @@ internal sealed class AppMatcher
             return matched;
         }
 
+        var excluded = _excluded?.MatchPids(pids);
         var services = ResolveServicePids();
         var tree = SnapshotProcessTree();
         var cache = new Dictionary<uint, (string? Path, long Created)>();
         foreach (var pid in pids)
         {
-            if (services.Contains(pid) || MatchesByImageOrAncestor(pid, tree, cache))
+            if (excluded?.Contains(pid) != true && (services.Contains(pid) || MatchesByImageOrAncestor(pid, tree, cache)))
             {
                 matched.Add(pid);
             }
@@ -228,6 +232,11 @@ internal sealed class AppMatcher
         if (pid == 0)
         {
             return null;
+        }
+
+        if (_excluded?.MatchesPid(pid) == true)
+        {
+            return false;
         }
 
         if (ResolveServicePids().Contains(pid))
@@ -376,7 +385,8 @@ internal sealed class AppMatcher
     /// </summary>
     public bool MatchesDevicePath(string path)
     {
-        return MatchesImage(ToDosPath(path));
+        var dos = ToDosPath(path);
+        return _excluded?.MatchesImage(dos) != true && MatchesImage(dos);
     }
 
     // \device\harddiskvolume3\app\app.exe -> C:\app\app.exe. An unmapped device is left alone; name rules still match it.

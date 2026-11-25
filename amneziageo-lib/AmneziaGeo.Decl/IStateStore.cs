@@ -28,12 +28,15 @@ public interface IStateStore
     /// <summary>
     /// Stores a routing projection and marks it live. routingListId is the source list (null for full-tunnel / no-list).
     /// </summary>
-    Task SaveTunnelProjectionAsync(string name, bool split, IReadOnlyList<string> routes, IReadOnlyList<GeoDomain> domains, IReadOnlyList<string> apps, IReadOnlyList<string> directRoutes, IReadOnlyList<GeoDomain> directDomains, IReadOnlyList<string> blockRoutes, IReadOnlyList<GeoDomain> blockDomains, long? routingListId, CancellationToken ct = default);
+    Task SaveTunnelProjectionAsync(string name, bool split, IReadOnlyList<string> routes, IReadOnlyList<GeoDomain> domains, IReadOnlyList<string> apps, IReadOnlyList<string> directRoutes, IReadOnlyList<GeoDomain> directDomains, IReadOnlyList<string> blockRoutes, IReadOnlyList<GeoDomain> blockDomains, long? routingListId, CancellationToken ct = default, TunnelRoutingProjection? policy = null);
 
     /// <summary>
     /// Drops the live routing projection, reverting to the config's own split. No-op when no row exists.
     /// </summary>
     Task ClearTunnelProjectionAsync(string name, CancellationToken ct = default);
+
+    /// <summary>Reads the versioned routing policy installed for a tunnel.</summary>
+    Task<TunnelRoutingProjection?> GetTunnelRoutingProjectionAsync(string name, CancellationToken ct = default);
 
     /// <summary>
     /// Returns the routing list id of the tunnel's live projection, or null when none or full-tunnel.

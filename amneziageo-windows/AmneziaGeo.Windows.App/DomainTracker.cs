@@ -28,7 +28,8 @@ internal sealed class DomainTracker(
     int routeTtlSeconds,
     bool stripV6,
     RoutingCache? routing = null,
-    SynSentReset? synReset = null)
+    SynSentReset? synReset = null,
+    string? policyStamp = null)
 {
     private readonly object _lock = new();
     private readonly Dictionary<string, HashSet<string>> _current = [];
@@ -275,7 +276,7 @@ internal sealed class DomainTracker(
             {
                 var snapshot = union.ToList();
                 var listId = _activeListId;
-                EnqueuePersist(() => store.SaveDomainResolutionAsync(tunnelName, new DomainResolution(key, snapshot), listId));
+                EnqueuePersist(() => store.SaveDomainResolutionAsync(tunnelName, new DomainResolution(key, snapshot, PolicyStamp: policyStamp), listId));
             }
         }
 
@@ -475,7 +476,7 @@ internal sealed class DomainTracker(
             // Persist the re-resolved set so the heal survives a restart.
             var snapshot = next.ToList();
             var listId = _activeListId;
-            EnqueuePersist(() => store.SaveDomainResolutionAsync(tunnelName, new DomainResolution(key, snapshot), listId));
+            EnqueuePersist(() => store.SaveDomainResolutionAsync(tunnelName, new DomainResolution(key, snapshot, PolicyStamp: policyStamp), listId));
         }
 
         // Advertise the delta off-lock (O(new)); evictions already dropped their OS routes, and the pipe round-trip
@@ -580,7 +581,13 @@ internal sealed class DomainTracker(
 
         if (cached is null || cached.Ips.Count == 0)
         {
-            return null; // nothing cached -> caller resolves through the tunnel
+            return null;
+        }
+
+        if (cached.PolicyStamp != policyStamp)
+        {
+            logger.LogDebug("{Tunnel}: ignored a remembered domain answer from another routing version", tunnelName);
+            return null;
         }
 
         // Re-check membership after the await: a list edit during the DB read may have swapped the matcher so
