@@ -736,12 +736,15 @@ internal sealed class ConfigRunner(
 
         // A service left half-started by an earlier run refuses every start with "already running", so the
         // retry never gets past it and the tunnel never comes up; it is forced down before this attempt.
-        if (serviceManager.QueryState(member) == "PENDING")
+        var previousState = serviceManager.QueryState(member);
+        if (previousState == "PENDING")
         {
             logger.LogWarning("{Member}: a tunnel service from an earlier run is stuck starting, so it is forced down first", member);
             StopService(member);
+            previousState = serviceManager.QueryState(member);
         }
 
+        var routing = await store.GetTunnelRoutingProjectionAsync(member, ct).ConfigureAwait(false);
         logger.LogInformation("{Member}: starting the tunnel process", member);
         _launched = member;
         var created = serviceManager.CreateService(member, activeScope.OwnerRoot);
@@ -775,6 +778,12 @@ internal sealed class ConfigRunner(
                 if (status.HandshakeSec > 0)
                 {
                     logger.LogInformation("{Member}: the server answered after {Ms} ms, the tunnel is up", member, elapsed);
+                    if (started == 0 || previousState is "STOPPED" or "ABSENT")
+                    {
+                        control.AppliedRouting = routing;
+                        logger.LogDebug("[FIX] {Member}: confirmed routing for {Count} list(s) after handshake", member, routing?.ListIds.Count ?? 0);
+                    }
+
                     return ConnectOutcome.Success;
                 }
 
@@ -1333,6 +1342,11 @@ internal sealed class ConfigRunner(
         StopService(member);
         serviceManager.DeleteService(member);
         AwaitCleanup(member);
+        if (serviceManager.QueryState(member) != "RUNNING")
+        {
+            control.AppliedRouting = null;
+        }
+
         reconciler.Reconcile(member);
         if (string.Equals(_launched, member, StringComparison.Ordinal))
         {

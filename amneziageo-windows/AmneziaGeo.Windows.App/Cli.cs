@@ -121,6 +121,15 @@ internal sealed class Cli(
                 return await RoutingListAddAsync(listName, listRules);
             case ["assign-routing", var list]:
                 return await AssignRoutingAsync(list);
+            case ["routing-selection"]:
+                return await IpcProbeAsync();
+            case ["routing-enable", var enableId]:
+                return await IpcCmdAsync(IpcContract.OpChangeRoutingSelection, [RoutingSelectionChange.Add, enableId]);
+            case ["routing-disable", var disableId]:
+                return await IpcCmdAsync(IpcContract.OpChangeRoutingSelection, [RoutingSelectionChange.Remove, disableId]);
+            case ["routing-replace", .. var ids]:
+                return await IpcCmdAsync(IpcContract.OpChangeRoutingSelection,
+                    ids is ["none"] ? [RoutingSelectionChange.Replace] : [RoutingSelectionChange.Replace, .. ids]);
             case ["set-websocket", var name, var toggle]:
                 return await SetWebSocketAsync(name, toggle, null, null);
             case ["set-websocket", var name, var toggle, var port]:
@@ -522,6 +531,19 @@ internal sealed class Cli(
             }
 
             Console.WriteLine($"routing\t{snapshot.SelectedRoutingList?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "none"}");
+
+            if (snapshot.RequestedRoutingListIds is not null)
+            {
+                Console.WriteLine($"routing-selected\t{string.Join(",", snapshot.RequestedRoutingIds())}");
+                Console.WriteLine($"routing-applied\t{string.Join(",", snapshot.AppliedRoutingIds())}");
+                Console.WriteLine($"routing-mode\t{snapshot.EffectiveRoutingMode()}\tall-udp={snapshot.EffectiveRoutingAllUdp()}");
+                if (snapshot.RoutingPendingReason.Length > 0)
+                {
+                    var reason = snapshot.RoutingPendingReason == IpcMessage.Key("Main_RoutingReconnectPending")
+                        ? "reconnect to apply the routing changes" : snapshot.RoutingPendingReason;
+                    Console.WriteLine($"routing-pending\t{reason}");
+                }
+            }
 
             foreach (var list in snapshot.RoutingLists ?? [])
             {

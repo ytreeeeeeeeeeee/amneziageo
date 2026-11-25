@@ -84,8 +84,29 @@ public sealed class RoutingCommandsTests : IDisposable
         Assert.Equal(new[] { IpcContract.OpSetRoutingSettings, "6", string.Empty, "off", "split", "off" }, link.Sent[^1]);
     }
 
+    [Theory]
+    [InlineData("enable", "add")]
+    [InlineData("disable", "remove")]
+    [InlineData("replace", "replace")]
+    public async Task SelectionCommandsSendTheirOwnOperation(string verb, string action)
+    {
+        var link = new Link(string.Empty, modern: true);
+        Assert.Equal(Exit.Ok, await RoutingCommands.RunAsync(link, [verb, "main"]));
+        Assert.Equal([IpcContract.OpChangeRoutingSelection, action, "6"], Assert.Single(link.Sent));
+    }
+
+    [Fact]
+    public async Task LegacyUseStillReplacesTheSelection()
+    {
+        var link = new Link(string.Empty);
+        Assert.Equal(Exit.Ok, await RoutingCommands.RunAsync(link, ["use", "main"]));
+        Assert.Equal(Exit.Ok, await RoutingCommands.RunAsync(link, ["use", "none"]));
+        Assert.Equal([IpcContract.OpAssignRouting, "6"], link.Sent[0]);
+        Assert.Equal([IpcContract.OpAssignRouting, "none"], link.Sent[1]);
+    }
+
     // Answers one snapshot holding the list "main", hands back its rules and settings and writes down what was sent.
-    private sealed class Link(string rules, string settings = Split) : IAgentLink
+    private sealed class Link(string rules, string settings = Split, bool modern = false) : IAgentLink
     {
         /// <inheritdoc/>
         public event Action<StatusSnapshot>? SnapshotReceived
@@ -100,7 +121,8 @@ public sealed class RoutingCommandsTests : IDisposable
         public List<string[]> Sent { get; } = [];
 
         /// <inheritdoc/>
-        public StatusSnapshot Snapshot { get; } = new("1.0.0", null, [], [new RoutingListEntry(6, "main", 2, 0, 0)]);
+        public StatusSnapshot Snapshot { get; } = new("1.0.0", null, [], [new RoutingListEntry(6, "main", 2, 0, 0)],
+            RequestedRoutingListIds: modern ? [] : null);
 
         /// <inheritdoc/>
         public Task<IpcAck> SendAsync(string op, params string[] args)

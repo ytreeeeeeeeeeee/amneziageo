@@ -16,6 +16,7 @@ internal sealed class AgentControl
     private readonly Lock _gate = new();
     private volatile bool _running;
     private volatile bool _connected;
+    private volatile TunnelRoutingProjection? _appliedRouting;
     private volatile bool _restartRequired;
     private volatile string? _target;
     private volatile string? _runningTarget;
@@ -44,6 +45,10 @@ internal sealed class AgentControl
     /// Whether the server has answered the running tunnel.
     /// </summary>
     public bool Connected => _connected;
+
+    /// <summary>The routing policy confirmed by the current tunnel handshake.</summary>
+    public TunnelRoutingProjection? AppliedRouting { get => _appliedRouting; set => _appliedRouting = value; }
+
 
     /// <summary>
     /// Records whether the tunnel stands.

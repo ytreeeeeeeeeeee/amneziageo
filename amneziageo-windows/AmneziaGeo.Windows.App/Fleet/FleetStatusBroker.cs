@@ -265,6 +265,10 @@ internal sealed class FleetStatusBroker(
     /// <inheritdoc/>
     protected override TunnelDutyRoster Roster => mode.MultiServer ? fleet : base.Roster;
 
+    protected override IReadOnlyList<TunnelRoutingProjection> AppliedRouting() => mode.MultiServer
+        ? [.. live.All().Select(member => member.Value.AppliedRouting).OfType<TunnelRoutingProjection>()]
+        : base.AppliedRouting();
+
     /// <inheritdoc/>
     protected override void MarkRestartRequired(string config)
     {

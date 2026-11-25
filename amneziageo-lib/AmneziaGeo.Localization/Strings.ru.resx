@@ -3050,4 +3050,52 @@
   <data name="Notice_StoppedChannel" xml:space="preserve">
     <value>Туннель остановлен</value>
   </data>
+  <data name="Main_RoutingSelectedCount" xml:space="preserve">
+    <value>Выбрано списков: {0}</value>
+  </data>
+  <data name="Main_RoutingAppliedCount" xml:space="preserve">
+    <value>Применено списков: {0}</value>
+  </data>
+  <data name="Main_RoutingReconnectPending" xml:space="preserve">
+    <value>Переподключитесь, чтобы применить изменения маршрутизации.</value>
+  </data>
+  <data name="Main_RoutingMixedMode" xml:space="preserve">
+    <value>Разные режимы в туннелях</value>
+  </data>
+  <data name="Main_RoutingConfigMode" xml:space="preserve">
+    <value>Маршруты конфигурации</value>
+  </data>
+  <data name="Main_RoutingLegacyAgent" xml:space="preserve">
+    <value>Эта версия агента поддерживает один список маршрутизации.</value>
+  </data>
+  <data name="Main_RoutingChangeFailed" xml:space="preserve">
+    <value>Не удалось изменить выбор списков маршрутизации.</value>
+  </data>
+  <data name="Main_RoutingAllUdp" xml:space="preserve">
+    <value>Весь UDP через туннель</value>
+  </data>
+  <data name="Main_RoutingEnableList" xml:space="preserve">
+    <value>Включить список</value>
+  </data>
+  <data name="Main_RoutingDisableList" xml:space="preserve">
+    <value>Выключить список</value>
+  </data>
+  <data name="Main_RoutingReplaceSelection" xml:space="preserve">
+    <value>Заменить набор</value>
+  </data>
+  <data name="Main_RoutingSelectionIds" xml:space="preserve">
+    <value>Введите ID списков через пробел или none, чтобы выключить маршрутизацию.</value>
+  </data>
+  <data name="Main_RoutingSelectionLegend" xml:space="preserve">
+    <value>* выбран   + применён</value>
+  </data>
+  <data name="Main_RoutingSelectionTitle" xml:space="preserve">
+    <value>Выбор списков маршрутизации</value>
+  </data>
+  <data name="Main_RoutingAppliedLabel" xml:space="preserve">
+    <value>Применён</value>
+  </data>
+  <data name="Main_RoutingReconnectAndroidPending" xml:space="preserve">
+    <value>Изменения маршрутизации применятся при переподключении VPN.</value>
+  </data>
 </root>

@@ -373,7 +373,8 @@ internal sealed partial class RoutingCard : UserControl
 
                 var part = stop switch
                 {
-                    Stop.Action => (Control)card.ActivePart,
+                    Stop.Action when card.ActivePart.IsEffectivelyEnabled => (Control)card.ActivePart,
+                    Stop.Action => card.SettingsPart,
                     Stop.Settings => card.SettingsPart,
                     _ => card.FacePart,
                 };
@@ -401,7 +402,7 @@ internal sealed partial class RoutingCard : UserControl
     {
         _entered = true;
         ApplyStopFocus();
-        ActivePart.Focus(NavigationMethod.Directional);
+        (ActivePart.IsEffectivelyEnabled ? ActivePart : SettingsPart).Focus(NavigationMethod.Directional);
     }
 
     private void Leave()
@@ -415,6 +416,7 @@ internal sealed partial class RoutingCard : UserControl
     private void Step(int delta)
     {
         Control[] stops = [ActivePart, .. TagsPart.Presses(), SettingsPart];
+        stops = [.. stops.Where(stop => stop.IsEffectivelyEnabled)];
         var at = Array.FindIndex(stops, stop => stop.IsKeyboardFocusWithin);
         var next = at < 0 ? 0 : at + delta;
         if (next >= 0 && next < stops.Length)

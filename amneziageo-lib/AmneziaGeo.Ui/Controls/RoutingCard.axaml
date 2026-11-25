@@ -22,6 +22,8 @@
                          TextTrimming="CharacterEllipsis" />
               <TextBlock Text="{Binding ModeText}" FontSize="12.5" Classes="muted"
                          TextTrimming="CharacterEllipsis" />
+              <TextBlock Text="{l:Tr Main_RoutingAppliedLabel}" FontSize="12" Classes="muted"
+                         IsVisible="{Binding IsLive}" />
             </StackPanel>
 
             <Button x:Name="ActivePart" Grid.Column="1" Classes="cardpick" VerticalAlignment="Top" Margin="0,1,0,0"

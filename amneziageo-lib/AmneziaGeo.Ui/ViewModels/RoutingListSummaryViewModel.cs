@@ -84,6 +84,7 @@ internal sealed partial class RoutingListSummaryViewModel : ViewModelBase
     private bool _warn = true;
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ActiveTip))]
     private bool _isSelected;
 
     // The configuration whose server keeps the switch of the list where it stands, empty while none does.
@@ -112,7 +113,7 @@ internal sealed partial class RoutingListSummaryViewModel : ViewModelBase
     /// </summary>
     public string ActiveTip => Locked
         ? Loc.Instance.Get("Main_ServerListsOnlyOf", LockedBy)
-        : Loc.Instance.Get("Main_CardActiveFlag");
+        : Loc.Instance.Get(IsSelected ? "Main_RoutingDisableList" : "Main_RoutingEnableList");
 
     /// <summary>
     /// Режим списка строкой под его именем.

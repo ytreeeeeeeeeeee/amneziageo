@@ -53,6 +53,19 @@ internal partial class RoutingViewModel : ViewModelBase
 
     // Состояние туннеля из снимка: по нему видно, идёт ли маршрутизация по выбранному списку прямо сейчас.
     private string _boundStatus = ConnectionStatus.Disconnected;
+    private IReadOnlyList<long> _requestedRouting = [];
+    private IReadOnlyList<long> _appliedRouting = [];
+    private bool _multipleRouting;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanChangeHomeRouting))]
+    [NotifyCanExecuteChangedFor(nameof(SelectCardCommand))]
+    private bool _changingRouting;
+    private string _routingMode = string.Empty;
+    private bool _routingAllUdp;
+    private string _routingPending = string.Empty;
+
+    [ObservableProperty]
+    private string _routingChangeError = string.Empty;
 
     // Set while the section waits for that first report.
     private bool _enterDeferred;
@@ -110,12 +123,6 @@ internal partial class RoutingViewModel : ViewModelBase
 
     // What the device found for each app:<name> of the routing lists, as the agent last reported it.
     private IReadOnlyDictionary<string, IReadOnlyList<string>>? _foundApps;
-
-    // The routing list every config uses, mirrored from the snapshot; null leaves each config on its own settings.
-    [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(IsOpenListActive))]
-    [NotifyPropertyChangedFor(nameof(UseOpenList))]
-    private long? _selectedRoutingListId;
 
     [ObservableProperty]
     private bool _routingDeletePending;
@@ -232,7 +239,7 @@ internal partial class RoutingViewModel : ViewModelBase
         RoutingEditor?.RefreshLocalizedLabels();
         OnPropertyChanged(nameof(DeleteListPrompt));
         OnPropertyChanged(nameof(PresetRegionsLabel));
-        OnPropertyChanged(nameof(HomeRoutingTip));
+        NotifyHomeRouting();
         OnPropertyChanged(nameof(OpenListLockTip));
         RebuildRegionCards();
     }
@@ -613,18 +620,14 @@ internal partial class RoutingViewModel : ViewModelBase
         NotifyCatalogueChanged();
     }
 
-    // Keeps the list that routes: the section lands on it next time, and turning routing off leaves it behind
-    // instead of sending the section back to the top of the catalogue.
-    partial void OnSelectedRoutingListIdChanged(long? value)
+    private void RememberRoutingSelection()
     {
-        MarkSelectedList();
-        if (value is not { } id || _prefs.LastRoutingList == id)
+        if (_requestedRouting.Count > 0 && !_requestedRouting.SequenceEqual(_prefs.LastRoutingLists))
         {
-            return;
+            _prefs.LastRoutingList = _requestedRouting[0];
+            _prefs.LastRoutingLists = _requestedRouting.ToArray();
+            _prefs.Save();
         }
-
-        _prefs.LastRoutingList = id;
-        _prefs.Save();
     }
 
     /// <summary>
@@ -649,6 +652,16 @@ internal partial class RoutingViewModel : ViewModelBase
     public virtual void Apply(StatusSnapshot snapshot)
     {
         _boundStatus = snapshot.BoundStatus;
+        _multipleRouting = snapshot.RequestedRoutingListIds is not null;
+        _requestedRouting = snapshot.RequestedRoutingIds();
+        _appliedRouting = snapshot.AppliedRoutingIds();
+        _routingMode = snapshot.EffectiveRoutingMode();
+        _routingAllUdp = snapshot.EffectiveRoutingAllUdp();
+        _routingPending = !_multipleRouting && snapshot.RestartRequired
+            ? IpcMessage.Key("Main_RoutingReconnectPending") : snapshot.RoutingPendingReason;
+        _serverListsOf = snapshot.ServerListsOf;
+        _serverLists = snapshot.ServerLists ?? [];
+        RememberRoutingSelection();
         EnsureRegionDetected();
 
         // No catalogue in the snapshot means the agent has not read its store yet - keep what is on screen and
@@ -660,11 +673,8 @@ internal partial class RoutingViewModel : ViewModelBase
             MarkCatalogueKnown();
         }
 
-        _serverListsOf = snapshot.ServerListsOf;
-        _serverLists = snapshot.ServerLists ?? [];
         _foundApps = snapshot.FoundApps;
         RoutingEditor?.ApplyFoundApps(_foundApps);
-        SelectedRoutingListId = snapshot.SelectedRoutingList;
         MarkSelectedList();
         _localDoh = snapshot.LocalDoh;
         _splitRouteLimit = snapshot.SplitRouteLimit;
@@ -714,7 +724,7 @@ internal partial class RoutingViewModel : ViewModelBase
     /// </summary>
     public bool HomeRoutingOn
     {
-        get => SelectedRoutingListId is not null;
+        get => _requestedRouting.Count > 0;
         set
         {
             if (value == HomeRoutingOn)
@@ -729,7 +739,15 @@ internal partial class RoutingViewModel : ViewModelBase
                 return;
             }
 
-            _ = AssignRoutingAsync(value ? PreferredDefaultList().Id : null);
+            if (HomeRoutingLocked || ChangingRouting)
+            {
+                OnPropertyChanged();
+                return;
+            }
+
+            var available = _prefs.LastRoutingLists.Where(id => CatalogueRow(id) is not null).ToArray();
+            IReadOnlyList<long> next = !value ? [] : available.Length > 0 ? available : [PreferredDefaultList().Id];
+            _ = ChangeRoutingAsync(new(RoutingSelectionChange.Replace, next));
         }
     }
 
@@ -737,6 +755,8 @@ internal partial class RoutingViewModel : ViewModelBase
     /// Стоит ли тумблер главного экрана на месте: сервер конфигурации разрешает только свои списки.
     /// </summary>
     public bool HomeRoutingLocked => _serverListsOf.Length > 0;
+
+    public bool CanChangeHomeRouting => !HomeRoutingLocked && !ChangingRouting;
 
     /// <summary>
     /// Подсказка тумблера главного экрана.
@@ -758,19 +778,45 @@ internal partial class RoutingViewModel : ViewModelBase
     /// <summary>
     /// Имя списка в строке главного экрана.
     /// </summary>
-    public string HomeRoutingList => HasRoutingLists
-        ? PreferredDefaultList().Name
-        : Loc.Instance.Get("Main_HomeRoutingNone");
+    public string HomeRoutingList => _requestedRouting.Count switch
+    {
+        0 => Loc.Instance.Get("Main_HomeRoutingNone"),
+        1 => CatalogueRow(_requestedRouting[0])?.Name ?? Loc.Instance.Get("Main_RoutingSelectedCount", 1),
+        _ => Loc.Instance.Get("Main_RoutingSelectedCount", _requestedRouting.Count),
+    };
 
-    /// <summary>
-    /// Whether the open list is the one every config routes by.
-    /// </summary>
-    public bool IsOpenListActive => EditRoutingList is { } open && SelectedRoutingListId == open.Id;
+    public string RoutingSummary
+    {
+        get
+        {
+            var mode = _routingMode switch
+            {
+                "full" => Loc.Instance.Get("Main_VpnModeFull"),
+                "split" => Loc.Instance.Get("Main_VpnModeSelected"),
+                "mixed" => Loc.Instance.Get("Main_RoutingMixedMode"),
+                "config" => Loc.Instance.Get("Main_RoutingConfigMode"),
+                _ => string.Empty,
+            };
+            var summary = Loc.Instance.Get("Main_RoutingSelectedCount", _requestedRouting.Count);
+            if (mode.Length > 0)
+            {
+                summary += " · " + Loc.Instance.Get("Main_RoutingAppliedCount", _appliedRouting.Count) + " · " + mode;
+                if (_routingAllUdp)
+                {
+                    summary += " · " + Loc.Instance.Get("Main_RoutingAllUdp");
+                }
+            }
 
-    /// <summary>
-    /// Whether every config routes by the open list. Setting it makes the open list the picked one, or leaves
-    /// every config on its own settings.
-    /// </summary>
+            return summary;
+        }
+    }
+
+    public string RoutingPendingText => LocalRoutingMessage(_routingPending);
+    public string RoutingSelectionHint => HomeRoutingLocked ? HomeRoutingTip
+        : _catalogueKnown && !_multipleRouting ? Loc.Instance.Get("Main_RoutingLegacyAgent") : string.Empty;
+
+    public bool IsOpenListActive => EditRoutingList is { } open && _requestedRouting.Contains(open.Id);
+
     public bool UseOpenList
     {
         get => _openListEcho ?? IsOpenListActive;
@@ -781,13 +827,13 @@ internal partial class RoutingViewModel : ViewModelBase
                 return;
             }
 
-            if (OpenListLocked)
+            if (EditRoutingList is not { } open || OpenListLocked || ChangingRouting)
             {
                 Dispatcher.UIThread.Post(() => TakeBackOpenList(value));
                 return;
             }
 
-            _ = AssignRoutingAsync(value && EditRoutingList is { } open ? open.Id : null);
+            _ = ToggleRoutingAsync(open.Id, value);
         }
     }
 
@@ -831,15 +877,45 @@ internal partial class RoutingViewModel : ViewModelBase
         }
     }
 
-    // Sends the assignment, then re-reads the switch from the state the agent answered with.
-    private async Task AssignRoutingAsync(long? listId)
+    private bool CanSelectCard() => !ChangingRouting;
+
+    private Task ToggleRoutingAsync(long id, bool enable) =>
+        ChangeRoutingAsync(new(enable ? RoutingSelectionChange.Add : RoutingSelectionChange.Remove, [id]));
+
+    private async Task ChangeRoutingAsync(RoutingSelectionChange change)
     {
-        var id = listId is { } picked
-            ? picked.ToString(System.Globalization.CultureInfo.InvariantCulture)
-            : "none";
-        await _connection.SendCommandAsync(new IpcCommand(IpcContract.OpAssignRouting, [id]));
-        OnPropertyChanged(nameof(UseOpenList));
+        if (ChangingRouting)
+        {
+            return;
+        }
+
+        ChangingRouting = true;
+        RoutingChangeError = string.Empty;
+        try
+        {
+            var result = await _connection.SendCommandAsync(_multipleRouting ? change.Command() : change.LegacyCommand());
+            if (!result.Ok)
+            {
+                RoutingChangeError = LocalRoutingMessage(result.Message);
+                if (RoutingChangeError.Length == 0)
+                {
+                    RoutingChangeError = Loc.Instance.Get("Main_RoutingChangeFailed");
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException or TimeoutException)
+        {
+            RoutingChangeError = Loc.Instance.Get("Main_RoutingChangeFailed");
+        }
+        finally
+        {
+            ChangingRouting = false;
+            NotifyHomeRouting();
+        }
     }
+
+    private static string LocalRoutingMessage(string message) => IpcMessage.TryParse(message, out var key, out var args)
+        ? Loc.Instance.Get(key, args) : message;
 
     public void Reset()
     {
@@ -850,7 +926,17 @@ internal partial class RoutingViewModel : ViewModelBase
         RoutingLists.Clear();
         _shownEntries = new();
         HasRoutingLists = false;
-        SelectedRoutingListId = null;
+        _boundStatus = ConnectionStatus.Disconnected;
+        _requestedRouting = [];
+        _appliedRouting = [];
+        _multipleRouting = false;
+        _routingMode = string.Empty;
+        _routingAllUdp = false;
+        _routingPending = string.Empty;
+        _serverListsOf = string.Empty;
+        _serverLists = [];
+        RoutingChangeError = string.Empty;
+        MarkSelectedList();
         RoutingEditor = null;
         RoutingSettings = null;
         EditRoutingList = null;
@@ -931,15 +1017,13 @@ internal partial class RoutingViewModel : ViewModelBase
     /// <summary>
     /// Применяет список карточки или снимает применение, не открывая его настройки.
     /// </summary>
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanSelectCard))]
     private void SelectCard(RoutingListSummaryViewModel? item)
     {
-        if (item is null)
+        if (item is { Locked: false } && CanSelectCard())
         {
-            return;
+            _ = ToggleRoutingAsync(item.Id, !item.IsSelected);
         }
-
-        _ = AssignRoutingAsync(item.IsSelected ? null : item.Id);
     }
 
     /// <summary>
@@ -1033,12 +1117,13 @@ internal partial class RoutingViewModel : ViewModelBase
     // Отмечает в каталоге выбранный список и тот, по которому маршрутизация идёт на самом деле.
     private void MarkSelectedList()
     {
-        var live = string.Equals(_boundStatus, ConnectionStatus.Connected, StringComparison.Ordinal);
+        var allowedSelected = _requestedRouting.Count(_serverLists.Contains);
         foreach (var row in RoutingLists)
         {
-            row.IsSelected = SelectedRoutingListId is { } id && row.Id == id;
-            row.IsLive = row.IsSelected && live;
-            row.LockedBy = _serverListsOf.Length > 0 && (row.IsSelected || !_serverLists.Contains(row.Id)) ? _serverListsOf : string.Empty;
+            row.IsSelected = _requestedRouting.Contains(row.Id);
+            row.IsLive = _appliedRouting.Contains(row.Id);
+            row.LockedBy = HomeRoutingLocked && (!_serverLists.Contains(row.Id) || (row.IsSelected && allowedSelected <= 1))
+                ? _serverListsOf : string.Empty;
         }
 
         OnPropertyChanged(nameof(OpenListLocked));
@@ -1053,7 +1138,13 @@ internal partial class RoutingViewModel : ViewModelBase
         OnPropertyChanged(nameof(HomeRoutingOn));
         OnPropertyChanged(nameof(HomeRoutingList));
         OnPropertyChanged(nameof(HomeRoutingLocked));
+        OnPropertyChanged(nameof(CanChangeHomeRouting));
         OnPropertyChanged(nameof(HomeRoutingTip));
+        OnPropertyChanged(nameof(IsOpenListActive));
+        OnPropertyChanged(nameof(UseOpenList));
+        OnPropertyChanged(nameof(RoutingSummary));
+        OnPropertyChanged(nameof(RoutingPendingText));
+        OnPropertyChanged(nameof(RoutingSelectionHint));
     }
 
     // Landing on the Routing section with nothing open: open the list that routes so it never opens empty, and
@@ -1069,7 +1160,8 @@ internal partial class RoutingViewModel : ViewModelBase
     // The list every config routes by, else the one that did last, else the first in the catalogue.
     private RoutingListSummaryViewModel PreferredDefaultList()
     {
-        return CatalogueRow(SelectedRoutingListId) ?? CatalogueRow(_prefs.LastRoutingList) ?? RoutingLists[0];
+        return RoutingLists.FirstOrDefault(row => _requestedRouting.Contains(row.Id))
+            ?? CatalogueRow(_prefs.LastRoutingList) ?? RoutingLists[0];
     }
 
     // The catalogue row carrying this id, while it is still there.
@@ -2084,7 +2176,7 @@ internal partial class RoutingViewModel : ViewModelBase
         if (_assignAfterSave)
         {
             _assignAfterSave = false;
-            await AssignRoutingAsync(RoutingEditor.Id);
+            await ToggleRoutingAsync(RoutingEditor.Id, true);
         }
 
         IsCreatingSectionRouting = false;
@@ -2158,12 +2250,16 @@ internal partial class RoutingViewModel : ViewModelBase
             return;
         }
 
-        var deletedId = RoutingEditor.Id;
-
-        // Применённый список удаляется как любой другой: правила переходят на первый оставшийся, а без него снимаются.
-        if (SelectedRoutingListId == deletedId)
+        if (!_multipleRouting && IsOpenListActive)
         {
-            await AssignRoutingAsync(RoutingLists.FirstOrDefault(r => r.Id != deletedId)?.Id);
+            if (OpenListLocked)
+            {
+                RoutingDeleteStatus = OpenListLockTip ?? string.Empty;
+                return;
+            }
+
+            var fallback = RoutingLists.FirstOrDefault(row => row.Id != RoutingEditor.Id);
+            await ChangeRoutingAsync(new(RoutingSelectionChange.Replace, fallback is null ? [] : [fallback.Id]));
         }
 
         if (!await RoutingEditor.DeleteAsync())

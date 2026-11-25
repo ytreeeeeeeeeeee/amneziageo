@@ -3050,4 +3050,52 @@ an address is downloaded; Ctrl+Shift+V pastes from the terminal</value>
   <data name="Notice_StoppedChannel" xml:space="preserve">
     <value>Tunnel stopped</value>
   </data>
+  <data name="Main_RoutingSelectedCount" xml:space="preserve">
+    <value>Selected lists: {0}</value>
+  </data>
+  <data name="Main_RoutingAppliedCount" xml:space="preserve">
+    <value>Applied lists: {0}</value>
+  </data>
+  <data name="Main_RoutingReconnectPending" xml:space="preserve">
+    <value>Connect again to apply the routing changes.</value>
+  </data>
+  <data name="Main_RoutingMixedMode" xml:space="preserve">
+    <value>Different modes across tunnels</value>
+  </data>
+  <data name="Main_RoutingConfigMode" xml:space="preserve">
+    <value>Configuration routes</value>
+  </data>
+  <data name="Main_RoutingLegacyAgent" xml:space="preserve">
+    <value>This agent supports one routing list at a time.</value>
+  </data>
+  <data name="Main_RoutingChangeFailed" xml:space="preserve">
+    <value>Could not change the routing selection.</value>
+  </data>
+  <data name="Main_RoutingAllUdp" xml:space="preserve">
+    <value>All UDP through the tunnel</value>
+  </data>
+  <data name="Main_RoutingEnableList" xml:space="preserve">
+    <value>Enable list</value>
+  </data>
+  <data name="Main_RoutingDisableList" xml:space="preserve">
+    <value>Disable list</value>
+  </data>
+  <data name="Main_RoutingReplaceSelection" xml:space="preserve">
+    <value>Replace selection</value>
+  </data>
+  <data name="Main_RoutingSelectionIds" xml:space="preserve">
+    <value>List IDs separated by spaces, or none to turn routing off.</value>
+  </data>
+  <data name="Main_RoutingSelectionLegend" xml:space="preserve">
+    <value>* selected   + applied</value>
+  </data>
+  <data name="Main_RoutingSelectionTitle" xml:space="preserve">
+    <value>Routing selection</value>
+  </data>
+  <data name="Main_RoutingAppliedLabel" xml:space="preserve">
+    <value>Applied</value>
+  </data>
+  <data name="Main_RoutingReconnectAndroidPending" xml:space="preserve">
+    <value>Routing changes take effect when the VPN reconnects.</value>
+  </data>
 </root>

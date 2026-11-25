@@ -414,6 +414,8 @@ internal sealed class LinuxAgent : IDisposable
                 s.ProxyRuleCount, s.DirectRuleCount, s.BlockRuleCount, s.AllUdp, s.UseGlobalProxy, s.Source, s.HasUpdate, s.ReadOnly))
             .ToList();
         var limit = await ServerListsLimitAsync(ct).ConfigureAwait(false);
+        var requested = await _store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false) ?? [];
+        var applied = _tunnel.Running ? _tunnel.AppliedRouting : null;
         var (updateSources, updateSource) = _updater.Sources(await UpdateServersAsync(ct).ConfigureAwait(false));
 
         return new StatusSnapshot(
@@ -425,7 +427,7 @@ internal sealed class LinuxAgent : IDisposable
             BoundStatus: _boundStatus,
             RestartRequired: _restartRequired || _routingPending is not null || _tunnel.RoutingRecoveryRequired,
             SelectedTarget: _selectedTarget ?? string.Empty,
-            SelectedRoutingList: await _store.GetSelectedRoutingListAsync(ct).ConfigureAwait(false),
+            SelectedRoutingList: requested.Count == 0 ? null : requested[0],
             Sources: await BuildSourcesAsync(ct).ConfigureAwait(false),
             ConnectFailed: _connectFailed,
             LogLevel: _logLevel,
@@ -488,7 +490,12 @@ internal sealed class LinuxAgent : IDisposable
             DnsTransport: _dnsTransport,
             ServerListsOf: limit?.Config ?? string.Empty,
             ServerLists: limit?.Lists,
-            FoundApps: await AppFinds.ReadAsync(_store, ct).ConfigureAwait(false));
+            FoundApps: await AppFinds.ReadAsync(_store, ct).ConfigureAwait(false),
+            RequestedRoutingListIds: requested,
+            AppliedRoutingListIds: applied?.ListIds ?? [],
+            RoutingPolicyMode: applied is null ? string.Empty : StatusSnapshot.PolicyMode(applied.Split, applied.ListIds.Count > 0),
+            RoutingPolicyAllUdp: applied?.AllUdp == true,
+            RoutingPendingReason: _routingPending ?? string.Empty);
     }
 
     // One proxy setting on top of the ones in force.
@@ -915,6 +922,9 @@ internal sealed class LinuxAgent : IDisposable
 
             case IpcContract.OpAssignRouting:
                 return await AssignRoutingAsync(args, ct).ConfigureAwait(false);
+
+            case IpcContract.OpChangeRoutingSelection:
+                return await ChangeRoutingAsync(RoutingSelectionChange.Parse(args), ct).ConfigureAwait(false);
 
             case IpcContract.OpSetGeo:
                 return await SetGeoAsync(args, ct).ConfigureAwait(false);
@@ -1757,17 +1767,32 @@ internal sealed class LinuxAgent : IDisposable
             return NotFound(args[0]);
         }
 
-        if (ServerListsOnly.Refusal(await ServerListsLimitAsync(ct).ConfigureAwait(false), listId) is { } refusal)
+        return await ChangeRoutingAsync(new(RoutingSelectionChange.Replace, listId is long id ? [id] : []), ct).ConfigureAwait(false);
+    }
+
+    private async Task<IpcAck> ChangeRoutingAsync(RoutingSelectionChange? change, CancellationToken ct)
+    {
+        _log.Debug("routing", $"changing selection: {change?.Action}, {change?.Ids.Count ?? 0} ID(s)");
+        var (refusal, before, after) = await ServerListsOnly.ChangeSelectionAsync(_store,
+            await ServerListsLimitAsync(ct).ConfigureAwait(false), change, ct).ConfigureAwait(false);
+        if (refusal is not null)
         {
-            _log.Warn("agent", "the server restriction refused the routing list selection");
+            _log.Warn("routing", "the routing selection change was refused");
             return refusal;
         }
 
-        var currentList = await _store.GetSelectedRoutingListAsync(ct).ConfigureAwait(false);
-        Journal(SwitchLog.RoutingList(
-            await ListNameAsync(currentList, ct).ConfigureAwait(false),
-            await ListNameAsync(listId, ct).ConfigureAwait(false)));
-        await _store.SetSelectedRoutingListAsync(listId, ct).ConfigureAwait(false);
+        if (!before.SequenceEqual(after))
+        {
+            if (before.Count <= 1 && after.Count <= 1)
+            {
+                Journal(SwitchLog.RoutingList(
+                    await ListNameAsync(before.Count == 0 ? null : before[0], ct).ConfigureAwait(false),
+                    await ListNameAsync(after.Count == 0 ? null : after[0], ct).ConfigureAwait(false)));
+            }
+
+            _log.Info("routing", $"selection changed to {after.Count} list(s)");
+        }
+
         await ApplyRoutingAsync(ct).ConfigureAwait(false);
         await PushAsync(ct).ConfigureAwait(false);
         return Ok();

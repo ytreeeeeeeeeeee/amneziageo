@@ -58,13 +58,24 @@ internal static class StatusCommands
             ("tunnel", snapshot.Active ? "up" : "down"),
             ("bound to", snapshot.BoundTarget ?? "-"),
             ("selected", snapshot.SelectedTarget ?? "-"),
-            ("routing", RoutingLabel(snapshot)),
+            ("routing", RoutingLabel(snapshot, snapshot.RequestedRoutingIds())),
             ("names", NameLine(snapshot)),
             ("survive reboot", snapshot.SurviveReboot ? "on" : "off"),
             ("auto reconnect", Reconnect(snapshot)),
             ("hold traffic", Hold(snapshot)),
             ("log level", snapshot.LogLevel),
         };
+
+        if (snapshot.RequestedRoutingListIds is not null)
+        {
+            pairs.Add(("routing applied", RoutingLabel(snapshot, snapshot.AppliedRoutingIds())));
+            pairs.Add(("routing mode", snapshot.EffectiveRoutingMode()));
+            pairs.Add(("routing all UDP", snapshot.EffectiveRoutingAllUdp() ? "on" : "off"));
+            if (snapshot.RoutingPendingReason.Length > 0)
+            {
+                pairs.Add(("routing pending", AckText.Localize(snapshot.RoutingPendingReason)));
+            }
+        }
 
         if (snapshot.ConnectFailed)
         {
@@ -140,16 +151,9 @@ internal static class StatusCommands
         return entry.Config.Length > 0 ? $"{entry.Key} ({entry.Host}, {entry.Config})" : $"{entry.Key} ({entry.Host})";
     }
 
-    private static string RoutingLabel(StatusSnapshot snapshot)
-    {
-        if (snapshot.SelectedRoutingList is not { } id)
-        {
-            return "off";
-        }
-
-        var list = snapshot.RoutingLists?.FirstOrDefault(entry => entry.Id == id);
-        return list?.Name ?? id.ToString(CultureInfo.InvariantCulture);
-    }
+    internal static string RoutingLabel(StatusSnapshot snapshot, IReadOnlyList<long> ids) =>
+        ids.Count == 0 ? "off" : string.Join(", ", ids.Select(id =>
+            snapshot.RoutingLists?.FirstOrDefault(entry => entry.Id == id)?.Name ?? id.ToString(CultureInfo.InvariantCulture)));
 
     private static async Task<int> UpAsync(IAgentLink agent, IReadOnlyList<string> args)
     {

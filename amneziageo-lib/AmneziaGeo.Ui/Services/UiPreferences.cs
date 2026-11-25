@@ -66,6 +66,8 @@ internal sealed class UiPreferences
     /// </summary>
     public long LastRoutingList { get; set; }
 
+    public IReadOnlyList<long> LastRoutingLists { get; set; } = [];
+
     /// <summary>
     /// Whether the home button leads to the system always-on screen instead of dialling.
     /// </summary>
@@ -190,6 +192,7 @@ internal sealed class UiPreferences
             ["language"] = Language,
             ["last-config"] = LastConfig,
             ["last-routing-list"] = LastRoutingList.ToString(CultureInfo.InvariantCulture),
+            ["last-routing-lists"] = string.Join(",", LastRoutingLists.Select(id => id.ToString(CultureInfo.InvariantCulture))),
             ["always-on-mode"] = AlwaysOnMode ? "1" : "0",
             ["routing-warnings"] = RoutingWarnings ? "1" : "0",
             ["preset-regions"] = PresetRegions,
@@ -302,6 +305,12 @@ internal sealed class UiPreferences
             && long.TryParse(lastList, NumberStyles.Integer, CultureInfo.InvariantCulture, out var listId))
         {
             prefs.LastRoutingList = listId;
+        }
+
+        if (values.TryGetValue("last-routing-lists", out var lastLists)
+            && RoutingListIds.Parse(lastLists.Split(',', StringSplitOptions.RemoveEmptyEntries)) is { } ids)
+        {
+            prefs.LastRoutingLists = ids.Where(id => id > 0).Distinct().ToArray();
         }
 
         if (values.TryGetValue("accepted-terms", out var acceptedTerms)

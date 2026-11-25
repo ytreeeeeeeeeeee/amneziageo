@@ -27,7 +27,8 @@
         controls:FileDropBehavior.Command="{Binding DropFilesCommand}">
 
     <!-- Заголовок раздела: стоит и над каталогом, и над экранами открытого списка. -->
-    <WrapPanel Grid.Row="0" ItemSpacing="10" LineSpacing="4">
+    <StackPanel Grid.Row="0" Spacing="4">
+      <WrapPanel ItemSpacing="10" LineSpacing="4">
       <TextBlock Classes="section" Text="{l:Tr Main_RoutingSection}" VerticalAlignment="Center" />
       <!-- Режим открытого списка. -->
       <Border Classes="cardbadge" IsVisible="{Binding ShowListMode}">
@@ -49,7 +50,16 @@
           <TextBlock Text="{l:Tr Main_CardTagUpdate}" FontSize="12" FontWeight="SemiBold" />
         </Border>
       </Button>
-    </WrapPanel>
+      </WrapPanel>
+      <TextBlock Text="{Binding RoutingSummary}" Classes="muted" FontSize="12" TextWrapping="Wrap"
+                 IsVisible="{Binding HasRoutingLists}" />
+      <TextBlock Text="{Binding RoutingSelectionHint}" Classes="muted" FontSize="12" TextWrapping="Wrap"
+                 IsVisible="{Binding RoutingSelectionHint, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+      <TextBlock Text="{Binding RoutingPendingText}" Classes="fieldwarn" FontSize="12" TextWrapping="Wrap"
+                 IsVisible="{Binding RoutingPendingText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+      <TextBlock Text="{Binding RoutingChangeError}" Classes="fieldwarn" FontSize="12" TextWrapping="Wrap"
+                 IsVisible="{Binding RoutingChangeError, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+    </StackPanel>
 
     <!-- Шапка каталога: добавление списка маршрутизации. Способ выбирается плитками на экране ниже. -->
     <StackPanel x:Name="CatalogueHeader" Grid.Row="1" Margin="0,14,0,0" Spacing="8"
@@ -146,6 +156,7 @@
                            TextWrapping="Wrap" VerticalAlignment="Center" />
                 <ToggleSwitch Grid.Column="1" MinWidth="0" VerticalAlignment="Center"
                               IsChecked="{Binding UseOpenList, Mode=TwoWay}" Classes.locked="{Binding OpenListLocked}"
+                              IsEnabled="{Binding !ChangingRouting}"
                               ToolTip.Tip="{Binding OpenListLockTip}" />
               </Grid>
 

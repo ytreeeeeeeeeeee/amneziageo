@@ -332,9 +332,13 @@
                       </Button>
                       <ToggleSwitch Grid.Column="1" VerticalAlignment="Center"
                                     IsChecked="{Binding Routing.HomeRoutingOn, Mode=TwoWay}"
-                                    IsEnabled="{Binding !Routing.HomeRoutingLocked}"
+                                    IsEnabled="{Binding Routing.CanChangeHomeRouting}"
                                     ToolTip.Tip="{Binding Routing.HomeRoutingTip}" ToolTip.ShowOnDisabled="True" />
                     </Grid>
+                    <TextBlock Text="{Binding Routing.RoutingPendingText}" Classes="fieldwarn" FontSize="12" TextWrapping="Wrap"
+                               IsVisible="{Binding Routing.RoutingPendingText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                    <TextBlock Text="{Binding Routing.RoutingChangeError}" Classes="fieldwarn" FontSize="12" TextWrapping="Wrap"
+                               IsVisible="{Binding Routing.RoutingChangeError, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
                   </StackPanel>
                 </StackPanel>
               </ScrollViewer>

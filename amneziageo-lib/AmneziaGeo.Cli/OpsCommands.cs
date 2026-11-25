@@ -30,6 +30,7 @@ internal static class OpsCommands
         [IpcContract.OpSetHoldTraffic] = "config hold",
         [IpcContract.OpSetGeo] = "config geo",
         [IpcContract.OpAssignRouting] = "routing use",
+        [IpcContract.OpChangeRoutingSelection] = "routing enable / disable / replace",
         [IpcContract.OpSaveRoutingList] = "routing create / set / add",
         [IpcContract.OpGetRoutingList] = "routing show",
         [IpcContract.OpRemoveRoutingList] = "routing remove",
@@ -308,7 +309,7 @@ internal static class OpsCommands
 
     // Operations that need no arguments to do their work: sending them is not a probe but the act itself.
     private static bool Skipped(string op) =>
-        op is IpcContract.OpSetConnection or IpcContract.OpSelectConfig or IpcContract.OpAssignRouting or IpcContract.OpLogClient
+        op is IpcContract.OpSetConnection or IpcContract.OpSelectConfig or IpcContract.OpAssignRouting or IpcContract.OpChangeRoutingSelection or IpcContract.OpLogClient
             or IpcContract.OpUpdateSources or IpcContract.OpUpdateSource
             or IpcContract.OpDownloadGeo or IpcContract.OpCollectDiagnostics or IpcContract.OpClearLog
             or IpcContract.OpAddConfig or IpcContract.OpImportConfig or IpcContract.OpEditConfig

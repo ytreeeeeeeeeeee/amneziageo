@@ -305,17 +305,14 @@ internal sealed class Shell : Window
             Action(Localized("Tui_Refresh"), Refresh));
     }
 
-    // The globally selected routing list, or the off label when none is picked.
     private string RoutingLabel(StatusSnapshot snapshot)
     {
-        if (snapshot.SelectedRoutingList is not { } id)
-        {
-            return Localized("Main_RoutingOffState");
-        }
-
-        var list = snapshot.RoutingLists?.FirstOrDefault(entry => entry.Id == id);
-        return list?.Name ?? id.ToString(CultureInfo.InvariantCulture);
+        var ids = snapshot.RequestedRoutingIds();
+        return ids.Count == 0 ? Localized("Main_RoutingOffState") : RoutingNames(snapshot, ids);
     }
+
+    private static string RoutingNames(StatusSnapshot snapshot, IReadOnlyList<long> ids) => string.Join(", ", ids.Select(id =>
+        snapshot.RoutingLists?.FirstOrDefault(entry => entry.Id == id)?.Name ?? id.ToString(CultureInfo.InvariantCulture)));
 
     private View Configs()
     {
@@ -435,21 +432,32 @@ internal sealed class Shell : Window
     {
         var snapshot = _agent.Snapshot;
         var lists = snapshot.RoutingLists ?? [];
+        var requested = snapshot.RequestedRoutingIds();
+        var applied = snapshot.AppliedRoutingIds();
         var list = Rows([.. lists.Select(entry =>
-            $"{(entry.Id == snapshot.SelectedRoutingList ? "*" : " ")} #{entry.Id.ToString(CultureInfo.InvariantCulture)} {entry.Name}  {entry.RuleCount.ToString(CultureInfo.InvariantCulture)} / {entry.RouteCount.ToString(CultureInfo.InvariantCulture)} / {entry.DomainCount.ToString(CultureInfo.InvariantCulture)}")]);
+            $"{(requested.Contains(entry.Id) ? "*" : " ")}{(applied.Contains(entry.Id) ? "+" : " ")} #{entry.Id.ToString(CultureInfo.InvariantCulture)} {entry.Name}  {entry.RuleCount.ToString(CultureInfo.InvariantCulture)} / {entry.RouteCount.ToString(CultureInfo.InvariantCulture)} / {entry.DomainCount.ToString(CultureInfo.InvariantCulture)}")]);
 
         RoutingListEntry? Current() => Pick(list, lists);
 
         return Panel(
             list,
-            Action(Localized("Tui_Select"), () =>
+            Action(Localized("Main_RoutingEnableList"), () =>
             {
-                if (Current() is { } entry)
+                if (Current() is { } entry && !requested.Contains(entry.Id))
                 {
-                    Apply(Send(IpcContract.OpAssignRouting, entry.Id.ToString(CultureInfo.InvariantCulture)));
+                    ChangeSelection(snapshot, new(RoutingSelectionChange.Add, [entry.Id]));
                 }
             }),
-            Action(Localized("Main_RoutingOffButton"), () => Apply(Send(IpcContract.OpAssignRouting, "none"))),
+            Action(Localized("Main_RoutingDisableList"), () =>
+            {
+                if (Current() is { } entry && requested.Contains(entry.Id))
+                {
+                    ChangeSelection(snapshot, new(RoutingSelectionChange.Remove, [entry.Id]));
+                }
+            }),
+            Action(Localized("Main_RoutingReplaceSelection"), () => ReplaceSelection(snapshot)),
+            Action(Localized("Main_RoutingOffButton"), () => ChangeSelection(snapshot, new(RoutingSelectionChange.Replace, []))),
+            Action(Localized("Main_RoutingSelectionTitle"), () => ShowSelection(snapshot)),
             Action(Localized("Tui_Rules"), () =>
             {
                 if (Current() is { } entry)
@@ -471,6 +479,61 @@ internal sealed class Shell : Window
                     Apply(Send(IpcContract.OpRemoveRoutingList, entry.Id.ToString(CultureInfo.InvariantCulture)));
                 }
             }));
+    }
+
+    private void ChangeSelection(StatusSnapshot snapshot, RoutingSelectionChange change)
+    {
+        if (snapshot.RequestedRoutingListIds is null && change.Ids.Count > 1)
+        {
+            Prompt.Error(Localized("Main_RoutingLegacyAgent"));
+            return;
+        }
+
+        var command = snapshot.RequestedRoutingListIds is null ? change.LegacyCommand() : change.Command();
+        Apply(Send(command.Op, [.. command.Args]));
+    }
+
+    private void ReplaceSelection(StatusSnapshot snapshot)
+    {
+        var initial = string.Join(" ", snapshot.RequestedRoutingIds().Select(id => id.ToString(CultureInfo.InvariantCulture)));
+        if (Prompt.Line(Localized("Main_RoutingReplaceSelection"), Localized("Main_RoutingSelectionIds"), initial) is not { } text)
+        {
+            return;
+        }
+
+        var words = text.Equals("none", StringComparison.OrdinalIgnoreCase) ? []
+            : text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (RoutingSelectionChange.Parse([RoutingSelectionChange.Replace, .. words]) is not { } change)
+        {
+            Prompt.Error(Localized("Main_RoutingChangeFailed"));
+            return;
+        }
+
+        ChangeSelection(snapshot, change);
+    }
+
+    private static void ShowSelection(StatusSnapshot snapshot)
+    {
+        var requested = snapshot.RequestedRoutingIds();
+        var applied = snapshot.AppliedRoutingIds();
+        var lines = new[]
+        {
+            Localized("Main_RoutingSelectionLegend"),
+            Loc.Instance.Get("Main_RoutingSelectedCount", requested.Count) + "  " + RoutingNames(snapshot, requested),
+            Loc.Instance.Get("Main_RoutingAppliedCount", applied.Count) + "  " + RoutingNames(snapshot, applied),
+            Localized(snapshot.EffectiveRoutingMode() switch
+            {
+                "split" => "Main_VpnModeSelected",
+                "full" => "Main_VpnModeFull",
+                "mixed" => "Main_RoutingMixedMode",
+                _ => "Main_RoutingConfigMode",
+            }),
+            snapshot.EffectiveRoutingAllUdp() ? Localized("Main_RoutingAllUdp") : string.Empty,
+            snapshot.ServerListsOf.Length > 0 ? Loc.Instance.Get("Main_ServerListsOnlyOf", snapshot.ServerListsOf) : string.Empty,
+            snapshot.RequestedRoutingListIds is null ? Localized("Main_RoutingLegacyAgent") : string.Empty,
+            AckText.Localize(snapshot.RoutingPendingReason),
+        };
+        Prompt.View(Localized("Main_RoutingSelectionTitle"), string.Join(Environment.NewLine, lines.Where(line => line.Length > 0)));
     }
 
     private void EditRules(RoutingListEntry entry)

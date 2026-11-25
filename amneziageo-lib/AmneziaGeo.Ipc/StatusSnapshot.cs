@@ -242,4 +242,38 @@ public sealed record StatusSnapshot(
     /// <summary>
     /// The SHA-256 of the certificate the server of the setup answers under, empty where the machine proves it.
     /// </summary>
-    string UpdateSetupPin = "");
+    string UpdateSetupPin = "",
+
+    // Null denotes a snapshot from a legacy single-list agent.
+    IReadOnlyList<long>? RequestedRoutingListIds = null,
+    IReadOnlyList<long>? AppliedRoutingListIds = null,
+    string RoutingPolicyMode = "",
+    bool RoutingPolicyAllUdp = false,
+    string RoutingPendingReason = "")
+{
+    public IReadOnlyList<long> RequestedRoutingIds() => RequestedRoutingListIds
+        ?? (SelectedRoutingList is long id ? [id] : []);
+
+    public IReadOnlyList<long> AppliedRoutingIds() => AppliedRoutingListIds
+        ?? (RequestedRoutingListIds is null && !RestartRequired && BoundStatus == ConnectionStatus.Connected ? RequestedRoutingIds() : []);
+
+    public string EffectiveRoutingMode()
+    {
+        if (RoutingPolicyMode.Length > 0)
+        {
+            return RoutingPolicyMode;
+        }
+
+        var ids = RequestedRoutingIds();
+        return PolicyMode(RoutingLists?.Any(list => ids.Contains(list.Id) && list.UseGlobalProxy) != true, ids.Count > 0);
+    }
+
+    public bool EffectiveRoutingAllUdp()
+    {
+        var ids = RequestedRoutingIds();
+        return RoutingPolicyMode.Length > 0 ? RoutingPolicyAllUdp
+            : RoutingLists?.Any(list => ids.Contains(list.Id) && list.AllUdp) == true;
+    }
+
+    public static string PolicyMode(bool split, bool usesLists) => usesLists ? (split ? "split" : "full") : "config";
+}

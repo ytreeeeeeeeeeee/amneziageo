@@ -142,7 +142,11 @@ public static class CliRunner
 
             routing lists
               routing list
-              routing use <id|name|none>
+              routing use <id|name|none>               replace with one list or clear selection
+              routing selection                       show requested and applied lists
+              routing enable <id|name>                add one list to the selection
+              routing disable <id|name>               remove one list from the selection
+              routing replace <id|name> ... | none    replace the selected set
               routing show <id|name>
               routing create <name> [rule...]
               routing set <id|name> [rule...]       replace every rule

@@ -69,6 +69,30 @@ public sealed class WindowsRoutingProjectionTests : IAsyncLifetime
         Assert.Null(await _store.GetTunnelRoutingProjectionAsync("alpha"));
     }
 
+    [Fact]
+    public async Task PreparedProjectionDoesNotReplaceConfirmedRoutingForAnotherAttempt()
+    {
+        var roster = new TunnelDutyRoster();
+        var first = await AddAsync("First", "proxy|cidr:203.0.113.0/24");
+        var second = await AddAsync("Second", "proxy|cidr:192.0.2.0/24");
+        var running = new AgentControl();
+        var connecting = new AgentControl();
+
+        await _store.SetSelectedRoutingListAsync(first);
+        await PublishAsync(roster);
+        running.AppliedRouting = await _store.GetTunnelRoutingProjectionAsync("alpha");
+
+        await _store.SetSelectedRoutingListAsync(second);
+        connecting.SetRunning(true);
+        await PublishAsync(roster);
+        var prepared = Assert.IsType<TunnelRoutingProjection>(await _store.GetTunnelRoutingProjectionAsync("alpha"));
+
+        Assert.True(connecting.Running);
+        Assert.Null(connecting.AppliedRouting);
+        Assert.Equal([first], running.AppliedRouting!.ListIds);
+        Assert.Equal([second], prepared.ListIds);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]

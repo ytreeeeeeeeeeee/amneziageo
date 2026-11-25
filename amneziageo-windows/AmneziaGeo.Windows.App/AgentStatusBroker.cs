@@ -277,6 +277,7 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
                 IpcContract.OpSetRoutingSettings => await OfferedLists.ReadOnlyRefusalAsync(store, command.Args, ct) ?? await SetRoutingSettingsAsync(command.Args, ct),
                 IpcContract.OpGetRoutingSettings => await GetRoutingSettingsAsync(command.Args, ct),
                 IpcContract.OpAssignRouting => await AssignRoutingAsync(command.Args, ct),
+                IpcContract.OpChangeRoutingSelection => await ChangeRoutingAsync(RoutingSelectionChange.Parse(command.Args), ct),
                 IpcContract.OpSetConnection => await SetConnectionAsync(command.Args, ct),
                 IpcContract.OpSetSetting => await SetSettingAsync(command.Args, ct),
                 IpcContract.OpSelectConfig => await SelectConfigAsync(command.Args, ct),
@@ -1392,6 +1393,9 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
     /// </summary>
     protected virtual TunnelDutyRoster Roster => roster;
 
+    protected virtual IReadOnlyList<TunnelRoutingProjection> AppliedRouting() =>
+        control.AppliedRouting is { } projection ? [projection] : [];
+
     /// <summary>
     /// Asks the tunnel of one configuration for a reconnect.
     /// </summary>
@@ -2065,29 +2069,41 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
             listId = id;
         }
 
-        if (ServerListsOnly.Refusal(await ServerListsLimitAsync(ct).ConfigureAwait(false), listId) is { } refusal)
+        var result = await ChangeRoutingAsync(new(RoutingSelectionChange.Replace, listId is long picked ? [picked] : []), ct);
+        return result.Ok ? new IpcAck(true, $"routing: {listId?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "none"} (applies on reconnect)") : result;
+    }
+
+    private async Task<IpcAck> ChangeRoutingAsync(RoutingSelectionChange? change, CancellationToken ct)
+    {
+        logger.LogDebug("Changing routing selection: {Action}, {Count} ID(s)", change?.Action, change?.Ids.Count ?? 0);
+        var (refusal, before, after) = await ServerListsOnly.ChangeSelectionAsync(store,
+            await ServerListsLimitAsync(ct).ConfigureAwait(false), change, ct).ConfigureAwait(false);
+        if (refusal is not null)
         {
-            logger.LogWarning("The server restriction refused the routing list selection");
+            logger.LogWarning("The routing selection change was refused");
             return refusal;
         }
 
-        IReadOnlyList<long> next = listId is long idToSelect ? [idToSelect] : [];
-        IReadOnlyList<long>? previous = null;
-        await store.UpdateSelectedRoutingListsAsync(current =>
+        if (!before.SequenceEqual(after))
         {
-            previous = current;
-            return next;
-        }, ct).ConfigureAwait(false);
-        var currentList = previous is { Count: > 0 } ? previous[0] : (long?)null;
-        Journal(SwitchLog.RoutingList(await ListNameAsync(currentList, ct), await ListNameAsync(listId, ct)));
-        if (!(previous ?? []).SequenceEqual(next) && RunningMembers().Count > 0)
-        {
-            // Routing applies on a fresh tunnel; flag a restart instead of re-applying live.
-            MarkRestartRequired();
+            if (before.Count <= 1 && after.Count <= 1)
+            {
+                Journal(SwitchLog.RoutingList(await ListNameAsync(before.Count == 0 ? null : before[0], ct),
+                    await ListNameAsync(after.Count == 0 ? null : after[0], ct)));
+            }
+
+            foreach (var member in RunningMembers())
+            {
+                if (await ConfigRouting.AllowedAsync(store, member, ct).ConfigureAwait(false))
+                {
+                    MarkRestartRequired(member);
+                }
+            }
+
+            logger.LogInformation("Routing selection changed to {Count} list(s)", after.Count);
         }
 
-        logger.LogInformation("routing list {List} now applies to every configuration; with none picked, all traffic goes through the tunnel", listId);
-        return new IpcAck(true, $"routing: {listId?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "none"} (applies on reconnect)");
+        return new IpcAck(true, $"routing: {after.Count} list(s)");
     }
 
     // Keeps a switchover in the log whatever the capture floor is: it is what a support thread reads first.
@@ -3333,9 +3349,15 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         // The live connection view belongs to the tunnel owner; other users see their own idle library.
         var owned = activeScope.IsOwnedBy(scope.UserRoot, scope.Sid);
         var selectedTarget = await store.GetSettingAsync(AgentControl.SelectedTargetKey, ct) ?? string.Empty;
-        var selectedRouting = await store.GetSelectedRoutingListAsync(ct);
+        var requestedRouting = await store.GetSelectedRoutingListsAsync(ct) ?? [];
+        var selectedRouting = requestedRouting.Count == 0 ? (long?)null : requestedRouting[0];
         var boundTarget = owned ? BoundTarget : null;
-        var limit = owned ? await ServerListsOnly.FirstAsync(store, RunningMembers(), ct).ConfigureAwait(false) : null;
+        var runningMembers = owned ? RunningMembers() : [];
+        var limit = await ServerListsOnly.FirstAsync(store, runningMembers, ct).ConfigureAwait(false);
+        var installedRouting = owned ? AppliedRouting() : [];
+        var appliedRouting = installedRouting.SelectMany(projection => projection.ListIds).Distinct().Order().ToArray();
+        var modes = installedRouting.Select(projection =>
+            StatusSnapshot.PolicyMode(projection.Split, projection.ListIds.Count > 0)).Distinct().ToArray();
         var foundApps = await AppFinds.ReadAsync(store, ct).ConfigureAwait(false);
 
         // Derive each config's status from the bound tunnel's state alone.
@@ -3421,7 +3443,7 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         var installing = downloadedForCurrent && updateState.DownloadPhase == UpdateDownloadPhase.Installing;
         var connectFailed = owned && control.ConnectFailed;
         var disconnectFailed = owned && control.DisconnectFailed;
-        return Describe(new StatusSnapshot(Version(), boundTarget, configs, routingLists, owned && control.Running, boundStatus, owned && control.RestartRequired, selectedTarget, selectedRouting, sources,
+        var snapshot = Describe(new StatusSnapshot(Version(), boundTarget, configs, routingLists, owned && control.Running, boundStatus, owned && control.RestartRequired, selectedTarget, selectedRouting, sources,
             settings.UpdateUrl,
             update?.Available ?? false,
             update?.Version ?? string.Empty,
@@ -3499,7 +3521,16 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
             UpdateSource: updateRoute.Key,
             UpdateSourceError: updateFault.Text,
             UpdateSourceErrorSince: updateFault.Since,
-            UpdateSetupPin: update?.Route?.Pin ?? string.Empty), scope, states);
+            UpdateSetupPin: update?.Route?.Pin ?? string.Empty,
+            RequestedRoutingListIds: requestedRouting,
+            AppliedRoutingListIds: appliedRouting,
+            RoutingPolicyMode: modes.Length > 1 ? "mixed" : modes.FirstOrDefault() ?? string.Empty,
+            RoutingPolicyAllUdp: installedRouting.Any(projection => projection.Settings?.AllUdp == true)), scope, states);
+        var routingInUse = appliedRouting.Length > 0
+            || configs.Any(config => config.UseRouting && runningMembers.Contains(config.Name));
+        return snapshot.RestartRequired && routingInUse
+            ? snapshot with { RoutingPendingReason = IpcMessage.Key("Main_RoutingReconnectPending") }
+            : snapshot;
     }
 
     /// <summary>

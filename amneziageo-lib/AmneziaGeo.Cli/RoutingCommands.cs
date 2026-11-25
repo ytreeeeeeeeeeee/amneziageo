@@ -16,7 +16,7 @@ internal static class RoutingCommands
     {
         if (args.Count == 0)
         {
-            return Reply.Usage("usage: amneziageo routing <list|use|show|create|set|add|delete-rule|remove|update|order|settings|configure>");
+            return Reply.Usage("usage: amneziageo routing <list|selection|use|enable|disable|replace|show|create|set|add|delete-rule|remove|update|order|settings|configure>");
         }
 
         var rest = (IReadOnlyList<string>)[.. args.Skip(1)];
@@ -24,6 +24,10 @@ internal static class RoutingCommands
         {
             "list" => List(agent),
             "use" => await UseAsync(agent, rest).ConfigureAwait(false),
+            "selection" when rest.Count == 0 => Selection(agent.Snapshot),
+            "enable" => await ChangeSelectionAsync(agent, rest, RoutingSelectionChange.Add).ConfigureAwait(false),
+            "disable" => await ChangeSelectionAsync(agent, rest, RoutingSelectionChange.Remove).ConfigureAwait(false),
+            "replace" => await ChangeSelectionAsync(agent, rest, RoutingSelectionChange.Replace).ConfigureAwait(false),
             "show" => await ShowAsync(agent, rest).ConfigureAwait(false),
             "create" => await CreateAsync(agent, rest).ConfigureAwait(false),
             "set" => await SetAsync(agent, rest).ConfigureAwait(false),
@@ -58,6 +62,72 @@ internal static class RoutingCommands
         }
 
         return Reply.Report(await agent.SendAsync(IpcContract.OpAssignRouting, listId).ConfigureAwait(false));
+    }
+
+    private static int Selection(StatusSnapshot snapshot)
+    {
+        if (Output.Json)
+        {
+            Output.AsJson(new
+            {
+                Requested = snapshot.RequestedRoutingIds(),
+                Applied = snapshot.AppliedRoutingIds(),
+                Mode = snapshot.EffectiveRoutingMode(),
+                AllUdp = snapshot.EffectiveRoutingAllUdp(),
+                Pending = AckText.Localize(snapshot.RoutingPendingReason),
+                MultipleLists = snapshot.RequestedRoutingListIds is not null,
+            });
+        }
+        else
+        {
+            Output.Info($"selected: {StatusCommands.RoutingLabel(snapshot, snapshot.RequestedRoutingIds())}");
+            Output.Info($"applied: {StatusCommands.RoutingLabel(snapshot, snapshot.AppliedRoutingIds())}");
+            Output.Info($"mode: {snapshot.EffectiveRoutingMode()}, all UDP: {(snapshot.EffectiveRoutingAllUdp() ? "on" : "off")}");
+            if (snapshot.RoutingPendingReason.Length > 0)
+            {
+                Output.Info(AckText.Localize(snapshot.RoutingPendingReason));
+            }
+            if (snapshot.RequestedRoutingListIds is null)
+            {
+                Output.Info(AckText.Localize(IpcMessage.Key("Main_RoutingLegacyAgent")));
+            }
+        }
+
+        return Exit.Ok;
+    }
+
+    private static async Task<int> ChangeSelectionAsync(IAgentLink agent, IReadOnlyList<string> args, string action)
+    {
+        var replace = action == RoutingSelectionChange.Replace;
+        if (args.Count == 0 || (!replace && args.Count != 1))
+        {
+            var usage = action == RoutingSelectionChange.Add ? "enable <id|name>"
+                : replace ? "replace <id|name> ... | none" : "disable <id|name>";
+            return Reply.Usage($"usage: amneziageo routing {usage}");
+        }
+
+        var ids = new List<long>();
+        if (!(replace && args.Count == 1 && args[0].Equals("none", StringComparison.OrdinalIgnoreCase)))
+        {
+            foreach (var key in args)
+            {
+                if (Resolve(agent, key) is not { } list)
+                {
+                    return Exit.Usage;
+                }
+
+                ids.Add(list.Id);
+            }
+        }
+
+        var change = new RoutingSelectionChange(action, ids);
+        if (agent.Snapshot.RequestedRoutingListIds is null && (!replace || ids.Count > 1))
+        {
+            return Reply.Usage(AckText.Localize(IpcMessage.Key("Main_RoutingLegacyAgent")));
+        }
+
+        var command = agent.Snapshot.RequestedRoutingListIds is null ? change.LegacyCommand() : change.Command();
+        return Reply.Report(await agent.SendAsync(command.Op, [.. command.Args]).ConfigureAwait(false), "routing selection saved");
     }
 
     // Sets the order of the catalogue: each list by id or name, sent on as ids.
@@ -145,6 +215,8 @@ internal static class RoutingCommands
             return Exit.Ok;
         }
 
+        var requested = agent.Snapshot.RequestedRoutingIds();
+        var applied = agent.Snapshot.AppliedRoutingIds();
         var rows = lists
             .Select(list => (IReadOnlyList<string>)
             [
@@ -156,10 +228,12 @@ internal static class RoutingCommands
                 list.Source.Length > 0 ? list.Source : "local",
                 list.HasUpdate ? "yes" : "-",
                 list.ReadOnly ? "yes" : "-",
+                requested.Contains(list.Id) ? "yes" : "-",
+                applied.Contains(list.Id) ? "yes" : "-",
             ])
             .ToList();
 
-        Output.Table(["ID", "NAME", "RULES", "ROUTES", "DOMAINS", "SOURCE", "UPDATE", "READ-ONLY"], rows, "no routing lists yet");
+        Output.Table(["ID", "NAME", "RULES", "ROUTES", "DOMAINS", "SOURCE", "UPDATE", "READ-ONLY", "SELECTED", "APPLIED"], rows, "no routing lists yet");
         if (agent.Snapshot.ServerListsOf is { Length: > 0 } config)
         {
             var ids = string.Join(", ", (agent.Snapshot.ServerLists ?? []).Select(id => id.ToString(CultureInfo.InvariantCulture)));
@@ -335,7 +409,7 @@ internal static class RoutingCommands
             return Exit.Usage;
         }
 
-        if (agent.Snapshot.SelectedRoutingList == list.Id)
+        if (agent.Snapshot.RequestedRoutingListIds is null && agent.Snapshot.SelectedRoutingList == list.Id)
         {
             return Reply.Usage($"'{list.Name}' is the one in use; pick another with 'routing use' first");
         }

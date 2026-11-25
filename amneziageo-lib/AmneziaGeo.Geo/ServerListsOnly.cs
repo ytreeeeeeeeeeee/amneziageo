@@ -103,6 +103,35 @@ public static class ServerListsOnly
     public static IpcAck? RefusalOfSet(ListsLimit? limit, IReadOnlyList<long> ids) =>
         limit is null || limit.AllowsSet(ids) ? null : Refused(limit);
 
+    /// <summary>Validates and applies an IPC selection change against the latest stored choice.</summary>
+    public static async Task<(IpcAck? Refusal, IReadOnlyList<long> Before, IReadOnlyList<long> After)> ChangeSelectionAsync(
+        IStateStore store, ListsLimit? limit, RoutingSelectionChange? change, CancellationToken ct = default)
+    {
+        if (change is null)
+        {
+            return (new IpcAck(false, "invalid routing selection action or list ID"), [], []);
+        }
+
+        IReadOnlyList<long> before = [];
+        IpcAck? refusal = null;
+        try
+        {
+            var after = await store.UpdateSelectedRoutingListsAsync(current =>
+            {
+                before = current ?? [];
+                var next = change.Apply(before);
+                refusal = RefusalOfSet(limit, next);
+                return refusal is not null || (change.Action != RoutingSelectionChange.Replace && before.SequenceEqual(next))
+                    ? null : next;
+            }, ct).ConfigureAwait(false);
+            return (refusal, before, after ?? []);
+        }
+        catch (InvalidOperationException)
+        {
+            return (new IpcAck(false, "the routing selection contains an unknown or invalid list"), before, before);
+        }
+    }
+
     /// <summary>Removes a list without racing another change to the selected set.</summary>
     public static async Task<IpcAck?> RemoveAsync(IStateStore store, ListsLimit? limit, long id, CancellationToken ct)
     {

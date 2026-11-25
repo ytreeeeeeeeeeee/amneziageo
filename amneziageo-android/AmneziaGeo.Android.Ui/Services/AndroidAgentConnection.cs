@@ -503,6 +503,9 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             case IpcContract.OpAssignRouting:
                 return await AssignRoutingAsync(args).ConfigureAwait(false);
 
+            case IpcContract.OpChangeRoutingSelection:
+                return await ChangeRoutingAsync(RoutingSelectionChange.Parse(args)).ConfigureAwait(false);
+
             case IpcContract.OpAddSource:
                 return await AddSourceAsync(args);
 
@@ -1685,6 +1688,16 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         LogProxyOffer(proxy.Running, reach);
         var (updateSources, updateSource) = _updater.Sources();
 
+        var requested = Volatile.Read(ref _routingSelection) ?? [];
+        var applied = Volatile.Read(ref _appliedRequest)?.Plan;
+        var routingPending = string.Empty;
+        if (_restartRequired || (applied is not null && !requested.SequenceEqual(applied.ListIds)
+            && ConfigRouting.Allowed(_transports.GetValueOrDefault(_boundTarget ?? string.Empty))))
+        {
+            routingPending = _connectFailed && _connectFailReason == nameof(ConnectFailureReason.TunnelSetupFailed)
+                && _connectFailDetail.Length > 0 ? _connectFailDetail : IpcMessage.Key("Main_RoutingReconnectAndroidPending");
+        }
+
         var activeChanged = Latest?.Active != _active;
         Latest = new StatusSnapshot(
             AgentVersion: AppVersion,
@@ -1695,7 +1708,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             BoundStatus: _boundStatus,
             RestartRequired: _restartRequired,
             SelectedTarget: _selectedTarget ?? string.Empty,
-            SelectedRoutingList: SelectedRoutingList,
+            SelectedRoutingList: requested.Count == 0 ? null : requested[0],
             Sources: BuildSources(),
             ConnectFailed: _connectFailed,
             ConnectFailReason: _connectFailReason,
@@ -1749,7 +1762,12 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             ProxyClients: proxy.Clients,
             ServerListsOf: ShownServerLists?.Config ?? string.Empty,
             ServerLists: ShownServerLists?.Lists,
-            FoundApps: _appFinds);
+            FoundApps: _appFinds,
+            RequestedRoutingListIds: requested,
+            AppliedRoutingListIds: applied?.ListIds ?? [],
+            RoutingPolicyMode: applied is null ? string.Empty : StatusSnapshot.PolicyMode(!applied.FullTunnel, applied.ListIds.Count > 0),
+            RoutingPolicyAllUdp: applied?.RequestedAllUdp == true,
+            RoutingPendingReason: routingPending);
 
         SnapshotReceived?.Invoke(Latest);
         if (activeChanged)
@@ -3565,30 +3583,41 @@ internal sealed class AndroidAgentConnection : IAgentConnection
 
             picked = listId;
         }
-        if (ServerListsOnly.Refusal(await ServerListsLimitAsync().ConfigureAwait(false), picked) is { } refusal)
+        return await ChangeRoutingAsync(new(RoutingSelectionChange.Replace, picked is long id ? [id] : [])).ConfigureAwait(false);
+    }
+
+    private async Task<IpcAck> ChangeRoutingAsync(RoutingSelectionChange? change)
+    {
+        await EnsureInitAsync().ConfigureAwait(false);
+        _log.Debug("routing", $"changing selection: {change?.Action}, {change?.Ids.Count ?? 0} ID(s)");
+        var (refusal, before, after) = await ServerListsOnly.ChangeSelectionAsync(_store,
+            await ServerListsLimitAsync().ConfigureAwait(false), change).ConfigureAwait(false);
+        if (refusal is not null)
         {
-            _log.Warn("agent", "the server restriction refused the routing list selection");
+            _log.Warn("routing", "the routing selection change was refused");
             return refusal;
         }
 
-        long? previous = null;
-        var changed = false;
-        await _store.UpdateSelectedRoutingListsAsync(current =>
-        {
-            previous = current is { Count: > 0 } ? current[0] : null;
-            IReadOnlyList<long> next = picked is long id ? [id] : [];
-            changed = !(current ?? []).SequenceEqual(next);
-            return next;
-        }).ConfigureAwait(false);
         await RefreshRoutingSelectionAsync().ConfigureAwait(false);
-        Journal(SwitchLog.RoutingList(await ListNameAsync(previous).ConfigureAwait(false), await ListNameAsync(picked).ConfigureAwait(false)));
-        var same = !changed && !_restartRequired;
-        PushSnapshot();
-        if (!same)
+        var changed = !before.SequenceEqual(after);
+        if (changed && before.Count <= 1 && after.Count <= 1)
+        {
+            Journal(SwitchLog.RoutingList(
+                await ListNameAsync(before.Count == 0 ? null : before[0]).ConfigureAwait(false),
+                await ListNameAsync(after.Count == 0 ? null : after[0]).ConfigureAwait(false)));
+        }
+
+        if (changed)
+        {
+            _log.Info("routing", $"selection changed to {after.Count} list(s)");
+        }
+
+        if (changed || _restartRequired)
         {
             ReconnectRouting();
         }
 
+        PushSnapshot();
         return Ok();
     }
 

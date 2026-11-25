@@ -151,6 +151,9 @@ public static class IpcContract
     /// </summary>
     public const string OpAssignRouting = "assign-routing";
 
+    /// <summary>Changes the requested set: add or remove one ID, or replace the entire set.</summary>
+    public const string OpChangeRoutingSelection = "change-routing-selection";
+
     /// <summary>
     /// Command to set a routing list's traffic settings. Args: routing list id, exclusions (one entry per
     /// line / comma-separated), all-UDP ("on"/"off"), mode ("split"/"full", derived from global-proxy),

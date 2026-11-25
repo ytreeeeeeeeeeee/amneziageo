@@ -67,6 +67,42 @@ public sealed class ServerListsOnlyTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SelectionChangesUseTheCurrentSetAndPreserveTheLastRequiredList()
+    {
+        await AskAsync(true, Item(First, "Unblock", Morning), Item(Second, "Work", Morning));
+        var ids = await IdsAsync();
+        var unblock = ids["Unblock"];
+        var work = ids["Work"];
+        var ct = TestContext.Current.CancellationToken;
+        var limit = await ServerListsOnly.OfAsync(_store, "office", ct);
+        await _store.SetSelectedRoutingListAsync(unblock, ct);
+
+        var add = await ServerListsOnly.ChangeSelectionAsync(_store, limit, new(RoutingSelectionChange.Add, [work]), ct);
+        Assert.Null(add.Refusal);
+        Assert.Equal(new[] { unblock, work }.Order(), add.After);
+
+        var remove = await ServerListsOnly.ChangeSelectionAsync(_store, limit, new(RoutingSelectionChange.Remove, [unblock]), ct);
+        Assert.Null(remove.Refusal);
+        Assert.Equal([work], remove.After);
+
+        var clear = await ServerListsOnly.ChangeSelectionAsync(_store, limit, new(RoutingSelectionChange.Replace, []), ct);
+        Assert.NotNull(clear.Refusal);
+        Assert.Equal([work], await _store.GetSelectedRoutingListsAsync(ct));
+    }
+
+    [Fact]
+    public void SnapshotDistinguishesLegacySelectionFromAnExplicitEmptyAppliedSet()
+    {
+        var legacy = new StatusSnapshot("old", null, [], BoundStatus: ConnectionStatus.Connected, SelectedRoutingList: 7);
+        Assert.Equal([7L], legacy.RequestedRoutingIds());
+        Assert.Equal([7L], legacy.AppliedRoutingIds());
+
+        var current = legacy with { RequestedRoutingListIds = [7, 9], AppliedRoutingListIds = [] };
+        Assert.Equal([7L, 9L], current.RequestedRoutingIds());
+        Assert.Empty(current.AppliedRoutingIds());
+    }
+
+    [Fact]
     public async Task TheLimit_NamesTheListsOfTheServerAndPicksTheDefaultOne()
     {
         await AskAsync(true, Item(First, "Unblock", Morning), Item(Second, "Work", Morning, marked: true));
@@ -290,9 +326,80 @@ public sealed class ServerListsOnlyTests : IAsyncLifetime
 
         Assert.Equal([true, true, false], routing.RoutingLists.Select(row => row.Locked));
         Assert.Equal(Loc.Instance.Get("Main_ServerListsOnlyOf", "office-awg1"), routing.RoutingLists[0].ActiveTip);
-        Assert.Equal(Loc.Instance.Get("Main_CardActiveFlag"), routing.RoutingLists[2].ActiveTip);
+        Assert.Equal(Loc.Instance.Get("Main_RoutingEnableList"), routing.RoutingLists[2].ActiveTip);
         Assert.True(routing.HomeRoutingLocked);
         Assert.Equal(Loc.Instance.Get("Main_ServerListsOnlyOf", "office-awg1"), routing.HomeRoutingTip);
+    }
+
+    [Fact]
+    public void TheUiRestoresTheLastSetAndShowsTheAppliedRowsIndependently()
+    {
+        var agent = new Silent();
+        var prefs = new UiPreferences { PresetRegions = "de" };
+        var routing = new MainWindowViewModel(agent, prefs).Routing;
+        var snapshot = Snapshot(string.Empty, null, selected: 2) with
+        {
+            RequestedRoutingListIds = [2, 3],
+            AppliedRoutingListIds = [1],
+        };
+
+        routing.Apply(snapshot);
+        Assert.Equal([false, true, true], routing.RoutingLists.Select(row => row.IsSelected));
+        Assert.Equal([true, false, false], routing.RoutingLists.Select(row => row.IsLive));
+        routing.HomeRoutingOn = false;
+        Assert.Equal(["replace"], agent.Commands.Last(command => command.Op == IpcContract.OpChangeRoutingSelection).Args);
+
+        routing.Apply(snapshot with { SelectedRoutingList = null, RequestedRoutingListIds = [] });
+        routing.HomeRoutingOn = true;
+        Assert.Equal(["replace", "2", "3"], agent.Commands.Last(command => command.Op == IpcContract.OpChangeRoutingSelection).Args);
+    }
+
+    [Fact]
+    public async Task RoutingControlsDisableUntilTheAgentAnswers()
+    {
+        var agent = new Silent();
+        var routing = new MainWindowViewModel(agent, new UiPreferences { PresetRegions = "de" }).Routing;
+        routing.Apply(Snapshot(string.Empty, null, selected: 2) with { RequestedRoutingListIds = [2] });
+        var first = routing.RoutingLists[0];
+        var second = routing.RoutingLists[2];
+        var response = new TaskCompletionSource<IpcAck>();
+        agent.RoutingResponse = response.Task;
+        var readyAgain = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        routing.SelectCardCommand.CanExecuteChanged += (_, _) =>
+        {
+            if (routing.SelectCardCommand.CanExecute(second))
+            {
+                readyAgain.TrySetResult();
+            }
+        };
+
+        Assert.True(routing.SelectCardCommand.CanExecute(first));
+        routing.SelectCardCommand.Execute(first);
+        Assert.True(routing.ChangingRouting);
+        Assert.False(routing.CanChangeHomeRouting);
+        Assert.False(routing.SelectCardCommand.CanExecute(second));
+        Assert.Single(agent.Commands.Where(command => command.Op == IpcContract.OpChangeRoutingSelection));
+
+        agent.RoutingResponse = null;
+        response.SetResult(new IpcAck(false, "request refused"));
+        await readyAgain.Task.WaitAsync(TestContext.Current.CancellationToken);
+
+        Assert.True(routing.CanChangeHomeRouting);
+        Assert.Equal("request refused", routing.RoutingChangeError);
+        routing.SelectCardCommand.Execute(second);
+        Assert.Equal(["add", "3"], agent.Commands.Last(command => command.Op == IpcContract.OpChangeRoutingSelection).Args);
+    }
+
+    [Fact]
+    public void TheUiLocksOnlyTheLastPermittedSelectedList()
+    {
+        var routing = Routing();
+        var snapshot = Snapshot("office", [2, 3], selected: 2);
+        routing.Apply(snapshot with { RequestedRoutingListIds = [2, 3] });
+        Assert.Equal([true, false, false], routing.RoutingLists.Select(row => row.Locked));
+
+        routing.Apply(snapshot with { RequestedRoutingListIds = [2] });
+        Assert.Equal([true, true, false], routing.RoutingLists.Select(row => row.Locked));
     }
 
     [Fact]
@@ -437,11 +544,17 @@ public sealed class ServerListsOnlyTests : IAsyncLifetime
 
         public List<string> Sent { get; } = [];
 
+        public List<IpcCommand> Commands { get; } = [];
+
+        public Task<IpcAck>? RoutingResponse { get; set; }
+
         public Task<IpcAck> SendCommandAsync(IpcCommand command)
         {
             Sent.Add(command.Op);
+            Commands.Add(command);
 
-            return Task.FromResult(new IpcAck(true, string.Empty));
+            return command.Op == IpcContract.OpChangeRoutingSelection && RoutingResponse is { } response
+                ? response : Task.FromResult(new IpcAck(true, string.Empty));
         }
 
         public Task<IpcAck> SendCommandRawAsync(IpcCommand command) => SendCommandAsync(command);
