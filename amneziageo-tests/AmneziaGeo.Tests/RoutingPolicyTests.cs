@@ -1,4 +1,5 @@
 using System.Net;
+using AmneziaGeo.Android.Engine;
 using AmneziaGeo.Dal;
 using AmneziaGeo.Decl;
 using AmneziaGeo.Geo;
@@ -180,6 +181,139 @@ public sealed class RoutingPolicyTests : IAsyncLifetime
         await Assert.ThrowsAsync<InvalidDataException>(() => _geo.LoadPolicyAsync([id]));
         Assert.Equal(RouteVerdict.Block, Decide(before, "192.0.2.5").Verdict);
     }
+
+    [Theory]
+    [InlineData(29)]
+    [InlineData(32)]
+    [InlineData(33)]
+    public async Task AndroidBuildsOnePlanAndKeepsMixedPackagesInsideTun(int api)
+    {
+        var proxy = await AddAsync("Proxy", ["proxy|app:pkg=org.example.tunnel", "proxy|domain:proxy.test"]);
+        var direct = await AddAsync("Direct", ["direct|app:pkg=org.example.direct", "direct|domain:direct.test",
+            "block|app:pkg=org.example.block", "proxy|app:pkg=org.example.missing"]);
+        await _store.SetRoutingSettingsAsync(new RoutingSettings(proxy, string.Empty, true));
+        var policy = await _geo.LoadPolicyAsync([direct, proxy], AppRulePlatform.Android);
+        var session = AndroidPlan(policy, api, package => package != "org.example.missing");
+
+        Assert.Equal([proxy, direct], session.Plan.ListIds);
+        Assert.Equal(session.Stamp, session.Plan.Version);
+        Assert.Equal(session.Stamp, AndroidPlan(await _geo.LoadPolicyAsync([proxy, direct], AppRulePlatform.Android),
+            api, package => package != "org.example.missing").Stamp);
+        Assert.True(session.Plan.FlowRules);
+        Assert.True(session.Plan.AllUdp);
+        Assert.False(session.Plan.FullTunnel);
+        Assert.Null(session.AppMode);
+        Assert.Empty(session.Apps);
+        Assert.Empty(session.Bypass);
+        Assert.Equal(RouteVerdict.Proxy, session.Plan.AppVerdict("org.example.tunnel"));
+        Assert.Equal(RouteVerdict.Direct, session.Plan.AppVerdict("org.example.direct"));
+        Assert.Equal(RouteVerdict.Block, session.Plan.AppVerdict("org.example.block"));
+        Assert.Equal(RouteVerdict.None, session.Plan.AppVerdict("org.example.missing"));
+
+        await _store.SetRoutingSettingsAsync(new RoutingSettings(direct, "exclude.test", false, UseGlobalProxy: true));
+        var full = AndroidPlan(await _geo.LoadPolicyAsync([proxy, direct], AppRulePlatform.Android), api);
+        Assert.True(full.Plan.FullTunnel);
+        Assert.True(full.Plan.RequestedAllUdp);
+        Assert.False(full.Plan.AllUdp);
+        Assert.Contains(full.Plan.DirectDomains, domain => domain.Value == "exclude.test");
+        Assert.NotEqual(session.Stamp, full.Stamp);
+        Assert.NotEqual(session.Stamp, AndroidPlan(policy, api).Stamp);
+    }
+
+    [Theory]
+    [InlineData(24)]
+    [InlineData(28)]
+    public async Task AndroidOlderApisOnlyUsePackageFiltersWhenTheyAreEquivalent(int api)
+    {
+        var apps = await AddAsync("Apps", ["proxy|app:pkg=org.example.tunnel"]);
+        var names = await AddAsync("Names", ["direct|domain:direct.test"]);
+        var session = AndroidPlan(await _geo.LoadPolicyAsync([apps], AppRulePlatform.Android), api);
+        Assert.Equal("include", session.AppMode);
+        Assert.Equal(["org.example.tunnel"], session.Apps);
+        Assert.Empty(session.Bypass);
+        Assert.False(session.Plan.FlowRules);
+
+        var missing = AndroidPlan(await _geo.LoadPolicyAsync([apps], AppRulePlatform.Android), api, _ => false);
+        Assert.False(missing.Plan.FullTunnel);
+        Assert.Null(missing.AppMode);
+        Assert.Empty(missing.Apps);
+
+        var mixed = await _geo.LoadPolicyAsync([apps, names], AppRulePlatform.Android);
+        Assert.Throws<NotSupportedException>(() => AndroidPlan(mixed, api));
+        Assert.Throws<NotSupportedException>(() => AndroidPlan(mixed, 33, useRouter: false));
+        Assert.Throws<NotSupportedException>(() => AndroidPlan(mixed, 33, ipv6: true));
+    }
+
+    [Fact]
+    public void AndroidUsesApplicationForAmbiguousDnsAndHonorsKnownDomains()
+    {
+        const uint shared = 0xc000020c;
+        var hints = new DnsRouteHints(new NameRules([], [], []), 300);
+        hints.SetInitial(new NameAnswers(["192.0.2.12/32", "192.0.2.13/32"], ["192.0.2.12/32"], []));
+        Assert.Equal(RouteVerdict.None, hints.Lookup(shared));
+        Assert.Equal(RouteVerdict.Proxy, hints.Lookup(0xc000020d));
+
+        var names = GeoRoutingPlan.Full with
+        {
+            FlowRules = true,
+            ProxyDomains = [new(GeoDomainKind.Full, "shared.test")],
+            DirectDomains = [new(GeoDomainKind.Domain, "shared.test")],
+        };
+        Assert.Equal("shared.test", Assert.Single(names.DnsNames().Proxy).Value);
+        Assert.Empty(names.DnsNames().Direct);
+
+        Assert.Equal(RouteVerdict.Direct, GeoRoutingPlan.DecideFlow(RouteVerdict.Proxy, RouteVerdict.None,
+            hints.Lookup(shared), RouteVerdict.Direct, true, RouteVerdict.Proxy));
+        Assert.Equal(RouteVerdict.Proxy, GeoRoutingPlan.DecideFlow(RouteVerdict.Direct, RouteVerdict.Proxy,
+            RouteVerdict.None, RouteVerdict.Direct, true, RouteVerdict.Direct));
+        Assert.Equal(RouteVerdict.Direct, GeoRoutingPlan.DecideFlow(RouteVerdict.Proxy, RouteVerdict.Direct,
+            RouteVerdict.None, RouteVerdict.Proxy, true, RouteVerdict.Proxy));
+        Assert.Equal(RouteVerdict.Block, GeoRoutingPlan.DecideFlow(RouteVerdict.Block, RouteVerdict.Proxy,
+            RouteVerdict.None, RouteVerdict.Proxy, true, RouteVerdict.Proxy));
+        Assert.Equal(RouteVerdict.Block, GeoRoutingPlan.DecideFlow(RouteVerdict.Proxy, RouteVerdict.None,
+            RouteVerdict.None, RouteVerdict.None, false, RouteVerdict.Proxy));
+    }
+
+    [Fact]
+    public void AndroidLearnsSuffixMatchesAndUsesAppWhileObservedDnsDisagrees()
+    {
+        const uint address = 0xc0000210;
+        var now = 0L;
+        var hints = new DnsRouteHints(new NameRules([new(GeoDomainKind.Domain, "proxy.test")],
+            [new(GeoDomainKind.Full, "direct.test")], []), 300, () => now);
+
+        Assert.Equal(RouteVerdict.None, hints.Lookup(address));
+        hints.Observe(address, "video.proxy.test.", 30);
+        Assert.Equal(RouteVerdict.Proxy, GeoRoutingPlan.DecideFlow(RouteVerdict.None, RouteVerdict.None,
+            hints.Lookup(address), RouteVerdict.Direct, true, RouteVerdict.Direct));
+
+        hints.Observe(address, "direct.test.", 2);
+        Assert.Equal(RouteVerdict.Direct, GeoRoutingPlan.DecideFlow(RouteVerdict.None, RouteVerdict.None,
+            hints.Lookup(address), RouteVerdict.Direct, true, RouteVerdict.Direct));
+        now = 2_000;
+        Assert.Equal(RouteVerdict.Proxy, hints.Lookup(address));
+        now = 30_000;
+        Assert.Equal(RouteVerdict.None, hints.Lookup(address));
+    }
+
+    [Fact]
+    public async Task AndroidKeepsAllowedIpsWithoutPolicyAndRejectsAnOversizedPackageFilter()
+    {
+        var empty = AndroidPlan(null, 28, ipv6: true);
+        Assert.True(empty.Plan.UseConfigRoutes);
+        Assert.Equal(["192.0.2.0/24", "2001:db8::/32"],
+            empty.Plan.RoutesForFamily(["192.0.2.0/24", "2001:db8::/32"], true));
+
+        var rules = Enumerable.Range(0, 4096).Select(i => $"proxy|app:pkg=org.example.{new string('a', 120)}{i}").ToArray();
+        var apps = await AddAsync("Large app filter", rules);
+        var policy = await _geo.LoadPolicyAsync([apps], AppRulePlatform.Android);
+        Assert.Throws<NotSupportedException>(() => AndroidPlan(policy, 33));
+    }
+
+    private static (GeoRoutingPlan Plan, string Stamp, string? AppMode, string[] Apps, string[] Bypass)
+        AndroidPlan(RoutingPolicy? policy, int api, Func<string, bool>? installed = null,
+            bool useRouter = true, bool ipv6 = false) =>
+        GeoRoutingPlan.FromPolicy(policy, useRouter, ipv6, api, [], 300, SplitBudget.DefaultLimit, installed ?? (_ => true));
 
     private Task<long> AddAsync(string name, IReadOnlyList<string> rules) => _geo.ApplyToRoutingListAsync(0, name, rules);
 

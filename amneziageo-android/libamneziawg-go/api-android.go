@@ -17,6 +17,12 @@ typedef int (*ag_protect_fn)(int fd);
 
 static int ag_call_protect(ag_protect_fn fn, int fd) { return fn(fd); }
 
+typedef int (*ag_dns_hint_fn)(unsigned int address, const char *host, unsigned int ttl);
+
+static int ag_call_dns_hint(ag_dns_hint_fn fn, unsigned int address, const char *host, unsigned int ttl) {
+	return fn(address, host, ttl);
+}
+
 // Хост называет владельца потока: 1 - наш собственный процесс, 2 - приложение из правил, 0 - остальные.
 typedef int (*ag_owner_fn)(int proto, unsigned int src, unsigned short srcPort, unsigned int dst, unsigned short dstPort);
 
@@ -31,6 +37,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -125,6 +132,12 @@ func wgTurnOn(settings *C.char, tunFd int32, logLevel int32, fn C.ag_protect_fn)
 	dev := device.NewDevice(verdictDevice, bind, logger)
 
 	text := C.GoString(settings)
+	const pendingPolicy = "ageo_policy_pending=1\n"
+	if strings.HasPrefix(text, pendingPolicy) {
+		verdictDevice.policyPending.Store(true)
+		text = strings.TrimPrefix(text, pendingPolicy)
+	}
+
 	if err := dev.IpcSet(text); err != nil {
 		logger.Errorf("Failed to apply UAPI settings: %v", err)
 		dev.Close()
@@ -271,6 +284,25 @@ func wgMemory() *C.char {
 //export wgReturnMemory
 func wgReturnMemory() {
 	debug.FreeOSMemory()
+}
+
+//export wgSetDnsHints
+func wgSetDnsHints(handle int32, fn C.ag_dns_hint_fn) int32 {
+	t, ok := tunnelHandles[handle]
+	if !ok || fn == nil {
+		return -1
+	}
+
+	hint := func(address uint32, host string, ttl uint32) int {
+		if host == "" {
+			return int(C.ag_call_dns_hint(fn, C.uint(address), nil, 0))
+		}
+		name := C.CString(host)
+		defer C.free(unsafe.Pointer(name))
+		return int(C.ag_call_dns_hint(fn, C.uint(address), name, C.uint(ttl)))
+	}
+	t.tun.dnsHint.Store(&hint)
+	return 0
 }
 
 //export wgSetRelay

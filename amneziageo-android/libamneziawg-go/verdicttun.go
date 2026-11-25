@@ -101,9 +101,14 @@ func (s *spanSet) has(addr uint32) bool {
 
 // Роли в порядке старшинства: блок сильнее директа, директ сильнее прокси.
 type verdictTable struct {
-	block  *spanSet
-	direct *spanSet
-	proxy  *spanSet
+	block      *spanSet
+	direct     *spanSet
+	proxy      *spanSet
+	pinned     *spanSet
+	resolvers  *spanSet
+	policy     bool
+	full       bool
+	dnsPending bool
 }
 
 func (t *verdictTable) lookup(addr uint32) (verdict, bool) {
@@ -124,12 +129,23 @@ func (t *verdictTable) lookup(addr uint32) (verdict, bool) {
 
 // Разбирает строки «cidr=роль», по одной на строку.
 func parseTable(spec string) *verdictTable {
-	var block, direct, proxy []span
+	var block, direct, proxy, pinned, resolvers []span
+	policy, full, dnsPending := false, false, false
 	for _, line := range strings.Split(spec, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
+		if line == "policy=split" || line == "policy=full" {
+			policy, full = true, line == "policy=full"
+			continue
+		}
+
+		if line == "dns-pending" {
+			dnsPending = true
+			continue
+		}
+
 		eq := strings.LastIndexByte(line, '=')
 		if eq < 0 {
 			continue
@@ -145,12 +161,21 @@ func parseTable(spec string) *verdictTable {
 			direct = append(direct, span{lo, hi})
 		case "proxy":
 			proxy = append(proxy, span{lo, hi})
+		case "pinned":
+			pinned = append(pinned, span{lo, hi})
+		case "dns-bootstrap":
+			resolvers = append(resolvers, span{lo, hi})
 		}
 	}
 	return &verdictTable{
-		block:  newSpanSet(block),
-		direct: newSpanSet(direct),
-		proxy:  newSpanSet(proxy),
+		block:      newSpanSet(block),
+		direct:     newSpanSet(direct),
+		proxy:      newSpanSet(proxy),
+		pinned:     newSpanSet(pinned),
+		resolvers:  newSpanSet(resolvers),
+		policy:     policy,
+		full:       full,
+		dnsPending: dnsPending,
 	}
 }
 
@@ -340,12 +365,15 @@ type verdictTun struct {
 	fwd  *datagram.Forwarder
 	tcp  atomic.Pointer[tcpForwarder]
 
-	protect atomic.Pointer[func(int) bool]
-	relay   atomic.Int32
-	split   atomic.Bool
-	owner   atomic.Pointer[func(uint8, uint32, uint16, uint32, uint16) int]
-	owners  owners.Cache
-	heads   datagram.Heads
+	protect       atomic.Pointer[func(int) bool]
+	relay         atomic.Int32
+	split         atomic.Bool
+	owner         atomic.Pointer[func(uint8, uint32, uint16, uint32, uint16) int]
+	policyPending atomic.Bool
+	dnsHint       atomic.Pointer[func(uint32, string, uint32) int]
+	dnsQueries    dnsQueries
+	owners        owners.Cache
+	heads         datagram.Heads
 
 	stop chan struct{}
 	once sync.Once
@@ -537,6 +565,13 @@ func (d *verdictTun) setRelay(port int, split bool, owner func(uint8, uint32, ui
 	if fwd := d.tcp.Load(); fwd != nil {
 		fwd.setRelay(port)
 	}
+
+	d.mu.RLock()
+	ready := d.table != nil && d.table.policy && !d.table.dnsPending
+	d.mu.RUnlock()
+	if port > 0 && ready {
+		d.policyPending.Store(false)
+	}
 }
 
 // Куда идёт датаграмма, которую ни одно правило по адресу не назвало: приложение из правил едет туннелем,
@@ -701,6 +736,9 @@ func (d *verdictTun) snapshot() string {
 func (d *verdictTun) setTable(table *verdictTable) {
 	d.mu.Lock()
 	d.table = table
+	if table != nil && table.policy && !table.dnsPending && d.relay.Load() > 0 {
+		d.policyPending.Store(false)
+	}
 	d.mu.Unlock()
 }
 
@@ -709,6 +747,112 @@ func (d *verdictTun) verdictFor(addr uint32) (verdict, bool) {
 	table := d.table
 	d.mu.RUnlock()
 	return table.lookup(addr)
+}
+
+// A real IP block is absolute. For TCP the relay reads the name before deciding by owner.
+func (d *verdictTun) applyPolicy(table *verdictTable, addr uint32, packet []byte, nanos int64) bool {
+	v, listed := table.lookup(addr)
+	if listed && v == verdictBlock {
+		d.blocked.Add(1)
+		return false
+	}
+
+	switch packet[9] {
+	case syscall.IPPROTO_TCP:
+		if d.ours(packet) {
+			return true
+		}
+		if d.stream(packet) {
+			d.passed.Add(1)
+		}
+		return false
+
+	case syscall.IPPROTO_UDP:
+		if datagram.Later(packet) {
+			aside, found := d.heads.Went(packet, nanos)
+			if !found {
+				return false
+			}
+			if aside {
+				d.aside(packet)
+			}
+			return !aside
+		}
+		// The first fragment is all that carries UDP ports.
+		if len(packet) < int(packet[0]&0x0f)*4+8 {
+			return false
+		}
+
+		// The configured VPN resolver and the server signal must remain reachable through the peer.
+		if table.pinned.has(addr) {
+			v = verdictProxy
+		} else if hint, known := d.dnsVerdict(addr); known {
+			v = hint
+		} else {
+			switch d.whose(packet, protoUdp) {
+			case owners.Block, owners.Unknown:
+				v = verdictBlock
+			case owners.Direct:
+				v = verdictDirect
+			case owners.Named, owners.Self:
+				v = verdictProxy
+			default:
+				if !listed && !table.full {
+					v = verdictDirect
+				}
+			}
+		}
+
+		if v == verdictBlock {
+			d.blocked.Add(1)
+			return false
+		}
+		d.noteDnsQuery(packet, nanos)
+		if datagram.Cut(packet) {
+			d.heads.Note(packet, v == verdictDirect, nanos)
+		}
+		if v == verdictDirect {
+			d.aside(packet)
+			d.passed.Add(1)
+			return false
+		}
+		return true
+	default:
+		if listed {
+			return v == verdictProxy
+		}
+		return table.full
+	}
+}
+
+func (d *verdictTun) dnsVerdict(addr uint32) (verdict, bool) {
+	if hint := d.dnsHint.Load(); hint != nil {
+		switch (*hint)(addr, "", 0) {
+		case 1:
+			return verdictProxy, true
+		case 2:
+			return verdictDirect, true
+		case 3:
+			return verdictBlock, true
+		}
+	}
+	return verdictProxy, false
+}
+
+func (d *verdictTun) noteDnsQuery(packet []byte, now int64) {
+	if d.dnsHint.Load() != nil {
+		d.dnsQueries.note(packet, now)
+	}
+}
+
+// During DNS bootstrap only the configured infrastructure can reach the peer.
+func (d *verdictTun) bootstrapDns(table *verdictTable, addr uint32, packet []byte) bool {
+	if table == nil || !table.dnsPending || d.relay.Load() <= 0 || !table.resolvers.has(addr) || table.block.has(addr) {
+		return false
+	}
+	header := int(packet[0]&0x0f) * 4
+	return header >= 20 && len(packet) >= header+4 && (packet[9] == syscall.IPPROTO_TCP || packet[9] == syscall.IPPROTO_UDP) &&
+		binary.BigEndian.Uint16(packet[6:8])&0x1fff == 0 && binary.BigEndian.Uint16(packet[header+2:header+4]) == 53
 }
 
 func (d *verdictTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
@@ -726,11 +870,26 @@ func (d *verdictTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	if n == 0 || err != nil {
 		return n, err
 	}
+	d.mu.RLock()
+	table := d.table
+	pending := d.policyPending.Load()
+	d.mu.RUnlock()
 	nanos := time.Now().UnixNano()
 	kept := 0
 	for i := 0; i < n; i++ {
-		if addr, ok := destinationIPv4(bufs[i][offset : offset+sizes[i]]); ok {
-			v, named := d.verdictFor(addr)
+		packet := bufs[i][offset : offset+sizes[i]]
+		addr, ok := destinationIPv4(packet)
+		if pending {
+			if !ok || !d.bootstrapDns(table, addr, packet) {
+				continue
+			}
+			d.noteDnsQuery(packet, nanos)
+		} else if table != nil && table.policy {
+			if !ok || !d.applyPolicy(table, addr, packet, nanos) {
+				continue
+			}
+		} else if ok {
+			v, named := table.lookup(addr)
 			d.seen.Add(1)
 			if named {
 				d.live.note(addr, v, nanos)
@@ -781,6 +940,12 @@ func (d *verdictTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 }
 
 func (d *verdictTun) Write(bufs [][]byte, offset int) (int, error) {
+	if hint := d.dnsHint.Load(); hint != nil {
+		now := time.Now().UnixNano()
+		for _, buffer := range bufs {
+			d.dnsQueries.answer(buffer[offset:], now, *hint)
+		}
+	}
 	return d.device().Write(bufs, offset)
 }
 

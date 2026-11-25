@@ -322,7 +322,7 @@ public static class VpnBridge
     /// <summary>
     /// Writes the stage for a head that comes up while the tunnel runs.
     /// </summary>
-    public static void WriteStage(VpnStage stage, string? detail)
+    public static void WriteStage(VpnStage stage, string? detail, string? sessionId = null)
     {
         try
         {
@@ -330,7 +330,7 @@ public static class VpnBridge
             {
                 var path = StagePath();
                 var fresh = path + ".new";
-                File.WriteAllText(fresh, $"{(int)stage}\n{detail}");
+                File.WriteAllText(fresh, $"{(int)stage}\n{detail}\n{sessionId}");
                 File.Move(fresh, path, true);
             }
         }
@@ -343,7 +343,7 @@ public static class VpnBridge
     /// <summary>
     /// Reads the stage the tunnel wrote last; nothing when it wrote none.
     /// </summary>
-    public static (VpnStage Stage, string Detail)? ReadStage()
+    public static (VpnStage Stage, string Detail, string? SessionId)? ReadStage()
     {
         try
         {
@@ -361,7 +361,7 @@ public static class VpnBridge
                 return null;
             }
 
-            return ((VpnStage)stage, lines.Length > 1 ? lines[1] : string.Empty);
+            return ((VpnStage)stage, lines.Length > 1 ? lines[1] : string.Empty, lines.Length > 2 && lines[2].Length > 0 ? lines[2] : null);
         }
         catch (Exception ex)
         {

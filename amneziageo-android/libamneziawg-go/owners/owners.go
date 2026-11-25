@@ -22,9 +22,12 @@ const Recheck = 30 * time.Second
 
 // Владелец, каким его называет хост.
 const (
-	Other = 0
-	Self  = 1
-	Named = 2
+	Other   = 0
+	Self    = 1
+	Named   = 2
+	Direct  = 3
+	Block   = 4
+	Unknown = 5
 )
 
 // Поток: протокол, адреса и порты обеих сторон.
@@ -76,7 +79,7 @@ func (c *Cache) Whose(flow Flow, nanos int64, ask func(uint8, uint32, uint16, ui
 	answer := &held{verdict: verdict}
 	answer.last.Store(nanos)
 	// «Чужой» сверяется снова: первый раз скоро, дальше редко.
-	if verdict == Other {
+	if verdict == Other || verdict == Unknown {
 		answer.again = nanos + int64(Hold)
 		if foreign {
 			answer.again = nanos + int64(Recheck)

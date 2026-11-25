@@ -1,5 +1,3 @@
-using Android.OS;
-
 namespace AmneziaGeo.Android.Engine;
 
 /// <summary>
@@ -20,13 +18,15 @@ public static class RouteBudget
     /// </summary>
     public const int Max = ParcelBytes / BytesPerRoute * 9 / 10;
 
-    /// <summary>
-    /// Whether this device can hand a relay to the applications at all.
-    /// </summary>
-    public static bool Relayable => Build.VERSION.SdkInt >= BuildVersionCodes.Q;
+    public static bool SupportsOwner(int api) => api >= 29;
+
+    // The Binder parcel includes the package strings, DNS servers and the route lists.
+    public static bool Fits(int routes, int names, IEnumerable<string> packages) =>
+        ((long)routes + (long)names * AddressesPerName) * BytesPerRoute
+        + packages.Sum(package => 16L + 2L * package.Length) <= Max * BytesPerRoute;
 
     /// <summary>
     /// Whether this many routes still fit once these names are resolved to addresses.
     /// </summary>
-    public static bool Fits(int routes, int names) => routes + (names * AddressesPerName) <= Max;
+    public static bool Fits(int routes, int names) => Fits(routes, names, []);
 }

@@ -14,6 +14,7 @@ internal static partial class AwgEngine
 
     // Кто называет владельца соединения.
     private static Func<int, uint, ushort, uint, ushort, int>? _owner;
+    private static DnsRouteHints? _dnsHints;
 
     // Кто отпускает сокет пробы мимо туннеля.
     private static Func<int, bool>? _probeProtect;
@@ -49,6 +50,7 @@ internal static partial class AwgEngine
     public static void TurnOff(int handle)
     {
         TurnOffNative(handle);
+        _dnsHints = null;
     }
 
     /// <summary>
@@ -186,6 +188,35 @@ internal static partial class AwgEngine
         return SetRelayNative(handle, port, split ? 1 : 0, &OwnerNative) == 0;
     }
 
+    public static unsafe bool SetDnsHints(int handle, DnsRouteHints hints)
+    {
+        _dnsHints = hints;
+        return SetDnsHintsNative(handle, &DnsHintNative) == 0;
+    }
+
+    [UnmanagedCallersOnly]
+    private static int DnsHintNative(uint address, nint host, uint ttl)
+    {
+        try
+        {
+            var hints = _dnsHints;
+            if (host == 0)
+            {
+                return (int)(hints?.Lookup(address) ?? default);
+            }
+
+            if (Marshal.PtrToStringUTF8(host) is { } name)
+            {
+                hints?.Observe(address, name, ttl);
+            }
+        }
+        catch
+        {
+        }
+
+        return 0;
+    }
+
     /// <summary>
     /// Asks a server for a handshake on an engine that carries nothing: true when it answered, false when it kept
     /// silent for the wait, null when the engine did not start.
@@ -302,6 +333,9 @@ internal static partial class AwgEngine
 
     [LibraryImport(Lib, EntryPoint = "wgPreloadLive", StringMarshalling = StringMarshalling.Utf8)]
     private static partial int PreloadLiveNative(int handle, string text);
+
+    [LibraryImport(Lib, EntryPoint = "wgSetDnsHints")]
+    private static unsafe partial int SetDnsHintsNative(int handle, delegate* unmanaged<uint, nint, uint, int> dnsHint);
 
     [LibraryImport(Lib, EntryPoint = "wgSetRelay")]
     private static unsafe partial int SetRelayNative(int handle, int port, int split, delegate* unmanaged<int, uint, ushort, uint, ushort, int> owner);

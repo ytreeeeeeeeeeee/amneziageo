@@ -130,7 +130,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     private readonly VpnConnectPreparation _connectPreparation = new();
     private PendingLaunch? _pendingLaunch;
 
-    private sealed record PendingLaunch(string Id, string Config, bool PlanAttributed, string DownNotice,
+    private sealed record PendingLaunch(string Id, string Config, string DownNotice,
         WsEndpoint? Front, bool RestartRequired);
     private readonly Handler _ticks = new(Looper.MainLooper!);
 
@@ -198,7 +198,8 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     private int _splitLimit = SplitBudget.DefaultLimit;
     // Whether the plan in force adds the named applications to the rules by connection; read off the plan when the
     // process has not built one yet.
-    private bool? _planAttributed;
+    private VpnRequest? _appliedRequest;
+    private string? _acceptedSessionId;
     private bool _geoAutoCheck = true;
     private int _geoCheckIntervalHours = 24;
     private bool _subscriptionAutoRefresh = true;
@@ -812,20 +813,32 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         var transport = _transports.GetValueOrDefault(configName);
-        var listId = ConfigRouting.Allowed(transport) ? SelectedRoutingList : null;
-        var useRouter = transport?.UseRouter != false;
 
         // Правила разворачиваются в пуле: агент живёт в процессе UI, и план большого списка держит поток.
         var planStarted = System.Environment.TickCount64;
-        var session = await Task.Run(() => PrepareSessionPlanAsync(useRouter, listId), ct).ConfigureAwait(false);
+        (GeoRoutingPlan Plan, string Stamp, string? AppMode, string[] Apps, string[] Bypass) session;
+        try
+        {
+            session = await Task.Run(() => PrepareSessionPlanAsync(configName, transport, ct), ct).ConfigureAwait(false);
+        }
+        catch (NotSupportedException ex)
+        {
+            return _connectPreparation.Apply(() =>
+            {
+                _log.Warn("geo", $"Android API {(int)Build.VERSION.SdkInt}: {ex.Message}");
+                ApplyConnectFailure(nameof(ConnectFailureReason.TunnelSetupFailed), ex.Message, true);
+                return new IpcAck(false, ex.Message);
+            }, ct);
+        }
+
         ct.ThrowIfCancellationRequested();
-        var words = await NoticeWordsAsync().ConfigureAwait(false);
+        var words = await NoticeWordsAsync(session.Plan).ConfigureAwait(false);
         var dns = await _store.GetConfigDnsAsync(configName, ct).ConfigureAwait(false);
         var vpnDns = VpnDns.Pick(dns, offer.Dns(), WgConfigEditor.GetDns(configText), Beside(true));
         var front = Front(configName, configText);
         var signal = TunnelSignal.Of(offer, configText, transport?.UseIpv6 == true, transport?.AllowSignal != false);
         var request = new VpnRequest(configText, configName,
-            session.Mode == "off" ? null : session.Mode, session.Mode == "off" ? null : session.Packages,
+            session.AppMode, session.Apps,
             transport?.Mtu ?? 0, transport?.UseIpv6 == true, front?.Address(), front?.Port ?? 0,
             EngineLog: EngineLogLevel(_logLevel), MtuMode: (int)(transport?.MtuMode ?? default),
             DirectTcp: _directTcp, ExcludeRoutes: _excludeRoutes, BypassApps: session.Bypass,
@@ -837,7 +850,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             Plan: session.Plan, PlanStamp: session.Stamp);
         ct.ThrowIfCancellationRequested();
         var id = VpnBridge.StageRequest(request);
-        var delivery = new PendingLaunch(id, configName, session.Plan.TunnelApps.Count > 0,
+        var delivery = new PendingLaunch(id, configName,
             DownKey(configName, words), front, restart);
         var started = false;
         try
@@ -850,8 +863,11 @@ internal sealed class AndroidAgentConnection : IAgentConnection
                     return VpnConnectPreparation.Cancelled;
                 }
 
-                _log.Info("agent", $"connect requested: config '{configName}', app rules {AppRulesLine(session.Mode, session.Packages.Length, session.Plan.TunnelApps.Count > 0)}"
-                    + $"{BypassLine(session.Bypass.Length)}, plan {(session.Rebuilt ? "ready" : "unchanged")} in {System.Environment.TickCount64 - planStarted} ms");
+                _log.Debug("geo", $"routing {session.Stamp[..12]} prepared for Android API {(int)Build.VERSION.SdkInt}: "
+                    + $"{session.Plan.ListIds.Count} list(s), {(session.Plan.FlowRules ? "per-flow" : "system routes")}, "
+                    + $"{session.Apps.Length + session.Bypass.Length} filtered package(s), "
+                    + $"{System.Environment.TickCount64 - planStarted} ms");
+                _log.Info("agent", $"connect requested: config '{configName}'");
                 if (!RevokePendingLaunch())
                 {
                     throw new IOException("could not revoke the previous pending VPN launch");
@@ -908,7 +924,8 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     private bool TryRestoreRunningTunnel()
     {
         if (!VpnBridge.IsRunning(Application.Context)
-            || VpnBridge.ReadStage() is not { Stage: VpnStage.Connected or VpnStage.Connecting } live)
+            || VpnBridge.ReadStage() is not { Stage: VpnStage.Connected or VpnStage.Connecting } live
+            || live.SessionId != VpnBridge.ReadRequest()?.SessionId)
         {
             return false;
         }
@@ -916,7 +933,11 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         _active = true;
         _boundTarget = live.Detail;
         _boundStatus = live.Stage == VpnStage.Connected ? ConnectionStatus.Connected : ConnectionStatus.Connecting;
-        _planAttributed = VpnBridge.ReadRequest()?.Plan?.TunnelApps.Count > 0;
+        if (live.Stage == VpnStage.Connected)
+        {
+            ConfirmRouting(live.SessionId);
+        }
+        _acceptedSessionId = live.SessionId;
         _watch.Heard();
         return true;
     }
@@ -1009,12 +1030,13 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     }
 
     // The words of the tunnel notification in the language the window is set to, with the routing list in use.
-    private async Task<NoticeWords> NoticeWordsAsync()
+    private async Task<NoticeWords> NoticeWordsAsync(GeoRoutingPlan? plan = null)
     {
         var language = UiPreferences.Load().Language;
         var takes = _selectedTarget is not { Length: > 0 } name
             || ConfigRouting.Allowed(_transports.GetValueOrDefault(name));
-        var list = takes ? await ListNameAsync(SelectedRoutingList).ConfigureAwait(false) ?? string.Empty : string.Empty;
+        var list = plan?.ListName ?? Volatile.Read(ref _appliedRequest)?.Plan?.ListName
+            ?? (takes ? await ListNameAsync(SelectedRoutingList).ConfigureAwait(false) : null) ?? string.Empty;
         var lists = takes && (list.Length > 0 || await AnyListAsync().ConfigureAwait(false));
         return new NoticeWords(
             Loc.GetIn(language, "Status_Connected"),
@@ -1107,7 +1129,8 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     private void TakeTunnelStage()
     {
         if (!VpnBridge.IsRunning(Application.Context) || VpnBridge.ReadStage() is not { } told
-            || told.Stage is not (VpnStage.Connecting or VpnStage.Connected))
+            || told.Stage is not (VpnStage.Connecting or VpnStage.Connected)
+            || told.SessionId != VpnBridge.ReadRequest()?.SessionId)
         {
             return;
         }
@@ -1116,6 +1139,11 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         _watch.Heard();
         _boundStatus = told.Stage == VpnStage.Connected ? ConnectionStatus.Connected : ConnectionStatus.Connecting;
         _boundTarget = told.Detail.Length > 0 ? told.Detail : _selectedTarget;
+        _acceptedSessionId = told.SessionId;
+        if (told.Stage == VpnStage.Connected)
+        {
+            ConfirmRouting(told.SessionId);
+        }
         global::Android.Util.Log.Info("AndroidAgent", $"the head comes up on the stage the tunnel wrote: {told.Stage} {_boundTarget}");
     }
 
@@ -1341,6 +1369,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     private void TakeTunnelEvent(int stageValue, string? launchId, Intent intent)
     {
         var reason = intent.GetStringExtra(VpnBridge.ExtraReason);
+        var terminal = stageValue == (int)VpnStage.Disconnected || stageValue == (int)VpnStage.Failed;
         if (_pendingLaunch is { } launch)
         {
             // A reply for a revoked launch, or a stage from the previous tunnel, cannot settle this launch.
@@ -1356,13 +1385,12 @@ internal sealed class AndroidAgentConnection : IAgentConnection
                 return;
             }
 
-            _planAttributed = launch.PlanAttributed;
+            _acceptedSessionId = launchId;
             _downNotice = launch.DownNotice;
             _handedFront = launch.Front;
             _frontHanded = true;
         }
-        else if (launchId is not null && (!_dialWanted || _connectPreparation.IsPending
-            || VpnBridge.ReadRequest()?.SessionId != launchId))
+        else if (launchId != VpnBridge.ReadRequest()?.SessionId && (!terminal || launchId != _acceptedSessionId))
         {
             return;
         }
@@ -1373,6 +1401,16 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         var stage = (VpnStage)stageValue;
+        if (!terminal && launchId is not null)
+        {
+            _acceptedSessionId = launchId;
+        }
+
+        if (stage == VpnStage.Connected)
+        {
+            ConfirmRouting(launchId);
+        }
+
         if (stage is VpnStage.Connecting or VpnStage.Connected)
         {
             _watch.Heard();
@@ -1385,6 +1423,21 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             reason, intent.GetIntExtra(VpnBridge.ExtraRetry, 0));
     }
 
+    private void ConfirmRouting(string? sessionId)
+    {
+        var request = VpnBridge.ReadRequest();
+        if (request is null || request.SessionId != sessionId)
+        {
+            return;
+        }
+
+        var previous = Interlocked.Exchange(ref _appliedRequest, request);
+        if (previous?.SessionId != request.SessionId && request.PlanStamp is { Length: >= 12 } stamp)
+        {
+            _log.Info("geo", $"routing {stamp[..12]} confirmed for {request.Plan?.ListIds.Count ?? 0} list(s)");
+        }
+    }
+
     private void OnVpnStateChanged(VpnStage stage, string? detail, string? reason = null, int retry = 0)
     {
         // The session name comes back from the tunnel, so a head that started after it still names what runs.
@@ -1395,7 +1448,6 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         {
             case VpnStage.Connecting:
                 _active = true;
-                _restartRequired = false;
                 _boundStatus = ConnectionStatus.Connecting;
                 _boundTarget = session;
                 break;
@@ -1408,9 +1460,14 @@ internal sealed class AndroidAgentConnection : IAgentConnection
 
                 _boundStatus = ConnectionStatus.Connected;
                 _boundTarget = session;
-                ClearConnectFailure();
+                if (!_restartRequired)
+                {
+                    ClearConnectFailure();
+                }
                 break;
             case VpnStage.Disconnected:
+                _acceptedSessionId = null;
+                Volatile.Write(ref _appliedRequest, null);
                 _active = false;
                 _restartRequired = false;
                 _boundStatus = ConnectionStatus.Disconnected;
@@ -1421,6 +1478,8 @@ internal sealed class AndroidAgentConnection : IAgentConnection
                 ForgetKeptSwitch();
                 break;
             case VpnStage.Failed:
+                _acceptedSessionId = null;
+                Volatile.Write(ref _appliedRequest, null);
                 _active = false;
                 _restartRequired = false;
                 _boundStatus = ConnectionStatus.Disconnected;
@@ -1581,25 +1640,36 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
     }
 
-    // Whether a list rebuilt from the bases carries what it carried before.
-    private static bool SameCarry(RoutingList before, RoutingList? after) =>
-        after is not null
-        && before.Routes.SequenceEqual(after.Routes)
-        && before.Domains.SequenceEqual(after.Domains)
-        && before.DirectRoutes.SequenceEqual(after.DirectRoutes)
-        && before.DirectDomains.SequenceEqual(after.DirectDomains)
-        && before.BlockRoutes.SequenceEqual(after.BlockRoutes)
-        && before.BlockDomains.SequenceEqual(after.BlockDomains);
-
-    // A live tun keeps the routes establish() was given, so an edited list only reaches the tunnel on a reconnect.
     private void MarkRoutingChanged(long listId)
     {
-        if (_active && RoutedList is not null && Volatile.Read(ref _routingSelection)?.Contains(listId) == true)
+        if (Volatile.Read(ref _routingSelection)?.Contains(listId) == true
+            || Volatile.Read(ref _appliedRequest)?.Plan?.ListIds.Contains(listId) == true)
         {
-            _restartRequired = true;
-            _log.Info("agent", "the edited routing list applies on the next connect");
+            ReconnectRouting();
         }
     }
+
+    private void ReconnectRouting() => _connectPreparation.Apply(() =>
+    {
+        if (!_dialWanted || !_active || _boundTarget is not { } bound
+            || !ConfigRouting.Allowed(_transports.GetValueOrDefault(bound)))
+        {
+            return;
+        }
+
+        _restartRequired = true;
+        if (!string.Equals(bound, _selectedTarget, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _connectPreparation.Invalidate();
+        if (RevokePendingLaunch())
+        {
+            _log.Info("geo", "the routing policy changed; preparing a replacement VPN session");
+            _ = QueueConnectAsync();
+        }
+    });
 
     private void PushSnapshot()
     {
@@ -2187,24 +2257,27 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     // Re-materializes routing lists against the changed bases, refreshes caches, and pushes a fresh snapshot.
     private async Task AfterSourcesChangedAsync()
     {
-        var routed = _active ? RoutedList : null;
-        var before = routed is { } held ? await _store.GetRoutingListAsync(held).ConfigureAwait(false) : null;
         try
         {
             await _geo.RematerializeAllRoutingListsAsync().ConfigureAwait(false);
+            if (Volatile.Read(ref _appliedRequest) is { PlanStamp: { } applied, Name: var config })
+            {
+                var transport = _transports.GetValueOrDefault(config);
+                var next = await PrepareSessionPlanAsync(config, transport, CancellationToken.None).ConfigureAwait(false);
+                if (!string.Equals(applied, next.Stamp, StringComparison.Ordinal))
+                {
+                    ReconnectRouting();
+                }
+            }
         }
-        catch (Exception)
+        catch (NotSupportedException ex)
         {
+            _log.Warn("geo", ex.Message);
+            ReconnectRouting();
         }
-
-        // The tunnel routes by the plan it was raised with. A base that changed what the routed list carries reaches
-        // it only with a fresh tunnel, and the owner is told so rather than having the tunnel raised behind their
-        // back: what the list sends through it goes past it while the tunnel is down.
-        if (before is not null && routed is { } listId && !_restartRequired
-            && !SameCarry(before, await _store.GetRoutingListAsync(listId).ConfigureAwait(false)))
+        catch (Exception ex)
         {
-            _restartRequired = true;
-            _log.Info("agent", "the refreshed rule databases change what the routing list carries; they apply on the next connect");
+            _log.Error("geo", "the updated routing lists could not be prepared", ex);
         }
 
         await RefreshRoutingSummariesAsync().ConfigureAwait(false);
@@ -2354,12 +2427,14 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             }
 
             _log.Info("agent", $"programs found again for {string.Join(", ", search.Changed.Select(name => "app:" + name))}");
-            if (_active && RoutedList is { } listId
-                && await _store.GetRoutingListStampAsync(listId).ConfigureAwait(false) is { } stamp
-                && AppFinds.NamesOf(stamp.Rules).Intersect(search.Changed, StringComparer.OrdinalIgnoreCase).Any())
+            foreach (var id in Volatile.Read(ref _routingSelection) ?? [])
             {
-                _log.Info("agent", "the routed list names other programs now; the session is built again with them");
-                _ = SetConnectionAsync("connect");
+                if (await _store.GetRoutingListStampAsync(id).ConfigureAwait(false) is { } stamp
+                    && AppFinds.NamesOf(stamp.Rules).Intersect(search.Changed, StringComparer.OrdinalIgnoreCase).Any())
+                {
+                    ReconnectRouting();
+                    break;
+                }
             }
 
             PushSnapshot();
@@ -2580,7 +2655,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         await EnsureInitAsync().ConfigureAwait(false);
         var full = string.Equals(args[0], "full", StringComparison.OrdinalIgnoreCase);
         // A session behind the relay has no ceiling: what the route table will not hold, the relay decides.
-        var relayable = RouteBudget.Relayable && RouterEnabled();
+        var relayable = PerAppSupported && RouterEnabled();
         if (relayable && full)
         {
             return new IpcAck(true, "{\"limit\":0,\"trims\":0}");
@@ -3323,25 +3398,27 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     {
         await RefreshOffersAsync().ConfigureAwait(false);
         await RefreshSubscriptionMembersAsync().ConfigureAwait(false);
-        if (await RefreshRoutingSelectionAsync().ConfigureAwait(false) && _active)
-        {
-            _restartRequired = true;
-        }
+        var routingChanged = await RefreshRoutingSelectionAsync().ConfigureAwait(false);
 
         FindAppsLater();
         if (_active && string.Equals(_boundTarget, config, StringComparison.Ordinal))
         {
             var (changed, available) = await KeepServerListsAsync(config).ConfigureAwait(false);
-            if (changed || !available)
-            {
-                _restartRequired = true;
-            }
+            routingChanged |= changed || !available;
         }
 
         await RefreshRoutingSummariesAsync().ConfigureAwait(false);
         await RefreshGeoSourcesAsync().ConfigureAwait(false);
+        if (routingChanged)
+        {
+            ReconnectRouting();
+        }
+
         PushSnapshot();
-        RedialForFront(config);
+        if (!routingChanged)
+        {
+            RedialForFront(config);
+        }
     }
 
     // Dials the tunnel again when it stands dialing a websocket front the server of its configuration no longer names.
@@ -3507,229 +3584,53 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         Journal(SwitchLog.RoutingList(await ListNameAsync(previous).ConfigureAwait(false), await ListNameAsync(picked).ConfigureAwait(false)));
         var same = !changed && !_restartRequired;
         PushSnapshot();
-        if (_active && !same)
+        if (!same)
         {
-            _ = SetConnectionAsync("connect");
+            ReconnectRouting();
         }
 
         return Ok();
     }
 
-    // Reuse only the plan committed together with the request that owns it.
-    private async Task<(string Mode, string[] Packages, string[] Bypass, GeoRoutingPlan Plan, string Stamp, bool Rebuilt)>
-        PrepareSessionPlanAsync(bool useRouter, long? listId)
+    private async Task<(GeoRoutingPlan Plan, string Stamp, string? AppMode, string[] Apps, string[] Bypass)>
+        PrepareSessionPlanAsync(string config, ConfigTransport? transport, CancellationToken ct)
     {
-        await EnsureInitAsync().ConfigureAwait(false);
-        var stamp = AppFinds.ExpandStamp(listId is { } id
-            ? await _store.GetRoutingListStampAsync(id).ConfigureAwait(false) : null, _appFinds);
-        var settings = listId is { } settingsId
-            ? await _store.GetRoutingSettingsAsync(settingsId).ConfigureAwait(false) : null;
-        var split = AppSplit(stamp, settings, useRouter);
-        var mark = RoutingPlanStamp.Of(stamp, settings, InboundRanges(), useRouter, PerAppSupported, _routeTtl, _splitLimit);
-        if (VpnBridge.ReadRequest() is { Plan: { } held, PlanStamp: { } heldStamp }
-            && string.Equals(heldStamp, mark, StringComparison.Ordinal))
+        var policy = ConfigRouting.Allowed(transport)
+            ? await _geo.LoadPolicyAsync(await _store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false),
+                AppRulePlatform.Android, ct: ct).ConfigureAwait(false)
+            : null;
+        var inbound = transport is { AllowInbound: true } && _configs.TryGetValue(config, out var text)
+            ? TunnelInbound.Ranges(WgConfigEditor.GetAddresses(text), WgConfigEditor.GetAllowedIps(text), transport.InboundNetwork)
+            : [];
+        var session = GeoRoutingPlan.FromPolicy(policy, transport?.UseRouter != false, transport?.UseIpv6 == true, (int)Build.VERSION.SdkInt,
+            inbound, _routeTtl, _splitLimit, IsPackageInstalled);
+        if (session.Plan.UseConfigRoutes && _configs.TryGetValue(config, out var configText)
+            && !RouteBudget.Fits(session.Plan.RoutesForFamily(WgConfigEditor.GetAllowedIps(configText), transport?.UseIpv6 == true).Count, 0))
         {
-            return (split.Mode, split.Packages, split.Bypass, held, mark, false);
+            throw new NotSupportedException("The profile's AllowedIPs exceed the Android VPN Binder budget.");
         }
 
-        var plan = await BuildPlanAsync(useRouter, listId).ConfigureAwait(false);
-        return (split.Mode, split.Packages, split.Bypass, plan, mark, true);
+        return session;
     }
 
-    // Выбранный список, если выбранная конфигурация его берёт.
-    private long? RoutedList =>
-        _selectedTarget is { Length: > 0 } name
-        && !ConfigRouting.Allowed(_transports.GetValueOrDefault(name))
-            ? null
-            : SelectedRoutingList;
-
-    // Соединение приписывается своему владельцу начиная с Android 10.
-    private static bool PerAppSupported => Build.VERSION.SdkInt >= BuildVersionCodes.Q;
-
-    // Приложения, которым отдан туннель, и те, что идут мимо него.
-    private static (string Mode, string[] Packages, string[] Bypass) AppSplit(RoutingListStamp? list, RoutingSettings? settings, bool useRouter)
+    private static bool IsPackageInstalled(string package)
     {
-        if (list is null || !useRouter)
+        try
         {
-            return ("off", [], []);
+            return !string.Equals(package, Application.Context.PackageName, StringComparison.Ordinal)
+                && Application.Context.PackageManager?.GetPackageInfo(package, 0) is not null;
         }
-
-        var bypass = AppPackages(RuleApps(list.Rules, RouteRole.Direct));
-        if (settings is { UseGlobalProxy: true })
+        catch (global::Android.Content.PM.PackageManager.NameNotFoundException)
         {
-            return ("off", [], bypass);
+            return false;
         }
-
-        var packages = AppPackages(RuleApps(list.Rules, RouteRole.Proxy));
-        return packages.Length > 0 ? ("include", packages, bypass) : ("off", [], bypass);
     }
 
-    // Значения правил приложений одной корзины.
-    private static IReadOnlyList<string> RuleApps(IReadOnlyList<GeoRule> rules, RouteRole role) =>
-        [.. rules.Where(rule => rule.Kind == GeoRuleKind.App && rule.Role == role).Select(rule => rule.Value)];
+    // The first ID is retained for single-list callers until the multi-list IPC task.
+    private long? RoutedList => _selectedTarget is { Length: > 0 } name
+        && ConfigRouting.Allowed(_transports.GetValueOrDefault(name)) ? SelectedRoutingList : null;
 
-    // The rules the session routes by. Addresses stay ranges and names stay names: a name resolved to a fresh
-    // address keeps its verdict, which a set of host routes fixed at connect never could.
-    private async Task<GeoRoutingPlan> BuildPlanAsync(bool useRouter, long? routedList)
-    {
-        if (routedList is not { } listId)
-        {
-            return GeoRoutingPlan.Full with { UseRouter = useRouter };
-        }
-
-        await EnsureInitAsync().ConfigureAwait(false);
-        var stored = await _store.GetRoutingListAsync(listId).ConfigureAwait(false);
-        if (stored is null)
-        {
-            return GeoRoutingPlan.Full;
-        }
-
-        var list = AppFinds.Expand(stored, _appFinds);
-
-        var settings = await _store.GetRoutingSettingsAsync(listId).ConfigureAwait(false);
-        // Inbound access rides the tunnel bucket: the tun then carries those ranges and the router sends the answers back.
-        var proxyRoutes = new List<string>(list.Routes);
-        foreach (var inbound in InboundRanges())
-        {
-            if (!proxyRoutes.Contains(inbound))
-            {
-                proxyRoutes.Add(inbound);
-            }
-        }
-
-        var excludedRoutes = new List<string>();
-        var excludedDomains = new List<GeoDomain>();
-        SplitExclusions(settings?.Exclusions, excludedRoutes, excludedDomains);
-        var directRoutes = new List<string>(list.DirectRoutes);
-        directRoutes.AddRange(excludedRoutes);
-        var directDomains = new List<GeoDomain>(list.DirectDomains);
-        directDomains.AddRange(excludedDomains);
-
-        // The share of the route table: every rule weighed apart, in the order of the list, the exclusions of the
-        // settings last. A rule heavier than half the threshold and the ones past it are decided on the fly.
-        var unfolded = await _geo.UnfoldEachAsync(list.Rules).ConfigureAwait(false);
-        var weights = unfolded.Select(rule => rule.Weight).ToList();
-        weights.Add(SplitBudget.Weight(excludedRoutes.Count, excludedDomains.Count));
-        var share = SplitBudget.Share(weights, _splitLimit);
-        var heldRoutes = new List<string>(InboundRanges());
-        var heldDomains = new List<GeoDomain>();
-        for (var i = 0; i < unfolded.Count; i++)
-        {
-            if (share.Held[i])
-            {
-                heldRoutes.AddRange(unfolded[i].Routes);
-                heldDomains.AddRange(unfolded[i].Domains);
-            }
-        }
-
-        if (share.Held[^1])
-        {
-            heldRoutes.AddRange(excludedRoutes);
-            heldDomains.AddRange(excludedDomains);
-        }
-
-        // An application the list names rides the tunnel wherever no rule decided for the destination: behind the
-        // relay the owner of every connection is named, so the rules keep deciding for everyone and the
-        // applications only add to them. The relay stands where the list carries or blocks anything of its own, a
-        // part of it is decided on the fly or every datagram is carried; a list of applications alone restricts the
-        // tunnel itself to them, which is what the whole tunnel below stands for, and no other application is shown
-        // a vpn.
-        var apps = AppPackages(list.Apps);
-        var perApp = settings is not { UseGlobalProxy: true } && useRouter && apps.Length > 0;
-        var own = proxyRoutes.Count + list.Domains.Count + list.BlockRoutes.Count + list.BlockDomains.Count > 0;
-        var attributed = PerAppSupported && (own || share.AnyLive || settings is { AllUdp: true, UseGlobalProxy: false });
-        if (perApp && own && !PerAppSupported)
-        {
-            _log.Warn("geo", $"routing '{list.Name}': this Android names no owner of a connection, so the rules of the "
-                + "list ride with its applications alone");
-        }
-        var plan = new GeoRoutingPlan(
-            proxyRoutes,
-            directRoutes,
-            list.BlockRoutes,
-            list.Domains,
-            directDomains,
-            list.BlockDomains,
-            settings is { UseGlobalProxy: true } || (perApp && !attributed),
-            settings is { AllUdp: true, UseGlobalProxy: false },
-            _routeTtl)
-        {
-            TunnelApps = perApp && attributed ? apps : [],
-            UseRouter = useRouter,
-            SplitLimit = _splitLimit,
-            Live = share.AnyLive,
-            HeldRoutes = share.AnyLive ? heldRoutes : [],
-            HeldDomains = share.AnyLive ? heldDomains : [],
-            HeldWeight = share.HeldWeight,
-            LiveWeight = share.LiveWeight,
-        };
-
-        // A list that decides nothing would leave every destination off the tunnel; the whole tunnel is the safer read.
-        if (!plan.HasRules && !perApp)
-        {
-            _log.Warn("geo", $"routing '{list.Name}': the list decides nothing, running the full tunnel instead");
-            return GeoRoutingPlan.Full;
-        }
-
-        _log.Info("geo", $"routing '{list.Name}': {plan.ProxyRoutes.Count}/{plan.DirectRoutes.Count}/{plan.BlockRoutes.Count} ranges, "
-            + $"{plan.ProxyDomains.Count}/{plan.DirectDomains.Count}/{plan.BlockDomains.Count} names, "
-            + ModeName(perApp ? apps.Length : 0, attributed, plan.FullTunnel)
-            + (plan.AllUdp ? ", all udp tunneled" : string.Empty)
-            + (share.AnyLive ? $", {share.LiveWeight} of {share.HeldWeight + share.LiveWeight} entries decided on the fly" : string.Empty));
-        return plan;
-    }
-
-    // Ranges the tunnel may reach this device from; empty unless the target answers what arrives from it.
-    private IReadOnlyList<string> InboundRanges()
-    {
-        if (_selectedTarget is not { Length: > 0 } name
-            || _transports.GetValueOrDefault(name) is not { AllowInbound: true } transport
-            || !_configs.TryGetValue(name, out var text))
-        {
-            return [];
-        }
-
-        return TunnelInbound.Ranges(WgConfigEditor.GetAddresses(text), WgConfigEditor.GetAllowedIps(text), transport.InboundNetwork);
-    }
-
-    // How the session reads in the log: rules deciding each destination with the named applications added to them,
-    // the tunnel restricted to those applications, everything tunneled, or the rules alone.
-    private static string ModeName(int apps, bool attributed, bool fullTunnel)
-    {
-        if (apps > 0)
-        {
-            return attributed
-                ? $"split, {apps} application(s) tunneled on top of the rules"
-                : "per-app tunnel";
-        }
-
-        return fullTunnel ? "full tunnel" : "split";
-    }
-
-    // Splits the free-text exclusions into what the router classifies: an address becomes a direct range, anything
-    // else a direct name.
-    private static void SplitExclusions(string? text, List<string> routes, List<GeoDomain> domains)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return;
-        }
-
-        var separators = new[] { ',', ';', '\n', '\r', ' ', '\t' };
-        foreach (var token in text.Split(separators, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            var slash = token.IndexOf('/');
-            var head = slash < 0 ? token : token[..slash];
-            if (System.Net.IPAddress.TryParse(head, out _))
-            {
-                routes.Add(token);
-            }
-            else
-            {
-                domains.Add(new GeoDomain(GeoDomainKind.Domain, token, Named: true));
-            }
-        }
-    }
+    private static bool PerAppSupported => RouteBudget.SupportsOwner((int)Build.VERSION.SdkInt);
 
     private static int SubscriptionInterval(string? value)
     {
@@ -4265,10 +4166,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         await EnsureInitAsync().ConfigureAwait(false);
-        var list = RoutedList is { } listId
-            && await _store.GetRoutingListStampAsync(listId).ConfigureAwait(false) is { } assigned
-                ? assigned.Name
-                : string.Empty;
+        var list = Volatile.Read(ref _appliedRequest)?.Plan?.ListName ?? string.Empty;
         return new IpcAck(true, (report with { List = list }).ToPayload());
     }
 
@@ -4366,16 +4264,24 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     // that the tunnel is built as an allow list of them instead - the answer follows the mode in force.
     private async Task<(TargetInspector Inspector, bool Whole)> RulesAsync(CancellationToken ct)
     {
-        var routed = RoutedList;
-        var list = routed is { } listId && await _store.GetRoutingListAsync(listId, ct).ConfigureAwait(false) is { } stored
-            ? AppFinds.Expand(stored, _appFinds)
+        if (Volatile.Read(ref _appliedRequest) is { Plan: { } applied } request && request.PlanStamp is not null)
+        {
+            IReadOnlyList<string> appliedApps = applied.FlowRules ? applied.TunnelApps : request.AppList ?? [];
+            IReadOnlyList<string> direct = applied.FlowRules ? applied.DirectApps : request.BypassApps ?? [];
+            var list = applied.ListIds.Count == 0 ? null : new RoutingList(applied.ListIds[0], applied.ListName, [],
+                applied.ProxyRoutes, applied.ProxyDomains, PackageRules(appliedApps), applied.DirectRoutes,
+                applied.DirectDomains, PackageRules(direct), applied.BlockRoutes, applied.BlockDomains);
+            var scope = applied.FlowRules ? AppScope.Additive : request.AppMode == "include" ? AppScope.Exclusive : AppScope.None;
+            return (new TargetInspector(list, !applied.FullTunnel, scope), applied.FullTunnel);
+        }
+
+        var policy = RoutedList is not null
+            ? await _geo.LoadPolicyAsync(Volatile.Read(ref _routingSelection), AppRulePlatform.Android, ct: ct).ConfigureAwait(false)
             : null;
-        var settings = routed is { } id
-            ? await _store.GetRoutingSettingsAsync(id, ct).ConfigureAwait(false)
-            : null;
-        var full = settings?.UseGlobalProxy ?? false;
-        // Without a list the tun carries everything, so nothing is left outside it to be put back in.
-        return (new TargetInspector(list, !full, AppMode(list, settings, RouterEnabled())), routed is null || full);
+        var full = policy?.Settings?.UseGlobalProxy == true;
+        return (new TargetInspector(policy?.List, !full), policy is null || full);
+
+        static string[] PackageRules(IEnumerable<string> packages) => [.. packages.Select(package => "pkg=" + package)];
     }
 
     // Measures one destination over the path asked for. The tun fixes its routes at establish, so the tunnel
@@ -5008,57 +4914,10 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
     }
 
-    // Whether the applications the selected list names ride the tunnel by connection, under the relay: the plan in
-    // force says so.
-    private bool AttributedNow() => RoutedList is not null && _planAttributed == true;
-
-    // The app set from the selected routing list's app:pkg rules, as the allow list the tunnel falls back to where
-    // a connection cannot be traced to its owner, and the set its Direct bucket names, which the tunnel leaves
-    // alone whatever the mode; ("off", [], []) when none.
-    private async Task<(string Mode, string[] Packages, string[] Bypass)> ResolveAppSplitFromRoutingAsync(bool useRouter)
-    {
-        if (RoutedList is not { } listId || !useRouter)
-        {
-            return ("off", [], []);
-        }
-
-        await EnsureInitAsync().ConfigureAwait(false);
-        var settings = await _store.GetRoutingSettingsAsync(listId).ConfigureAwait(false);
-        return AppSplit(AppFinds.ExpandStamp(await _store.GetRoutingListStampAsync(listId).ConfigureAwait(false), _appFinds), settings, useRouter);
-    }
-
-    // What the app rules of a list do here: they add to the rules where the relay stands, and hold the tunnel to
-    // themselves where it does not.
-    private AppScope AppMode(RoutingList? list, RoutingSettings? settings, bool useRouter)
-    {
-        if (!useRouter || settings is { UseGlobalProxy: true } || AppPackages(list?.Apps).Length == 0)
-        {
-            return AppScope.None;
-        }
-
-        return list is not null && _planAttributed == true ? AppScope.Additive : AppScope.Exclusive;
-    }
-
     // Whether the selected configuration decides connections on its own: the flag rides with the tunnel, not
     // with the rules, and a configuration that never said otherwise does.
     private bool RouterEnabled() =>
         _selectedTarget is not { Length: > 0 } name || _transports.GetValueOrDefault(name)?.UseRouter != false;
-
-    // The packages a routing list names, without the marker they are stored under.
-    private static string[] AppPackages(IReadOnlyList<string>? apps)
-    {
-        const string prefix = "pkg=";
-        if (apps is not { Count: > 0 })
-        {
-            return [];
-        }
-
-        return [.. apps
-            .Where(a => a.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-            .Select(a => a[prefix.Length..].Trim())
-            .Where(p => p.Length > 0)
-            .Distinct(StringComparer.Ordinal)];
-    }
 
     // Reads a window of one log table for the in-app viewer, newest first.
     private async Task<IpcAck> ReadLogAsync(IReadOnlyList<string> args)
@@ -5342,10 +5201,17 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             report.Append("endpoint     : ").Append(WgConfigEditor.GetEndpoint(configText) ?? "(none)").Append('\n');
         }
 
-        var (appMode, appPkgs, bypassPkgs) = await ResolveAppSplitFromRoutingAsync(RouterEnabled());
-        report.Append("app rules    : ").Append(AppRulesLine(appMode, appPkgs.Length, AttributedNow())).Append('\n');
-        report.Append("apps off tun : ").Append(bypassPkgs.Length == 0 ? "none" : string.Join(", ", bypassPkgs)).Append('\n');
-        AppendRoutingReport(report);
+        if (Volatile.Read(ref _appliedRequest) is { } applied)
+        {
+            report.Append("applied routing : ").Append(applied.PlanStamp ?? "(legacy)").Append('\n');
+            report.Append("applied lists   : ").AppendJoin(", ", applied.Plan?.ListIds ?? []).Append('\n');
+            if (applied.Plan is { SelectionPlan: true } plan)
+            {
+                report.Append("requested all UDP : ").Append(plan.RequestedAllUdp ? "on" : "off").Append('\n');
+            }
+        }
+
+        report.Append("selected lists  : ").AppendJoin(", ", Volatile.Read(ref _routingSelection) ?? []).Append('\n');
         report.Append("log level    : ").Append(_logLevel).Append('\n');
         report.Append("direct tcp   : ").Append(_directTcp ? "on" : "off").Append('\n');
         report.Append("exclude routes: ").Append(_excludeRoutes ? "on" : "off").Append('\n');
@@ -5353,37 +5219,6 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         report.Append("tunnel notice: ").Append(_tunnelNotice).Append('\n');
         report.Append("route log    : ").Append(_routeLog ? "on" : "off").Append('\n');
         return new IpcAck(true, report.ToString());
-    }
-
-    // The applications the list keeps off the tunnel, appended to the connect line.
-    private static string BypassLine(int apps) => apps == 0 ? string.Empty : $", {apps} application(s) off the tunnel";
-
-    // What the applications a list names get in the session the next connect builds.
-    private static string AppRulesLine(string mode, int apps, bool attributed)
-    {
-        if (mode == "off" || apps == 0)
-        {
-            return "off";
-        }
-
-        return attributed
-            ? $"{apps} application(s) tunneled on top of the rules"
-            : $"{apps} application(s) alone ride the tunnel, the rest pass every rule by";
-    }
-
-    // Appends the selected routing list and its rule counts to the runtime report.
-    private void AppendRoutingReport(System.Text.StringBuilder report)
-    {
-        if (RoutedList is not { } listId)
-        {
-            report.Append("routing list : (off)\n");
-            return;
-        }
-
-        var summary = _routingSummaries?.FirstOrDefault(r => r.Id == listId);
-        report.Append("routing list : ").Append(summary?.Name ?? listId.ToString(CultureInfo.InvariantCulture)).Append('\n');
-        report.Append("  routes         : ").Append(summary?.RouteCount ?? 0).Append('\n');
-        report.Append("  domains        : ").Append(summary?.DomainCount ?? 0).Append('\n');
     }
 
     private static bool IsKnownLogTable(string name) => name is SqliteLogStore.AgentTable or SqliteLogStore.DnsTable

@@ -44,6 +44,11 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _owners = new(StringComparer.Ordinal);
     private readonly HashSet<string> _apps;
+    private readonly HashSet<string> _directApps;
+    private readonly HashSet<string> _blockApps;
+    private readonly bool _flowRules;
+    private readonly bool _needsOwner;
+    private readonly DnsRouteHints? _dnsHints;
     private readonly ConcurrentDictionary<Socket, byte> _open = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly Func<int, bool> _protect;
@@ -69,7 +74,7 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
     /// <summary>
     /// ctor
     /// </summary>
-    public ProxyRelay(GeoRoutingPlan plan, Func<int, bool> protect, Action<string> log, Func<IPEndPoint, IPEndPoint, int> caller, Func<IPEndPoint, IPEndPoint, string?>? owner, Action<IPAddress>? refuse = null)
+    public ProxyRelay(GeoRoutingPlan plan, Func<int, bool> protect, Action<string> log, Func<IPEndPoint, IPEndPoint, int> caller, Func<IPEndPoint, IPEndPoint, string?>? owner, Action<IPAddress>? refuse = null, DnsRouteHints? dnsHints = null)
     {
         _names = new NameRules(plan.ProxyDomains, plan.DirectDomains, plan.BlockDomains);
         _proxyRanges = GeoIpRanges.Build(plan.ProxyRoutes);
@@ -83,6 +88,11 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
             ? (plan.HasRules || plan.TunnelApps.Count > 0 ? SessionReport.ModeFull : SessionReport.ModeOff)
             : SessionReport.ModeSplit;
         _apps = new HashSet<string>(plan.TunnelApps, StringComparer.Ordinal);
+        _directApps = new HashSet<string>(plan.DirectApps, StringComparer.Ordinal);
+        _blockApps = new HashSet<string>(plan.BlockApps, StringComparer.Ordinal);
+        _flowRules = plan.FlowRules;
+        _needsOwner = plan.HasFlowApps;
+        _dnsHints = dnsHints;
         _protect = protect;
         _log = log;
         _caller = caller;
@@ -321,17 +331,17 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
         };
     }
 
-    // Turns a destination into an action: an application the list names rides the tunnel whatever the rules say of
-    // the destination, a rule that decided sends everyone else, and the tunnel flag says where the rest belongs.
+    // The report uses the last decision and the default for entries without traffic.
     private RouteVerdict Effective(RouteVerdict verdict, string app)
     {
-        if (app.Length > 0 && _apps.Contains(app))
-        {
-            return RouteVerdict.Proxy;
-        }
-
-        return verdict != RouteVerdict.None ? verdict : _undecided;
+        var fallback = ApplicationVerdict(app);
+        return verdict != RouteVerdict.None ? verdict : fallback != RouteVerdict.None ? fallback : _undecided;
     }
+
+    private RouteVerdict ApplicationVerdict(string package) =>
+        _blockApps.Contains(package) ? RouteVerdict.Block
+        : _directApps.Contains(package) ? RouteVerdict.Direct
+        : _apps.Contains(package) ? RouteVerdict.Proxy : RouteVerdict.None;
 
     private async Task AcceptAsync(Socket listener, CancellationToken ct)
     {
@@ -384,7 +394,7 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
 
             entry = Touch(request.Host);
             var app = NoteOwner(entry, request);
-            if (Effective(entry.Verdict, app) == RouteVerdict.Block)
+            if (entry.NameVerdict == RouteVerdict.Block)
             {
                 Interlocked.Increment(ref _blocked);
                 // The stream names the address behind the blocked name, so a datagram to it is refused as well.
@@ -492,19 +502,23 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
             // costs every connection to it the whole connect timeout before the working one is reached.
             var index = (Volatile.Read(ref entry.Preferred) + step) % addresses.Count;
             var address = addresses[index];
-            var verdict = Classify(entry.Verdict, address);
-            var way = Effective(verdict, app);
+            var range = ByAddress(address);
+            var hint = IPAddress.TryParse(entry.Host, out _) && GeoIpRanges.TryToNumeric(address, out var numeric)
+                ? _dnsHints?.Lookup(numeric) ?? RouteVerdict.None : RouteVerdict.None;
+            var way = GeoRoutingPlan.DecideFlow(range, entry.NameVerdict, hint, ApplicationVerdict(app),
+                !_needsOwner || app.Length > 0, _undecided);
             if (way == RouteVerdict.Block)
             {
                 entry.Verdict = RouteVerdict.Block;
-                return null;
+                continue;
             }
 
             var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
             Hold(socket);
-            if (way == RouteVerdict.Direct)
+            if (way == RouteVerdict.Direct && !_protect(socket.Handle.ToInt32()))
             {
-                _protect(socket.Handle.ToInt32());
+                Close(socket);
+                continue;
             }
 
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -512,7 +526,7 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
             try
             {
                 await socket.ConnectAsync(new IPEndPoint(address, port), timeout.Token).ConfigureAwait(false);
-                entry.Verdict = verdict;
+                entry.Verdict = way;
                 Volatile.Write(ref entry.Preferred, index);
                 return socket;
             }
@@ -562,15 +576,8 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
         }
     }
 
-    // A name that already decided keeps its verdict; an address only decides what the name left open, by the one set
-    // of the list that holds it.
-    private RouteVerdict Classify(RouteVerdict byName, IPAddress address)
+    private RouteVerdict ByAddress(IPAddress address)
     {
-        if (byName != RouteVerdict.None)
-        {
-            return byName;
-        }
-
         if (!GeoIpRanges.TryToNumeric(address, out var value))
         {
             return RouteVerdict.None;
@@ -603,7 +610,8 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
     private Entry Decide(string host)
     {
         var started = Environment.TickCount64;
-        var fresh = new Entry(host) { Verdict = ByName(host), LastTouch = started, Since = started, ReportedAt = started };
+        var verdict = ByName(host);
+        var fresh = new Entry(host) { NameVerdict = verdict, Verdict = verdict, LastTouch = started, Since = started, ReportedAt = started };
         _log($"relay: {host} -> {Word(fresh.Verdict)}");
         return fresh;
     }
@@ -685,7 +693,7 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
     // answer costs two round trips into the system.
     private string NoteOwner(Entry entry, Request request)
     {
-        if (_owner is null || (entry.App.Length > 0 && _apps.Count == 0))
+        if (_owner is null || (!_flowRules && entry.App.Length > 0 && _apps.Count == 0))
         {
             return entry.App;
         }
@@ -693,7 +701,7 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
         var name = _owner(request.Source, request.Destination);
         if (name is null)
         {
-            return entry.App;
+            return _flowRules ? string.Empty : entry.App;
         }
 
         if (entry.App.Length == 0)
@@ -860,6 +868,7 @@ internal sealed class ProxyRelay : IProxyOutbound, IDisposable
     {
         public string Host { get; } = host;
 
+        public RouteVerdict NameVerdict { get; init; }
         public RouteVerdict Verdict;
         public long LastTouch;
         public long Since;

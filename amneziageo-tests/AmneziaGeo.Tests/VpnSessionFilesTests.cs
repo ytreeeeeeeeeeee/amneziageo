@@ -51,6 +51,9 @@ public sealed class VpnSessionFilesTests
             Assert.Null(files.ReadStaged(second));
             Assert.Equal("second", restored.Name);
             Assert.Equal("198.51.100.0/24", Assert.Single(restored.Plan!.DirectRoutes));
+            Assert.Equal("second", restored.PlanStamp);
+            Assert.Equal(restored.PlanStamp, restored.Plan.Version);
+            Assert.Equal(["org.example.second"], restored.AppList);
         }
         finally
         {
@@ -59,6 +62,6 @@ public sealed class VpnSessionFilesTests
     }
 
     private static VpnRequest Request(string name, string range) =>
-        new("config", name, null, null, 0, false, null, 0,
-            Plan: GeoRoutingPlan.Full with { DirectRoutes = [range] });
+        new("config", name, "include", ["org.example." + name], 0, false, null, 0,
+            Plan: GeoRoutingPlan.Full with { DirectRoutes = [range], Version = name }, PlanStamp: name);
 }
