@@ -37,9 +37,6 @@ public sealed class ServerOffers
     /// </summary>
     public const int ForeignAnswers = 3;
 
-    // Two configs of one server answer at once: one of them adds what it hands out, the other finds it held.
-    private static readonly SemaphoreSlim _listing = new(1, 1);
-
     private readonly IStateStore _store;
     private readonly GeoConfigurator? _geo;
     private readonly Action<IReadOnlyList<GeoSource>>? _fetch;
@@ -50,6 +47,7 @@ public sealed class ServerOffers
     private readonly Func<string, bool>? _carried;
     private readonly Func<string, CancellationToken, Task<string?>>? _dialed;
     private readonly Action<string, Exception?>? _note;
+    private readonly Action<string>? _debug;
     private readonly TimeProvider _time;
     private readonly HashSet<string> _asking = new(StringComparer.Ordinal);
     private readonly object _lock = new();
@@ -68,10 +66,12 @@ public sealed class ServerOffers
         Func<IReadOnlyList<long>, CancellationToken, Task>? take = null,
         Func<string, bool>? carried = null,
         Func<ServiceTarget, CancellationToken, Task<HelloReply>>? askInside = null,
-        Func<string, CancellationToken, Task<string?>>? dialed = null)
+        Func<string, CancellationToken, Task<string?>>? dialed = null,
+        Action<string>? debug = null)
     {
         _store = store;
         _note = note;
+        _debug = debug;
         _ask = ask ?? ServerHello.AskAsync;
         _askInside = askInside ?? ServerHello.AskAsync;
         _carried = carried;
@@ -283,7 +283,10 @@ public sealed class ServerOffers
 
         var bound = await BindAsync(config, text, offer, ct).ConfigureAwait(false);
         var listed = await ListAsync(config, offer, ct).ConfigureAwait(false);
-        var limited = offer.PresetsOnly != (kept?.Offer.PresetsOnly ?? false);
+        var previous = kept?.Offer ?? ServerOffer.None;
+        var limited = offer.PresetsOnly != previous.PresetsOnly;
+        var allowedChanged = offer.PresetsOnly && !offer.Presets().Select(one => (one.Id, one.Default))
+            .SequenceEqual(previous.Presets().Select(one => (one.Id, one.Default)));
         if (limited)
         {
             _note?.Invoke(offer.PresetsOnly
@@ -291,7 +294,7 @@ public sealed class ServerOffers
                 : $"{config}: the server allows any routing list again", null);
         }
 
-        return (offer, bound || listed || limited);
+        return (offer, bound || listed || limited || allowedChanged);
     }
 
     // Asks the server inside the tunnel, while the tunnel of the config carries and the server named where it answers
@@ -376,6 +379,14 @@ public sealed class ServerOffers
         try
         {
             await take(taking, ct).ConfigureAwait(false);
+            if (_rerouted is { } rerouted && await _store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false) is { } selected)
+            {
+                var origins = await _store.ListRoutingListOriginsAsync(ct).ConfigureAwait(false);
+                if (origins.Any(origin => origin.Pending is null && taking.Contains(origin.ListId) && selected.Contains(origin.ListId)))
+                {
+                    rerouted();
+                }
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -391,7 +402,7 @@ public sealed class ServerOffers
     {
         var sources = offer.Sources();
         var presets = offer.Presets();
-        await _listing.WaitAsync(ct).ConfigureAwait(false);
+        await OfferedLists.VersionGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             var taken = await OfferedLists.TakeSourcesAsync(_store, sources, ct).ConfigureAwait(false);
@@ -413,7 +424,7 @@ public sealed class ServerOffers
             var lists = await OfferedLists.TakePresetsAsync(_store, geo, config, presets, ct).ConfigureAwait(false);
             if (lists.Any)
             {
-                var use = lists.InUse is null ? string.Empty : "; a list the server marks default was put in use";
+                var use = lists.InUse is { Count: > 0 } selected ? $"; {selected.Count} default list(s) put in use" : string.Empty;
                 var kept = lists.TakeNow.Count == 0 ? string.Empty : $", {lists.TakeNow.Count} read-only taking the newer version";
                 var marks = lists.Marked == 0 ? string.Empty : $", {lists.Marked} made read-only or ordinary again";
                 _note?.Invoke($"{config}: of the routing lists of the server {lists.Added} added, {lists.Waiting} with a newer version{kept}{marks}{use}", null);
@@ -422,6 +433,10 @@ public sealed class ServerOffers
             if (lists.InUse is not null)
             {
                 _rerouted?.Invoke();
+            }
+            else if (lists.KeptSelection)
+            {
+                _debug?.Invoke($"{config}: the existing routing list selection was kept");
             }
 
             return (taken.Any || lists.Any, lists.TakeNow);
@@ -434,7 +449,7 @@ public sealed class ServerOffers
         }
         finally
         {
-            _listing.Release();
+            OfferedLists.VersionGate.Release();
         }
     }
 

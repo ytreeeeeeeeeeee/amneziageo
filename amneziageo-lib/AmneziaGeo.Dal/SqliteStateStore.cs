@@ -2806,8 +2806,13 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
     }
 
     /// <inheritdoc/>
-    public async Task RemoveRoutingListAsync(long id, CancellationToken ct = default)
+    public Task RemoveRoutingListAsync(long id, CancellationToken ct = default) =>
+        TryRemoveRoutingListAsync(id, _ => true, ct);
+
+    /// <inheritdoc/>
+    public async Task<bool> TryRemoveRoutingListAsync(long id, Func<IReadOnlyList<long>?, bool> canRemove, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(canRemove);
         var lease = await LeaseAsync(ct).ConfigureAwait(false);
         await using (lease.ConfigureAwait(false))
         {
@@ -2817,6 +2822,11 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
             await using (transaction.ConfigureAwait(false))
             {
                 var selected = ParseRoutingSelection(await ReadRoutingSelectionAsync(connection, transaction, ct).ConfigureAwait(false));
+                if (!canRemove(selected))
+                {
+                    return false;
+                }
+
                 if (selected is not null && selected.Contains(id))
                 {
                     await WriteRoutingSelectionAsync(connection, transaction, selected.Where(item => item != id).ToArray(), ct)
@@ -2870,6 +2880,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
                 }
 
                 await transaction.CommitAsync(ct).ConfigureAwait(false);
+                return true;
             }
         }
     }
@@ -3159,7 +3170,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
     public async Task<long?> GetSelectedRoutingListAsync(CancellationToken ct = default)
     {
         var ids = await GetSelectedRoutingListsAsync(ct).ConfigureAwait(false);
-        return ids is { Count: 1 } ? ids[0] : null;
+        return ids is { Count: > 0 } ? ids[0] : null;
     }
 
     /// <inheritdoc/>

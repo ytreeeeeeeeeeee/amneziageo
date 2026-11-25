@@ -77,7 +77,7 @@ public sealed class ServerListsOnlyTests : IAsyncLifetime
         Assert.NotNull(limit);
         Assert.Equal("office", limit.Config);
         Assert.Equal([ids["Unblock"], ids["Work"]], limit.Lists);
-        Assert.Equal(ids["Work"], limit.Pick);
+        Assert.Equal([ids["Work"]], limit.Fallback);
     }
 
     [Fact]
@@ -88,7 +88,7 @@ public sealed class ServerListsOnlyTests : IAsyncLifetime
 
         var limit = await ServerListsOnly.OfAsync(_store, "office", CancellationToken.None);
 
-        Assert.Equal(ids["Unblock"], limit!.Pick);
+        Assert.Equal([ids["Unblock"]], limit!.Fallback);
     }
 
     [Fact]
@@ -112,12 +112,22 @@ public sealed class ServerListsOnlyTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task AServerWhoseListsTheDeviceNoLongerHolds_SetsNoLimit()
+    public async Task AServerWhoseListsTheDeviceNoLongerHoldsStillRejectsUnrelatedLists()
     {
         await AskAsync(true, Item(First, "Unblock", Morning));
         await _store.RemoveRoutingListAsync((await IdsAsync())["Unblock"]);
+        var geo = new GeoConfigurator(_store, new NoFiles());
+        var own = await geo.ApplyToRoutingListAsync(0, "Mine", ["proxy|geosite:openai"]);
+        await _store.SetSelectedRoutingListAsync(own);
 
-        Assert.Null(await ServerListsOnly.OfAsync(_store, "office", CancellationToken.None));
+        var limit = await ServerListsOnly.OfAsync(_store, "office", CancellationToken.None);
+
+        Assert.NotNull(limit);
+        Assert.False(limit.Available);
+        Assert.Empty(limit.Lists);
+        Assert.NotNull(ServerListsOnly.RefusalOfSet(limit, [own]));
+        Assert.False(await ServerListsOnly.EnforceSelectionAsync(_store, limit, CancellationToken.None));
+        Assert.Equal([own], await _store.GetSelectedRoutingListsAsync());
     }
 
     [Fact]
@@ -160,10 +170,48 @@ public sealed class ServerListsOnlyTests : IAsyncLifetime
         var own = await geo.ApplyToRoutingListAsync(0, "Mine", ["proxy|geosite:openai"]);
         var limit = await ServerListsOnly.OfAsync(_store, "office", CancellationToken.None);
 
-        Assert.Equal(server, ServerListsOnly.Switch(limit, own));
-        Assert.Equal(server, ServerListsOnly.Switch(limit, null));
-        Assert.Null(ServerListsOnly.Switch(limit, server));
-        Assert.Null(ServerListsOnly.Switch(null, own));
+        await _store.SetSelectedRoutingListAsync(own);
+
+        Assert.True(await ServerListsOnly.EnforceSelectionAsync(_store, limit, CancellationToken.None));
+        Assert.Equal([server], await _store.GetSelectedRoutingListsAsync());
+        Assert.False(await ServerListsOnly.EnforceSelectionAsync(_store, limit, CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ARestrictionKeepsAllowedMembersOrFallsBackToAllAllowedDefaults(bool hasAllowedMember)
+    {
+        await AskAsync(true, Item(First, "Unblock", Morning, marked: true), Item(Second, "Work", Morning, marked: true));
+        var ids = await IdsAsync();
+        var geo = new GeoConfigurator(_store, new NoFiles());
+        var own = await geo.ApplyToRoutingListAsync(0, "Mine", ["proxy|geosite:openai"]);
+        var limit = await ServerListsOnly.OfAsync(_store, "office", CancellationToken.None);
+        var allowed = new[] { ids["Unblock"], ids["Work"] };
+        await _store.UpdateSelectedRoutingListsAsync(_ => hasAllowedMember ? [allowed[1], own] : [own]);
+
+        Assert.Null(ServerListsOnly.RefusalOfSet(limit, allowed));
+        Assert.NotNull(ServerListsOnly.RefusalOfSet(limit, [allowed[0], own]));
+        Assert.NotNull(ServerListsOnly.RefusalOfSet(limit, []));
+        Assert.True(await ServerListsOnly.EnforceSelectionAsync(_store, limit, CancellationToken.None));
+        Assert.Equal(hasAllowedMember ? [allowed[1]] : allowed, await _store.GetSelectedRoutingListsAsync());
+        Assert.False(await ServerListsOnly.EnforceSelectionAsync(_store, limit, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task TwoConcurrentRemovalsCannotDeleteTheEntireRestrictedSelection()
+    {
+        await AskAsync(true, Item(First, "Unblock", Morning, marked: true), Item(Second, "Work", Morning, marked: true));
+        var limit = await ServerListsOnly.OfAsync(_store, "office", CancellationToken.None);
+        Assert.NotNull(limit);
+
+        var refusals = await Task.WhenAll(limit.Lists.Select(id =>
+            ServerListsOnly.RemoveAsync(_store, limit, id, CancellationToken.None)));
+
+        Assert.Single(refusals, refusal => refusal is null);
+        Assert.Single(refusals, refusal => refusal is { Ok: false });
+        var remaining = Assert.Single((await _store.GetSelectedRoutingListsAsync())!);
+        Assert.Equal(remaining, Assert.Single(await _store.ListRoutingListsAsync()).Id);
     }
 
     [Fact]
@@ -208,6 +256,29 @@ public sealed class ServerListsOnlyTests : IAsyncLifetime
         await Asked(false, Item(First, "Unblock", Morning)).AskEachAsync([("office", Text)], Tell, CancellationToken.None);
 
         Assert.Equal(["office", "office"], told);
+    }
+
+    [Fact]
+    public async Task WithdrawalOfAnEditablePresetIsReportedWithTheRestrictionStillOn()
+    {
+        var first = Item(First, "Unblock", Morning, marked: true);
+        var second = Item(Second, "Work", Morning, marked: true);
+        await AskAsync(true, first, second);
+        var ids = await IdsAsync();
+        var notifications = 0;
+
+        async Task Tell(string config)
+        {
+            notifications++;
+            var limit = await ServerListsOnly.OfAsync(_store, config, CancellationToken.None);
+            await ServerListsOnly.EnforceSelectionAsync(_store, limit, CancellationToken.None);
+        }
+
+        await Asked(true, second).AskEachAsync([("office", Text)], Tell, CancellationToken.None);
+
+        Assert.Equal(1, notifications);
+        Assert.Equal([ids["Work"]], await _store.GetSelectedRoutingListsAsync());
+        Assert.Equal(2, (await _store.ListRoutingListsAsync()).Count);
     }
 
     [Fact]

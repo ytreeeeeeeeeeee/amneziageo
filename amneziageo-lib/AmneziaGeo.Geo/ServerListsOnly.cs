@@ -4,17 +4,23 @@ using AmneziaGeo.Ipc;
 namespace AmneziaGeo.Geo;
 
 /// <summary>
-/// The routing lists a configuration whose server allows none but its own leaves to choose from.
+/// The local routing lists a configuration's server permits and its fallback selection.
 /// </summary>
 /// <param name="Config">The configuration whose server allows none but its own lists.</param>
 /// <param name="Lists">The lists of that server the device holds, in the order the server hands them out.</param>
-/// <param name="Pick">The list put in use in place of another one: the one the server marks default, else the first.</param>
-public sealed record ListsLimit(string Config, IReadOnlyList<long> Lists, long Pick)
+/// <param name="Fallback">All available defaults, or the first permitted list if there are no defaults.</param>
+public sealed record ListsLimit(string Config, IReadOnlyList<long> Lists, IReadOnlyList<long> Fallback)
 {
     /// <summary>
     /// Whether a list may be in use; none may not.
     /// </summary>
     public bool Allows(long? listId) => listId is { } id && Lists.Contains(id);
+
+    /// <summary>Whether every member is permitted and the set is nonempty.</summary>
+    public bool AllowsSet(IReadOnlyList<long> ids) => ids.Count > 0 && ids.All(Lists.Contains);
+
+    /// <summary>Whether the device has any of the allowed presets.</summary>
+    public bool Available => Lists.Count > 0;
 }
 
 /// <summary>
@@ -23,8 +29,7 @@ public sealed record ListsLimit(string Config, IReadOnlyList<long> Lists, long P
 public static class ServerListsOnly
 {
     /// <summary>
-    /// Returns the limit the server of a stored config sets, null when it allows any list or the device holds none of
-    /// its lists.
+    /// Returns the limit the server sets. An empty limit means the server requires presets that are unavailable.
     /// </summary>
     public static async Task<ListsLimit?> OfAsync(IStateStore store, string config, CancellationToken ct)
     {
@@ -34,8 +39,7 @@ public static class ServerListsOnly
     }
 
     /// <summary>
-    /// Returns the limit the server of a config with its text sets, null when it allows any list or the device holds
-    /// none of its lists.
+    /// Returns the limit the server of a config with its text sets, null when it allows any list.
     /// </summary>
     public static async Task<ListsLimit?> OfAsync(IStateStore store, string config, string? text, CancellationToken ct)
     {
@@ -50,7 +54,7 @@ public static class ServerListsOnly
 
         var origins = await OriginsAsync(store, ct).ConfigureAwait(false);
         var lists = new List<long>();
-        var pick = default(long?);
+        var defaults = new List<long>();
         foreach (var preset in offer.Presets().Where(one => one.Id.Length > 0))
         {
             if (!origins.TryGetValue(preset.Id, out var listId) || lists.Contains(listId))
@@ -61,11 +65,12 @@ public static class ServerListsOnly
             lists.Add(listId);
             if (preset.Default)
             {
-                pick ??= listId;
+                defaults.Add(listId);
             }
         }
 
-        return lists.Count == 0 ? null : new ListsLimit(config, lists, pick ?? lists[0]);
+        IReadOnlyList<long> fallback = defaults.Count > 0 ? defaults : lists.Take(1).ToArray();
+        return new ListsLimit(config, lists, fallback);
     }
 
     /// <summary>
@@ -88,41 +93,59 @@ public static class ServerListsOnly
     }
 
     /// <summary>
-    /// Returns the list to put in use in place of the one in use, null when the one in use stays.
-    /// </summary>
-    public static long? Switch(ListsLimit? limit, long? inUse) =>
-        limit is null || limit.Allows(inUse) ? null : limit.Pick;
-
-    /// <summary>
     /// Returns the refusal of a command that puts in use a list the limit does not allow, or none, null when the
     /// limit allows it.
     /// </summary>
     public static IpcAck? Refusal(ListsLimit? limit, long? listId) =>
-        limit is null || limit.Allows(listId) ? null : new IpcAck(false, IpcMessage.Key("Agent_RoutingListsServerOnly", limit.Config));
+        RefusalOfSet(limit, listId is long id ? [id] : []);
 
-    /// <summary>Applies the existing single-list restriction to the selection in one store operation.</summary>
-    public static async Task<(long? Before, long? Pick)> EnforceSingleSelectionAsync(IStateStore store, ListsLimit? limit, CancellationToken ct)
+    /// <summary>Checks every member of a choice, including attempts to clear the entire set.</summary>
+    public static IpcAck? RefusalOfSet(ListsLimit? limit, IReadOnlyList<long> ids) =>
+        limit is null || limit.AllowsSet(ids) ? null : Refused(limit);
+
+    /// <summary>Removes a list without racing another change to the selected set.</summary>
+    public static async Task<IpcAck?> RemoveAsync(IStateStore store, ListsLimit? limit, long id, CancellationToken ct)
     {
-        if (limit is null)
+        if (limit is null || !limit.Allows(id))
         {
-            return default;
+            await store.RemoveRoutingListAsync(id, ct).ConfigureAwait(false);
+            return null;
         }
 
-        long? before = null;
-        long? pick = null;
+        var removed = await store.TryRemoveRoutingListAsync(id, selected =>
+            selected is null || !selected.Contains(id) || selected.Any(other => other != id && limit.Allows(other)), ct)
+            .ConfigureAwait(false);
+        return removed ? null : Refused(limit);
+    }
+
+    /// <summary>Retains permitted members, or installs the fallback set if the permitted subset is empty.</summary>
+    public static async Task<bool> EnforceSelectionAsync(IStateStore store, ListsLimit? limit, CancellationToken ct)
+    {
+        if (limit is not { Available: true })
+        {
+            return false;
+        }
+
+        var changed = false;
         await store.UpdateSelectedRoutingListsAsync(current =>
         {
-            if (current is { Count: > 1 })
+            if (current is not null && limit.AllowsSet(current))
             {
                 return null;
             }
 
-            before = current is { Count: 1 } ? current[0] : null;
-            pick = Switch(limit, before);
-            return pick is long id ? [id] : null;
+            var allowed = current?.Where(limit.Lists.Contains).ToArray();
+            changed = true;
+            return allowed is { Length: > 0 } ? allowed : limit.Fallback;
         }, ct).ConfigureAwait(false);
-        return (before, pick);
+        return changed;
     }
+
+    /// <summary>Reason shown when a restricted connection has no local presets it can use.</summary>
+    public const string UnavailableDetail = "The server requires routing presets that are not available on this device.";
+
+    private static IpcAck Refused(ListsLimit limit) =>
+        new(false, IpcMessage.Key("Agent_RoutingListsServerOnly", limit.Config));
 
     /// <summary>
     /// Returns the refusal of a command that keeps a stored config off the routing list where its server allows none

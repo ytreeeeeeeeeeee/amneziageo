@@ -158,7 +158,8 @@ internal sealed class LinuxAgent : IDisposable
             fetch: FetchOffered,
             take: TakeLater,
             carried: Carries,
-            dialed: (config, _) => Task.FromResult(Carries(config) ? _tunnel.EndpointAddress : null));
+            dialed: (config, _) => Task.FromResult(Carries(config) ? _tunnel.EndpointAddress : null),
+            debug: message => _log.Debug("agent", message));
     }
 
     // Whether the tunnel of a config is up now: the hello then goes inside it.
@@ -1131,7 +1132,17 @@ internal sealed class LinuxAgent : IDisposable
         await PushAsync(ct).ConfigureAwait(false);
 
         var offer = await _offers.BeforeConnectAsync(configName, config, OfferChangedAsync, ct).ConfigureAwait(false);
-        await KeepServerListsAsync(configName, ct).ConfigureAwait(false);
+        if (!await KeepServerListsAsync(configName, ct).ConfigureAwait(false))
+        {
+            _connectFailed = true;
+            _connectFailReason = ConnectFailureReason.TunnelSetupFailed.ToString();
+            _connectFailDetail = ServerListsOnly.UnavailableDetail;
+            _boundStatus = ConnectionStatus.Failed;
+            _nextRetryUtc = DateTime.UtcNow.AddSeconds(_reconnectIntervalSeconds);
+            await PushAsync(ct).ConfigureAwait(false);
+            return new IpcAck(false, ServerListsOnly.UnavailableDetail);
+        }
+
         var routing = await TunnelRouting.LoadAsync(_store, configName, ct).ConfigureAwait(false);
         var configDns = await _store.GetConfigDnsAsync(configName, ct).ConfigureAwait(false);
         var configTransport = await _store.GetConfigTransportAsync(configName, ct).ConfigureAwait(false);
@@ -1713,6 +1724,7 @@ internal sealed class LinuxAgent : IDisposable
 
         if (ServerListsOnly.Refusal(await ServerListsLimitAsync(ct).ConfigureAwait(false), listId) is { } refusal)
         {
+            _log.Warn("agent", "the server restriction refused the routing list selection");
             return refusal;
         }
 
@@ -1729,8 +1741,14 @@ internal sealed class LinuxAgent : IDisposable
     // Hands the edited rules to the running tunnel; what a live session cannot take raises the reconnect banner.
     private async Task ApplyRoutingAsync(CancellationToken ct)
     {
-        if (!_tunnel.Running)
+        if (!_tunnel.Running || _boundTarget is not { } config)
         {
+            return;
+        }
+
+        if (!await KeepServerListsAsync(config, ct).ConfigureAwait(false))
+        {
+            _restartRequired = true;
             return;
         }
 
@@ -2046,7 +2064,7 @@ internal sealed class LinuxAgent : IDisposable
         var saved = await _geo.ApplyToRoutingListAsync(id, name, [.. args.Skip(2)], ct).ConfigureAwait(false);
 
         // The first list applies at once.
-        if (id == 0 && lists.Count == 0)
+        if (id == 0 && lists.Count == 0 && await ServerListsLimitAsync(ct).ConfigureAwait(false) is null)
         {
             await _store.UpdateSelectedRoutingListsAsync(current => current is null ? [saved] : null, ct).ConfigureAwait(false);
         }
@@ -2098,8 +2116,12 @@ internal sealed class LinuxAgent : IDisposable
             return Fail();
         }
 
-        await _store.RemoveRoutingListAsync(id, ct).ConfigureAwait(false);
-        await _store.RemoveRoutingSettingsAsync(id, ct).ConfigureAwait(false);
+        if (await ServerListsOnly.RemoveAsync(_store, await ServerListsLimitAsync(ct).ConfigureAwait(false), id, ct).ConfigureAwait(false) is { } refusal)
+        {
+            _log.Warn("agent", $"the server restriction refused removal of routing list {id}");
+            return refusal;
+        }
+
         await ApplyRoutingAsync(ct).ConfigureAwait(false);
         await PushAsync(ct).ConfigureAwait(false);
         return Ok();
@@ -2108,22 +2130,21 @@ internal sealed class LinuxAgent : IDisposable
     // Takes the newer version the server handed out for a list, by the commands that save a list and its settings.
     private async Task<IpcAck> UpdateRoutingListAsync(IReadOnlyList<string> args, CancellationToken ct)
     {
-        if (args.Count < 1
-            || !long.TryParse(args[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var id)
-            || await OfferedLists.WaitingAsync(_store, id, ct).ConfigureAwait(false) is not { } waiting)
+        if (args.Count < 1 || !long.TryParse(args[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var id))
         {
             return Fail();
         }
 
-        var saved = await SaveRoutingListAsync(waiting.SaveArgs, ct).ConfigureAwait(false);
-        if (!saved.Ok)
-        {
-            return saved;
-        }
-
-        await OfferedLists.SettleAsync(_store, id, ct).ConfigureAwait(false);
-
-        return await SetRoutingSettingsAsync(waiting.SettingsArgs, ct).ConfigureAwait(false);
+        return await OfferedLists.AcceptPendingAsync(
+            _store,
+            id,
+            async waiting =>
+            {
+                var saved = await SaveRoutingListAsync(waiting.SaveArgs, ct).ConfigureAwait(false);
+                return saved.Ok ? await SetRoutingSettingsAsync(waiting.SettingsArgs, ct).ConfigureAwait(false) : saved;
+            },
+            Fail(),
+            ct).ConfigureAwait(false);
     }
 
     private async Task<IpcAck> GetRoutingSettingsAsync(IReadOnlyList<string> args, CancellationToken ct)
@@ -3201,27 +3222,17 @@ internal sealed class LinuxAgent : IDisposable
     // asked is done.
     private Task OfferChangedAsync(string config)
     {
-        _ = Task.Run(() => ReapplyRoutingAsync(config));
+        _ = Task.Run(ReapplyRoutingAsync);
         FindAppsLater();
 
         return PushAsync(CancellationToken.None);
     }
 
-    private async Task ReapplyRoutingAsync(string config)
+    private async Task ReapplyRoutingAsync()
     {
         try
         {
-            await GatedAsync(
-                async () =>
-                {
-                    if (_desiredConnected && string.Equals(config, _boundTarget, StringComparison.Ordinal))
-                    {
-                        await KeepServerListsAsync(config, CancellationToken.None).ConfigureAwait(false);
-                    }
-
-                    await ApplyRoutingAsync(CancellationToken.None).ConfigureAwait(false);
-                },
-                CancellationToken.None).ConfigureAwait(false);
+            await GatedAsync(() => ApplyRoutingAsync(CancellationToken.None), CancellationToken.None).ConfigureAwait(false);
             await PushAsync(CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -3230,9 +3241,7 @@ internal sealed class LinuxAgent : IDisposable
         }
     }
 
-    // Puts on the routing list a configuration whose server allows none but its own lists, and puts one of them in use
-    // in place of the list in use.
-    private async Task KeepServerListsAsync(string config, CancellationToken ct)
+    private async Task<bool> KeepServerListsAsync(string config, CancellationToken ct)
     {
         if (await ServerListsOnly.RoutingOnAsync(_store, config, ct).ConfigureAwait(false))
         {
@@ -3240,16 +3249,18 @@ internal sealed class LinuxAgent : IDisposable
         }
 
         var limit = await ServerListsOnly.OfAsync(_store, config, ct).ConfigureAwait(false);
-        var (inUse, chosen) = await ServerListsOnly.EnforceSingleSelectionAsync(_store, limit, ct).ConfigureAwait(false);
-        if (chosen is not { } pick)
+        if (limit is { Available: false })
         {
-            return;
+            _log.Warn("agent", $"{config}: {ServerListsOnly.UnavailableDetail}");
+            return false;
         }
 
-        Journal(SwitchLog.RoutingList(
-            await ListNameAsync(inUse, ct).ConfigureAwait(false),
-            await ListNameAsync(pick, ct).ConfigureAwait(false)));
-        _log.Info("agent", $"{config}: its server allows none but its own routing lists; routing list {pick} is put in use");
+        if (await ServerListsOnly.EnforceSelectionAsync(_store, limit, ct).ConfigureAwait(false))
+        {
+            _log.Info("agent", $"{config}: the routing list selection was synchronized with the server");
+        }
+
+        return true;
     }
 
     // Has the programs of the machine searched again behind a command that changed a routing list.

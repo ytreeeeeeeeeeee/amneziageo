@@ -258,14 +258,33 @@ public sealed class HelloListsTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task OfTwoListsMarkedDefault_TheFirstIsPutInUse()
+    public async Task AllInitialDefaultsAreSelectedTogether()
     {
         await AskAsync(
             Item(First, "Unblock", "proxy|geosite:youtube", Morning, marked: true),
             Item(Second, "Other", "proxy|geosite:openai", Morning, marked: true));
 
         var lists = await _store.ListRoutingListsAsync();
-        Assert.Equal(lists[0].Id, await _store.GetSelectedRoutingListAsync());
+        Assert.Equal(lists.Select(list => list.Id), await _store.GetSelectedRoutingListsAsync());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RepeatedHelloUpdateAndWithdrawalDoNotRestoreDefaults(bool explicitlyOff)
+    {
+        await AskAsync(
+            Item(First, "Unblock", "proxy|geosite:youtube", Morning, marked: true),
+            Item(Second, "Other", "proxy|geosite:openai", Morning, marked: true, readOnly: true));
+        var selected = (await _store.ListRoutingListsAsync()).Single(list => list.Name == "Unblock").Id;
+        await _store.SetSelectedRoutingListAsync(explicitlyOff ? null : selected);
+
+        await AskAsync(
+            Item(First, "Unblock", "proxy|geosite:youtube", Morning, marked: true),
+            Item(Second, "Other", "proxy|geosite:google", Noon, marked: true, readOnly: true));
+        await AskAsync(Item(First, "Unblock", "proxy|geosite:youtube", Morning, marked: true));
+
+        Assert.Equal(explicitlyOff ? [] : new[] { selected }, await _store.GetSelectedRoutingListsAsync());
     }
 
     [Fact]
@@ -422,6 +441,32 @@ public sealed class HelloListsTests : IAsyncLifetime
             new RoutingListOrigin(list.Id, First, "vpn.example-awg0-office", NoonTime, Config: "office"),
             Assert.Single(await _store.ListRoutingListOriginsAsync()));
         Assert.False(Assert.Single(await _store.ListRoutingListSummariesAsync()).HasUpdate);
+    }
+
+    [Fact]
+    public async Task AnEditableUpdateStaysPendingOnFailureAndKeepsTheSelectedSetOnRetry()
+    {
+        var geo = new GeoConfigurator(_store, new NoFiles());
+        await AskAsync(
+            Item(First, "Primary", "proxy|geosite:openai", Morning, marked: true),
+            Item(Second, "Editable", "proxy|geosite:youtube", Morning, marked: true));
+        var selected = await _store.GetSelectedRoutingListsAsync();
+        var editable = (await _store.ListRoutingListsAsync()).Single(list => list.Name == "Editable");
+        await AskAsync(Item(Second, "Editable", "direct|geosite:youtube", Noon, allUdp: true));
+
+        var failed = await OfferedLists.AcceptPendingAsync(
+            _store,
+            editable.Id,
+            _ => Task.FromResult(new IpcAck(false, "settings failed")),
+            new IpcAck(false, "missing"),
+            CancellationToken.None);
+
+        Assert.Equal("settings failed", failed.Message);
+        Assert.NotNull((await _store.GetRoutingListOriginAsync(editable.Id))?.Pending);
+        Assert.True(await UpdateAsync(geo, editable.Id));
+        Assert.Null((await _store.GetRoutingListOriginAsync(editable.Id))?.Pending);
+        Assert.True((await _store.GetRoutingSettingsAsync(editable.Id))?.AllUdp);
+        Assert.Equal(selected, await _store.GetSelectedRoutingListsAsync());
     }
 
     [Fact]
@@ -656,6 +701,38 @@ public sealed class HelloListsTests : IAsyncLifetime
         Assert.True(origin.ReadOnly);
     }
 
+    [Theory]
+    [InlineData(true, true, 1)]
+    [InlineData(false, true, 0)]
+    [InlineData(true, false, 0)]
+    public async Task AReadOnlyUpdateReroutesOnlyWhenAppliedToASelectedMember(bool selected, bool applied, int expectedReroutes)
+    {
+        var geo = new GeoConfigurator(_store, new NoFiles());
+        await AskAsync(
+            Item(First, "Primary", "proxy|geosite:openai", Morning, marked: true),
+            Item(Second, "Pinned", "proxy|geosite:youtube", Morning, marked: selected, readOnly: true));
+        var initialSelection = await _store.GetSelectedRoutingListsAsync();
+        var reroutes = 0;
+
+        await Asked(
+                Lists(
+                    Item(First, "Primary", "proxy|geosite:openai", Morning, marked: true),
+                    Item(Second, "Pinned", "direct|geosite:youtube", Noon, marked: selected, readOnly: true)),
+                rerouted: () => reroutes++,
+                take: async (ids, _) =>
+                {
+                    var id = Assert.Single(ids);
+                    if (applied)
+                    {
+                        Assert.True(await UpdateAsync(geo, id));
+                    }
+                })
+            .AskAsync("office", Text, CancellationToken.None);
+
+        Assert.Equal(expectedReroutes, reroutes);
+        Assert.Equal(initialSelection, await _store.GetSelectedRoutingListsAsync());
+    }
+
     [Fact]
     public async Task AListTheServerNoLongerKeepsReadOnly_WaitsForTheOwnerAgain()
     {
@@ -798,22 +875,25 @@ public sealed class HelloListsTests : IAsyncLifetime
     // Берёт ожидающую версию так, как это делает агент: своими командами сохранения списка и его настроек.
     private async Task<bool> UpdateAsync(GeoConfigurator geo, long listId)
     {
-        if (await OfferedLists.WaitingAsync(_store, listId, CancellationToken.None) is not { } waiting)
-        {
-            return false;
-        }
-
-        Assert.Equal(listId.ToString(System.Globalization.CultureInfo.InvariantCulture), waiting.SaveArgs[0]);
-        await geo.ApplyToRoutingListAsync(listId, waiting.SaveArgs[1], [.. waiting.SaveArgs.Skip(2)]);
-        await _store.SetRoutingSettingsAsync(new RoutingSettings(
+        var result = await OfferedLists.AcceptPendingAsync(
+            _store,
             listId,
-            waiting.SettingsArgs[1],
-            waiting.SettingsArgs[2] == "on",
-            waiting.SettingsArgs[3],
-            waiting.SettingsArgs[4] == "on"));
-        await OfferedLists.SettleAsync(_store, listId, CancellationToken.None);
+            async waiting =>
+            {
+                Assert.Equal(listId.ToString(System.Globalization.CultureInfo.InvariantCulture), waiting.SaveArgs[0]);
+                await geo.ApplyToRoutingListAsync(listId, waiting.SaveArgs[1], [.. waiting.SaveArgs.Skip(2)]);
+                await _store.SetRoutingSettingsAsync(new RoutingSettings(
+                    listId,
+                    waiting.SettingsArgs[1],
+                    waiting.SettingsArgs[2] == "on",
+                    waiting.SettingsArgs[3],
+                    waiting.SettingsArgs[4] == "on"));
+                return new IpcAck(true, "saved");
+            },
+            new IpcAck(false, "missing"),
+            CancellationToken.None);
 
-        return true;
+        return result.Ok;
     }
 
     private ServerOffers Offers(Action<IReadOnlyList<GeoSource>>? fetch = null) => Asked(Answer, fetch);

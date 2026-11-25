@@ -252,7 +252,11 @@ internal sealed class ConfigRunner(
             return;
         }
 
-        await ProjectRoutingAsync(config, ct);
+        if (!await ProjectRoutingAsync(config, ct))
+        {
+            return;
+        }
+
         ReapForeignTunnels(roster.Standing(config));
         Stop(config);
 
@@ -356,7 +360,11 @@ internal sealed class ConfigRunner(
                 if (!string.Equals(current, config, StringComparison.Ordinal))
                 {
                     logger.LogInformation("configuration {Old} was renamed to {New} while connected; reconnecting under the new name", config, current);
-                    await ProjectRoutingAsync(current, ct);
+                    if (!await ProjectRoutingAsync(current, ct))
+                    {
+                        return;
+                    }
+
                     config = current;
                 }
 
@@ -462,7 +470,11 @@ internal sealed class ConfigRunner(
             {
                 logger.LogInformation("configuration {Old} was renamed to {New} while it was being dialled; the next attempt goes under the new name", config, renamed);
                 Stop(config);
-                await ProjectRoutingAsync(renamed, ct);
+                if (!await ProjectRoutingAsync(renamed, ct))
+                {
+                    return (false, renamed);
+                }
+
                 config = renamed;
             }
         }
@@ -569,7 +581,7 @@ internal sealed class ConfigRunner(
     }
 
     // The server is asked before the list is cut, so a ban it sets holds from this connect on.
-    private async Task ProjectRoutingAsync(string config, CancellationToken ct)
+    private async Task<bool> ProjectRoutingAsync(string config, CancellationToken ct)
     {
         var text = await store.GetConfigTextAsync(config, ct).ConfigureAwait(false);
         var offers = new ServerOffers(
@@ -578,14 +590,23 @@ internal sealed class ConfigRunner(
             geo: new GeoConfigurator(store, geoFiles),
             fetch: broker.FetchOffered,
             rerouted: () => broker.RerouteOthers(config),
-            take: broker.TakeReadOnlyVersionsAsync);
+            take: broker.TakeReadOnlyVersionsAsync,
+            debug: message => logger.LogDebug("{Message}", message));
         await offers.BeforeConnectAsync(config, text, null, ct).ConfigureAwait(false);
-        if (await broker.KeepServerListsAsync(store, config, ct).ConfigureAwait(false))
+        var (changed, available) = await broker.KeepServerListsAsync(store, config, ct).ConfigureAwait(false);
+        if (!available)
+        {
+            control.FailConnect(ConnectFailureReason.TunnelSetupFailed, ServerListsOnly.UnavailableDetail);
+            return false;
+        }
+
+        if (changed)
         {
             broker.RerouteOthers(config);
         }
 
         await RoutingProjection.ProjectAsync(store, geo, roster, config, logger, ct).ConfigureAwait(false);
+        return true;
     }
 
     // What asking the server has to say, at the level its news deserves.

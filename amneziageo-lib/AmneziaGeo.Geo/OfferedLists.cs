@@ -32,10 +32,11 @@ public sealed record TakenSources(IReadOnlyList<GeoSource> Added, IReadOnlyList<
 /// </summary>
 /// <param name="Added">How many lists were added.</param>
 /// <param name="Waiting">How many lists got a newer version that waits for the owner.</param>
-/// <param name="InUse">The list put in use, null when none was.</param>
+/// <param name="InUse">The lists put in use, null when none were.</param>
 /// <param name="Taking">The lists the server keeps read-only whose newer version is to be taken at once.</param>
 /// <param name="Marked">How many lists the server made read-only or let go of being so.</param>
-public sealed record TakenPresets(int Added, int Waiting, long? InUse, IReadOnlyList<long>? Taking = null, int Marked = 0)
+/// <param name="KeptSelection">Whether defaults were offered and the existing selection was kept.</param>
+public sealed record TakenPresets(int Added, int Waiting, IReadOnlyList<long>? InUse, IReadOnlyList<long>? Taking = null, int Marked = 0, bool KeptSelection = false)
 {
     /// <summary>
     /// Nothing taken.
@@ -81,6 +82,9 @@ public sealed record WaitingList(long ListId, string Name, IReadOnlyList<string>
 /// </summary>
 public static class OfferedLists
 {
+    // Imports and acceptance share a gate so a hello cannot replace the pending version during acceptance.
+    internal static SemaphoreSlim VersionGate { get; } = new(1, 1);
+
     private const int MaxSourceName = 32;
 
     private const int MaxTakenAddresses = 128;
@@ -179,7 +183,7 @@ public static class OfferedLists
         var added = 0;
         var waiting = 0;
         var marks = 0;
-        var defaultId = default(long?);
+        var defaults = new HashSet<long>();
         var taking = new List<long>();
         foreach (var preset in offered)
         {
@@ -187,7 +191,12 @@ public static class OfferedLists
             {
                 if (names.Add(preset.Name))
                 {
-                    await AddListAsync(store, geo, preset.Name, preset.Rules, preset.AllUdp, preset.Full, string.Empty, ct).ConfigureAwait(false);
+                    var legacyId = await AddListAsync(store, geo, preset.Name, preset.Rules, preset.AllUdp, preset.Full,
+                        string.Empty, ct).ConfigureAwait(false);
+                    if (preset.Default)
+                    {
+                        defaults.Add(legacyId);
+                    }
                     added++;
                 }
 
@@ -202,7 +211,7 @@ public static class OfferedLists
                 var origin = origins[at];
                 if (preset.Default && lists.Any(list => list.Id == origin.ListId))
                 {
-                    defaultId ??= origin.ListId;
+                    defaults.Add(origin.ListId);
                 }
 
                 var marked = origin with { ReadOnly = preset.ReadOnly, Config = config };
@@ -244,28 +253,25 @@ public static class OfferedLists
             added++;
             if (preset.Default)
             {
-                defaultId ??= id;
+                defaults.Add(id);
             }
         }
 
         marks += await ReleaseAsync(store, config, offered, origins, ct).ConfigureAwait(false);
 
-        var inUse = default(long?);
-        if (defaultId is long choice)
+        IReadOnlyList<long>? inUse = null;
+        if (defaults.Count > 0)
         {
-            await store.UpdateSelectedRoutingListsAsync(current =>
+            var initialized = false;
+            var selected = await store.UpdateSelectedRoutingListsAsync(current =>
             {
-                if (current is not null)
-                {
-                    return null;
-                }
-
-                inUse = choice;
-                return [choice];
+                initialized = current is null;
+                return initialized ? defaults.ToArray() : null;
             }, ct).ConfigureAwait(false);
+            inUse = initialized ? selected : null;
         }
 
-        return new TakenPresets(added, waiting, inUse, taking, marks);
+        return new TakenPresets(added, waiting, inUse, taking, marks, KeptSelection: defaults.Count > 0 && inUse is null);
     }
 
     /// <summary>
@@ -330,9 +336,40 @@ public static class OfferedLists
     }
 
     /// <summary>
-    /// Records that a routing list took the version that waited for it.
+    /// Applies the waiting version and settles it only after its rules and settings have both been saved.
     /// </summary>
-    public static async Task SettleAsync(IStateStore store, long listId, CancellationToken ct)
+    public static async Task<IpcAck> AcceptPendingAsync(
+        IStateStore store,
+        long listId,
+        Func<WaitingList, Task<IpcAck>> apply,
+        IpcAck missing,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(apply);
+
+        await VersionGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (await WaitingAsync(store, listId, ct).ConfigureAwait(false) is not { } waiting)
+            {
+                return missing;
+            }
+
+            var result = await apply(waiting).ConfigureAwait(false);
+            if (result.Ok)
+            {
+                await SettleAsync(store, listId, ct).ConfigureAwait(false);
+            }
+
+            return result;
+        }
+        finally
+        {
+            VersionGate.Release();
+        }
+    }
+
+    private static async Task SettleAsync(IStateStore store, long listId, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(store);
 

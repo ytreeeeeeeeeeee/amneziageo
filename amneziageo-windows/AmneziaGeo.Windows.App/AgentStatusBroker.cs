@@ -52,7 +52,8 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
                 fetch: sources => EnqueueGeoRefresh(sources, forceResolve: false),
                 rerouted: () => MarkRestartRequired(),
                 take: (ids, ct) => TakeVersionsAsync(made!, ids, ct),
-                carried: IsRunningMember);
+                carried: IsRunningMember,
+                debug: message => logger.LogDebug("{Message}", message));
             made = new BrokerScope(root, scopeStore, new ConfigRepository(scopeStore, serviceManager), scopeGeo, offers);
             return made;
         });
@@ -1597,19 +1598,22 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
     private async Task OfferChangedAsync(string config)
     {
         FindAppsLater();
-        if (IsRunningMember(config) && await KeepServerListsAsync(activeScope.Store, config, CancellationToken.None).ConfigureAwait(false))
+        if (IsRunningMember(config))
         {
-            MarkRestartRequired();
+            var (changed, available) = await KeepServerListsAsync(activeScope.Store, config, CancellationToken.None).ConfigureAwait(false);
+            if (changed || !available)
+            {
+                MarkRestartRequired();
+            }
         }
 
         await BroadcastIfChangedAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Puts on the routing list a config whose server allows none but its own lists, and puts one of them in use in
-    /// place of the list in use, unless a tunnel ahead of it sets a limit of its own. Returns whether either changed.
+    /// Enforces the first restriction in fleet order and reports whether routing changed and can be used.
     /// </summary>
-    public async Task<bool> KeepServerListsAsync(IStateStore scoped, string config, CancellationToken ct)
+    public async Task<(bool Changed, bool Available)> KeepServerListsAsync(IStateStore scoped, string config, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(scoped);
 
@@ -1620,18 +1624,19 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         }
 
         var limit = await ServerListsOnly.FirstAsync(scoped, ServerListsOrder(config), ct).ConfigureAwait(false);
-        var (inUse, chosen) = await ServerListsOnly.EnforceSingleSelectionAsync(scoped, limit, ct).ConfigureAwait(false);
-        if (chosen is not { } pick)
+        if (limit is { Available: false })
         {
-            return routed;
+            logger.LogWarning("{Config}: {Detail}", limit.Config, ServerListsOnly.UnavailableDetail);
+            return (routed, false);
         }
 
-        var from = inUse is { } held ? (await scoped.GetRoutingListStampAsync(held, ct).ConfigureAwait(false))?.Name : null;
-        var to = (await scoped.GetRoutingListStampAsync(pick, ct).ConfigureAwait(false))?.Name;
-        Journal(SwitchLog.RoutingList(from, to));
-        logger.LogInformation("{Config}: its server allows none but its own routing lists; routing list {List} is put in use", limit!.Config, pick);
+        if (await ServerListsOnly.EnforceSelectionAsync(scoped, limit, ct).ConfigureAwait(false))
+        {
+            logger.LogInformation("{Config}: the routing list selection was synchronized with the server", limit!.Config);
+            return (true, true);
+        }
 
-        return true;
+        return (routed, true);
     }
 
     /// <summary>
@@ -1833,7 +1838,7 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         var resultId = await geo.ApplyToRoutingListAsync(id, name, args.Skip(2).ToList(), ct);
 
         // The first list applies at once.
-        if (id == 0 && lists.Count == 0)
+        if (id == 0 && lists.Count == 0 && await ServerListsLimitAsync(ct).ConfigureAwait(false) is null)
         {
             await store.UpdateSelectedRoutingListsAsync(current => current is null ? [resultId] : null, ct).ConfigureAwait(false);
         }
@@ -1915,7 +1920,12 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
             return new IpcAck(false, "remove-routing-list requires a positive id");
         }
 
-        await store.RemoveRoutingListAsync(id, ct);
+        if (await ServerListsOnly.RemoveAsync(store, await ServerListsLimitAsync(ct).ConfigureAwait(false), id, ct).ConfigureAwait(false) is { } refusal)
+        {
+            logger.LogWarning("The server restriction refused removal of routing list {List}", id);
+            return refusal;
+        }
+
         await KeepAddressesAsync(id, new HashSet<string>(StringComparer.Ordinal), ct).ConfigureAwait(false);
         logger.LogInformation("removed routing list {Id}", id);
         return new IpcAck(true, $"removed routing list {id}");
@@ -1960,20 +1970,22 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
             return new IpcAck(false, "update-routing-list requires a positive id");
         }
 
-        if (await OfferedLists.WaitingAsync(store, id, ct).ConfigureAwait(false) is not { } waiting)
+        var accepted = await OfferedLists.AcceptPendingAsync(
+            store,
+            id,
+            async waiting =>
+            {
+                var saved = await SaveRoutingListAsync(waiting.SaveArgs, ct).ConfigureAwait(false);
+                return saved.Ok ? await SetRoutingSettingsAsync(waiting.SettingsArgs, ct).ConfigureAwait(false) : saved;
+            },
+            new IpcAck(false, $"routing list {id} holds the newest version of its server"),
+            ct).ConfigureAwait(false);
+        if (accepted.Ok && RunningMembers().Count > 0 && (await store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false))?.Contains(id) == true)
         {
-            return new IpcAck(false, $"routing list {id} holds the newest version of its server");
+            MarkRestartRequired();
         }
 
-        var saved = await SaveRoutingListAsync(waiting.SaveArgs, ct);
-        if (!saved.Ok)
-        {
-            return saved;
-        }
-
-        await OfferedLists.SettleAsync(store, id, ct).ConfigureAwait(false);
-
-        return await SetRoutingSettingsAsync(waiting.SettingsArgs, ct);
+        return accepted;
     }
 
     private async Task<IpcAck> GetRoutingListAsync(IReadOnlyList<string> args, CancellationToken ct)
@@ -2093,13 +2105,20 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
 
         if (ServerListsOnly.Refusal(await ServerListsLimitAsync(ct).ConfigureAwait(false), listId) is { } refusal)
         {
+            logger.LogWarning("The server restriction refused the routing list selection");
             return refusal;
         }
 
-        var currentList = await store.GetSelectedRoutingListAsync(ct);
+        IReadOnlyList<long> next = listId is long idToSelect ? [idToSelect] : [];
+        IReadOnlyList<long>? previous = null;
+        await store.UpdateSelectedRoutingListsAsync(current =>
+        {
+            previous = current;
+            return next;
+        }, ct).ConfigureAwait(false);
+        var currentList = previous is { Count: > 0 } ? previous[0] : (long?)null;
         Journal(SwitchLog.RoutingList(await ListNameAsync(currentList, ct), await ListNameAsync(listId, ct)));
-        await store.SetSelectedRoutingListAsync(listId, ct);
-        if (currentList != listId && RunningMembers().Count > 0)
+        if (!(previous ?? []).SequenceEqual(next) && RunningMembers().Count > 0)
         {
             // Routing applies on a fresh tunnel; flag a restart instead of re-applying live.
             MarkRestartRequired();

@@ -144,7 +144,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     private LegacyRoutingSelection? _legacyRoutingSelection;
     private IReadOnlyList<long>? _routingSelection;
 
-    private long? SelectedRoutingList => Volatile.Read(ref _routingSelection) is { Count: 1 } selection ? selection[0] : null;
+    private long? SelectedRoutingList => Volatile.Read(ref _routingSelection) is { Count: > 0 } selection ? selection[0] : null;
 
     // What the notification of a tunnel taken down was last told, so the same is not posted again.
     private string _downNotice = string.Empty;
@@ -263,7 +263,8 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             fetch: sources => _ = Task.Run(() => FetchOfferedAsync(sources)),
             take: (ids, ct) => Task.Run(() => TakeVersionsAsync(ids), ct),
             carried: Carries,
-            dialed: DialedAsync);
+            dialed: DialedAsync,
+            debug: message => _log.Debug("agent", message));
         Current = this;
     }
 
@@ -792,7 +793,16 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             _connectPreparation.Apply(() => _restartRequired = false, ct);
         }
 
-        await KeepServerListsAsync(configName).ConfigureAwait(false);
+        var (_, available) = await KeepServerListsAsync(configName).ConfigureAwait(false);
+        if (!available)
+        {
+            return _connectPreparation.Apply(() =>
+            {
+                ApplyConnectFailure(nameof(ConnectFailureReason.TunnelSetupFailed), ServerListsOnly.UnavailableDetail, restart);
+                return new IpcAck(false, ServerListsOnly.UnavailableDetail);
+            }, ct);
+        }
+
         await RefreshRoutingSummariesAsync().ConfigureAwait(false);
         await RefreshGeoSourcesAsync().ConfigureAwait(false);
         ct.ThrowIfCancellationRequested();
@@ -1584,7 +1594,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     // A live tun keeps the routes establish() was given, so an edited list only reaches the tunnel on a reconnect.
     private void MarkRoutingChanged(long listId)
     {
-        if (_active && RoutedList == listId)
+        if (_active && RoutedList is not null && Volatile.Read(ref _routingSelection)?.Contains(listId) == true)
         {
             _restartRequired = true;
             _log.Info("agent", "the edited routing list applies on the next connect");
@@ -2378,9 +2388,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     private ListsLimit? ShownServerLists =>
         _active && _serverLists is { } limit && string.Equals(limit.Config, _boundTarget, StringComparison.Ordinal) ? limit : null;
 
-    // Puts on the routing list a configuration whose server allows none but its own lists, and puts one of them in
-    // use in place of the list in use; returns whether either changed.
-    private async Task<bool> KeepServerListsAsync(string config)
+    private async Task<(bool Changed, bool Available)> KeepServerListsAsync(string config)
     {
         var text = _configs.GetValueOrDefault(config);
         var routed = await ServerListsOnly.RoutingOnAsync(_store, config, text, CancellationToken.None).ConfigureAwait(false);
@@ -2391,17 +2399,20 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         var limit = await ServerListsOnly.OfAsync(_store, config, text, CancellationToken.None).ConfigureAwait(false);
-        var (previous, chosen) = await ServerListsOnly.EnforceSingleSelectionAsync(_store, limit, CancellationToken.None).ConfigureAwait(false);
-        if (chosen is not { } pick)
+        if (limit is { Available: false })
         {
-            return routed;
+            _log.Warn("agent", $"{config}: {ServerListsOnly.UnavailableDetail}");
+            return (routed, false);
         }
 
-        await RefreshRoutingSelectionAsync().ConfigureAwait(false);
-        Journal(SwitchLog.RoutingList(await ListNameAsync(previous).ConfigureAwait(false), await ListNameAsync(pick).ConfigureAwait(false)));
-        _log.Info("agent", $"{config}: its server allows none but its own routing lists; routing list {pick} is put in use");
+        if (await ServerListsOnly.EnforceSelectionAsync(_store, limit, CancellationToken.None).ConfigureAwait(false))
+        {
+            await RefreshRoutingSelectionAsync().ConfigureAwait(false);
+            _log.Info("agent", $"{config}: the routing list selection was synchronized with the server");
+            return (true, true);
+        }
 
-        return true;
+        return (routed, true);
     }
 
     // Downloads the geoip databases on first use; retries after a failed attempt.
@@ -2527,7 +2538,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         var savedId = await _geo.ApplyToRoutingListAsync(id, name, [.. args.Skip(2)]).ConfigureAwait(false);
 
         // The first list applies at once.
-        if (id == 0 && lists.Count == 0)
+        if (id == 0 && lists.Count == 0 && await ServerListsLimitAsync().ConfigureAwait(false) is null)
         {
             await _store.UpdateSelectedRoutingListsAsync(current => current is null ? [savedId] : null).ConfigureAwait(false);
             await RefreshRoutingSelectionAsync().ConfigureAwait(false);
@@ -2649,7 +2660,12 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         await EnsureInitAsync().ConfigureAwait(false);
-        await _store.RemoveRoutingListAsync(id).ConfigureAwait(false);
+        if (await ServerListsOnly.RemoveAsync(_store, await ServerListsLimitAsync().ConfigureAwait(false), id, CancellationToken.None).ConfigureAwait(false) is { } refusal)
+        {
+            _log.Warn("agent", $"the server restriction refused removal of routing list {id}");
+            return refusal;
+        }
+
         MarkRoutingChanged(id);
 
         await RefreshRoutingSelectionAsync().ConfigureAwait(false);
@@ -2722,20 +2738,23 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         await EnsureInitAsync().ConfigureAwait(false);
-        if (await OfferedLists.WaitingAsync(_store, id, CancellationToken.None).ConfigureAwait(false) is not { } waiting)
+        var accepted = await OfferedLists.AcceptPendingAsync(
+            _store,
+            id,
+            async waiting =>
+            {
+                var saved = await SaveRoutingListAsync(waiting.SaveArgs).ConfigureAwait(false);
+                return saved.Ok ? await SetRoutingSettingsAsync(waiting.SettingsArgs).ConfigureAwait(false) : saved;
+            },
+            Fail(),
+            CancellationToken.None).ConfigureAwait(false);
+        if (accepted.Ok)
         {
-            return Fail();
+            await RefreshRoutingSummariesAsync().ConfigureAwait(false);
+            PushSnapshot();
         }
 
-        var saved = await SaveRoutingListAsync(waiting.SaveArgs).ConfigureAwait(false);
-        if (!saved.Ok)
-        {
-            return saved;
-        }
-
-        await OfferedLists.SettleAsync(_store, id, CancellationToken.None).ConfigureAwait(false);
-
-        return await SetRoutingSettingsAsync(waiting.SettingsArgs).ConfigureAwait(false);
+        return accepted;
     }
 
     private async Task<IpcAck> SetRoutingSettingsAsync(IReadOnlyList<string> args)
@@ -3310,10 +3329,13 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         FindAppsLater();
-        if (_active && string.Equals(_boundTarget, config, StringComparison.Ordinal) && await KeepServerListsAsync(config).ConfigureAwait(false))
+        if (_active && string.Equals(_boundTarget, config, StringComparison.Ordinal))
         {
-            _restartRequired = true;
-            _log.Info("agent", "the routing list the server allows applies on the next connect");
+            var (changed, available) = await KeepServerListsAsync(config).ConfigureAwait(false);
+            if (changed || !available)
+            {
+                _restartRequired = true;
+            }
         }
 
         await RefreshRoutingSummariesAsync().ConfigureAwait(false);
@@ -3468,6 +3490,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
         if (ServerListsOnly.Refusal(await ServerListsLimitAsync().ConfigureAwait(false), picked) is { } refusal)
         {
+            _log.Warn("agent", "the server restriction refused the routing list selection");
             return refusal;
         }
 
@@ -3475,7 +3498,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         var changed = false;
         await _store.UpdateSelectedRoutingListsAsync(current =>
         {
-            previous = current is { Count: 1 } ? current[0] : null;
+            previous = current is { Count: > 0 } ? current[0] : null;
             IReadOnlyList<long> next = picked is long id ? [id] : [];
             changed = !(current ?? []).SequenceEqual(next);
             return next;

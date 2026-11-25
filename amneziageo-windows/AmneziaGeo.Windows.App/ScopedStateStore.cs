@@ -255,6 +255,9 @@ internal sealed class ScopedStateStore(IStateStore machine, IStateStore user) : 
     /// <inheritdoc/>
     public Task RemoveRoutingListAsync(long id, CancellationToken ct = default) => user.RemoveRoutingListAsync(id, ct);
 
+    public Task<bool> TryRemoveRoutingListAsync(long id, Func<IReadOnlyList<long>?, bool> canRemove, CancellationToken ct = default) =>
+        user.TryRemoveRoutingListAsync(id, canRemove, ct);
+
     /// <inheritdoc/>
     public Task<IReadOnlyList<RoutingListOrigin>> ListRoutingListOriginsAsync(CancellationToken ct = default) => user.ListRoutingListOriginsAsync(ct);
 

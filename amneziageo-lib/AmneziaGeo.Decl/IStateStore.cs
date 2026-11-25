@@ -271,6 +271,9 @@ public interface IStateStore
     /// </summary>
     Task RemoveRoutingListAsync(long id, CancellationToken ct = default);
 
+    /// <summary>Removes a list only if the current selection passes the guard inside the deletion transaction.</summary>
+    Task<bool> TryRemoveRoutingListAsync(long id, Func<IReadOnlyList<long>?, bool> canRemove, CancellationToken ct = default);
+
     /// <summary>
     /// Returns where the routing lists taken from servers came from.
     /// </summary>
@@ -325,7 +328,7 @@ public interface IStateStore
         Func<IReadOnlyList<long>?, IReadOnlyList<long>?> update, CancellationToken ct = default);
 
     /// <summary>
-    /// Returns the globally selected list for a caller that accepts only a single list.
+    /// Returns the first selected list for legacy single-list callers, or null when none is selected.
     /// </summary>
     Task<long?> GetSelectedRoutingListAsync(CancellationToken ct = default);
 
