@@ -14,16 +14,10 @@ internal static class BlockFirewall
     /// </summary>
     public static async Task<bool> ApplyAsync(IReadOnlyList<string> ranges, AgentLog log, CancellationToken ct)
     {
-        if (ranges.Count == 0)
-        {
-            await RemoveAsync(ct).ConfigureAwait(false);
-            return false;
-        }
-
         var path = Path.Combine(AgentPaths.Root, "block.nft");
         try
         {
-            await File.WriteAllTextAsync(path, SteeringRules.Refusals(ranges), ct).ConfigureAwait(false);
+            await File.WriteAllTextAsync(path, SteeringRules.Refusals(ranges, exemptApps: false), ct).ConfigureAwait(false);
             var applied = await Shell.RunAsync("nft", ct, "-f", path).ConfigureAwait(false);
             if (applied.ExitCode != 0)
             {

@@ -5,7 +5,7 @@ using AmneziaGeo.Routing;
 namespace AmneziaGeo.Linux.App;
 
 /// <summary>
-/// Keeps the named applications past a tunnel that carries everything. The kernel does the steering: the processes
+/// Keeps the named applications on the physical path in both tunnel modes. The kernel does the steering: the processes
 /// live in a cgroup, a netfilter rule marks what its sockets send, and the mark selects the routes of the machine
 /// narrower than a half of the address space that lead past the tunnel and then a table whose default is the hop the
 /// machine reaches the internet over. Own cgroup, netfilter table, routing table and rules; those of other software are never touched.
@@ -28,7 +28,7 @@ internal sealed class AppBypass : IDisposable
     private readonly string _iface;
     private readonly string _gateway;
     private readonly string _device;
-    private readonly AppGroup _group;
+    private readonly AppGroup? _group;
     private readonly AgentLog _log;
     private string? _strict;
     private bool _disposed;
@@ -41,7 +41,7 @@ internal sealed class AppBypass : IDisposable
         _iface = interfaceName;
         _gateway = gateway;
         _device = device;
-        _group = new AppGroup(SteeringRules.DirectGroup, images, "leaves past the tunnel from now on", log);
+        _group = images.Empty ? null : new AppGroup(SteeringRules.DirectGroup, images, "leaves past the tunnel from now on", log);
         _log = log;
     }
 
@@ -49,15 +49,15 @@ internal sealed class AppBypass : IDisposable
     /// Raises the path past the tunnel for the applications the rules name; null when they name none, the kernel
     /// offers no unified cgroups, or the system refuses the mark or its routes.
     /// </summary>
-    public static async Task<AppBypass?> TryStartAsync(string interfaceName, IReadOnlyList<string> apps, string gateway, string device, AgentLog log, CancellationToken ct)
+    public static async Task<AppBypass?> TryStartAsync(string interfaceName, IReadOnlyList<string> apps, string gateway, string device, AgentLog log, CancellationToken ct, bool names = false)
     {
         var images = AppImages.Parse(apps);
-        if (images.Empty)
+        if (images.Empty && !names)
         {
             return null;
         }
 
-        if (!AppGroup.Offered)
+        if (!images.Empty && !AppGroup.Offered)
         {
             log.Warn("apps", $"the kernel offers no unified cgroups here, so {Fallback}");
             return null;
@@ -70,8 +70,8 @@ internal sealed class AppBypass : IDisposable
             return null;
         }
 
-        bypass._group.Watch();
-        log.Info("apps", $"{images.Count} application(s) leave past {interfaceName} by cgroup, through {gateway} on {device}, and the rest of the machine rides the tunnel");
+        bypass._group?.Watch();
+        log.Info("apps", $"{images.Count} application(s) use the physical path by cgroup where domain or block rules do not decide");
         return bypass;
     }
 
@@ -80,10 +80,13 @@ internal sealed class AppBypass : IDisposable
     /// </summary>
     public async Task StopAsync()
     {
-        await _group.StopAsync().ConfigureAwait(false);
+        if (_group is { } group)
+        {
+            await group.StopAsync().ConfigureAwait(false);
+        }
         await ClearAsync(CancellationToken.None).ConfigureAwait(false);
         Tighten();
-        _group.Remove();
+        _group?.Remove();
     }
 
     /// <summary>
@@ -106,19 +109,19 @@ internal sealed class AppBypass : IDisposable
         }
 
         _disposed = true;
-        _group.Dispose();
+        _group?.Dispose();
     }
 
     // Builds the cgroup, the mark and the routes the mark selects.
     private async Task<bool> RaiseAsync(CancellationToken ct)
     {
-        if (!_group.Make())
+        if (_group is { } group && !group.Make())
         {
             return false;
         }
 
         await ClearAsync(ct).ConfigureAwait(false);
-        var six = await SixAsync(ct).ConfigureAwait(false);
+        var six = _group is null ? default : await SixAsync(ct).ConfigureAwait(false);
         IReadOnlyList<string> devices = six.Device is { } other && other != _device ? [_device, other] : [_device];
         if (!await MarkAsync(devices, six.Tunnelled && six.Device is null, ct).ConfigureAwait(false))
         {
@@ -143,8 +146,7 @@ internal sealed class AppBypass : IDisposable
         }
 
         Loosen();
-        await LaySixAsync(six, ct).ConfigureAwait(false);
-        return true;
+        return await LaySixAsync(six, ct).ConfigureAwait(false);
     }
 
     // Marks what the sockets of the cgroup send and rewrites its source on the way out.
@@ -153,7 +155,7 @@ internal sealed class AppBypass : IDisposable
         var path = Path.Combine(AgentPaths.Root, "direct-apps.nft");
         try
         {
-            var text = SteeringRules.Passes(SteeringRules.DirectGroup, devices, refuseSix ? _iface : null);
+            var text = SteeringRules.Passes(_group is null ? null : SteeringRules.DirectGroup, devices, refuseSix ? _iface : null);
             await File.WriteAllTextAsync(path, text, ct).ConfigureAwait(false);
             var (exitCode, output) = await Shell.RunAsync("nft", ct, "-f", path).ConfigureAwait(false);
             if (exitCode != 0)
@@ -208,17 +210,17 @@ internal sealed class AppBypass : IDisposable
     }
 
     // Leads the sixth family of the applications past the tunnel where the machine has a way of its own for it.
-    private async Task LaySixAsync((bool Tunnelled, string? Via, string? Device) six, CancellationToken ct)
+    private async Task<bool> LaySixAsync((bool Tunnelled, string? Via, string? Device) six, CancellationToken ct)
     {
         if (!six.Tunnelled)
         {
-            return;
+            return true;
         }
 
         if (six.Device is not { } hop)
         {
             _log.Info("apps", "the machine has no way of its own for the sixth family, so it is refused to these applications instead of riding the tunnel");
-            return;
+            return true;
         }
 
         string[][] steps =
@@ -232,12 +234,13 @@ internal sealed class AppBypass : IDisposable
             var (exitCode, output) = await Shell.RunAsync("ip", ct, step).ConfigureAwait(false);
             if (exitCode != 0)
             {
-                _log.Warn("apps", $"the sixth family of the applications the list keeps direct rides the tunnel: ip {string.Join(' ', step)} failed: {output}");
-                return;
+                _log.Error("apps", $"could not install IPv6 bypass: ip {string.Join(' ', step)} failed: {output}");
+                return false;
             }
         }
 
         _log.Info("apps", $"the sixth family of these applications leaves past the tunnel as well, on {hop}");
+        return true;
     }
 
     // The iproute2 words that lay the default of the sixth family in the table.

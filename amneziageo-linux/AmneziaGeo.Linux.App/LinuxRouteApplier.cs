@@ -32,6 +32,9 @@ internal sealed class LinuxRouteApplier : IRouteApplier
     private GeoIpRanges _refused = GeoIpRanges.Build([]);
     private int _generation = 1;
     private int _endpointWarned;
+    private int _failures;
+
+    public int Failures => Volatile.Read(ref _failures);
 
     /// <summary>
     /// ctor
@@ -370,46 +373,33 @@ internal sealed class LinuxRouteApplier : IRouteApplier
     {
         foreach (var cidr in removed)
         {
-            Ip("route", "del", cidr, "dev", _iface);
+            if (!Ip("route", "del", cidr, "dev", _iface))
+            {
+                throw new IOException("Could not remove a standing VPN route.");
+            }
         }
 
-        var carried = Readvertise(added, removed);
-        foreach (var cidr in added)
-        {
-            Ip("route", "replace", cidr, "dev", _iface);
-        }
-
-        return carried;
-    }
-
-    // Rewrites the standing ranges and hands the peer the whole set; returns the standing ranges.
-    private IReadOnlyList<string> Readvertise(IReadOnlyList<string> added, IReadOnlyList<string> removed)
-    {
         lock (_sync)
         {
-            _advertised.RemoveAll(cidr => removed.Contains(cidr, StringComparer.Ordinal));
-            foreach (var cidr in added)
-            {
-                if (!_advertised.Contains(cidr, StringComparer.Ordinal))
-                {
-                    _advertised.Add(cidr);
-                }
-            }
-
+            var next = _advertised.Except(removed, StringComparer.Ordinal).Union(added, StringComparer.Ordinal).ToArray();
             if (_peerKey is not null)
             {
-                try
-                {
-                    _daemon.ReplaceAllowedIpsAsync(_peerKey, [.. _advertised, .. _live]).GetAwaiter().GetResult();
-                }
-                catch (Exception ex)
-                {
-                    _log.Error("route", "handing the standing ranges to the engine failed", ex);
-                }
+                _daemon.ReplaceAllowedIpsAsync(_peerKey, [.. next, .. _live]).GetAwaiter().GetResult();
             }
 
-            return [.. _advertised];
+            _advertised.Clear();
+            _advertised.AddRange(next);
         }
+
+        foreach (var cidr in added)
+        {
+            if (!Ip("route", "replace", cidr, "dev", _iface))
+            {
+                throw new IOException("Could not install a standing VPN route.");
+            }
+        }
+
+        return [.. _advertised];
     }
 
     /// <summary>
@@ -507,6 +497,7 @@ internal sealed class LinuxRouteApplier : IRouteApplier
             catch (Exception ex)
             {
                 _live.Remove(cidr);
+                Interlocked.Increment(ref _failures);
                 _log.Error("route", $"advertising {cidr} to the engine failed", ex);
                 return false;
             }
@@ -541,6 +532,7 @@ internal sealed class LinuxRouteApplier : IRouteApplier
             }
             catch (Exception ex)
             {
+                Interlocked.Increment(ref _failures);
                 _log.Error("route", "withdrawing addresses from the engine failed", ex);
             }
         }
@@ -582,6 +574,7 @@ internal sealed class LinuxRouteApplier : IRouteApplier
                     _live.Remove(cidr);
                 }
 
+                Interlocked.Increment(ref _failures);
                 _log.Error("route", $"advertising {added.Count} address(es) to the engine failed", ex);
                 return false;
             }
@@ -610,6 +603,7 @@ internal sealed class LinuxRouteApplier : IRouteApplier
             var (exitCode, output) = Shell.RunAsync("ip", CancellationToken.None, "-batch", file).GetAwaiter().GetResult();
             if (exitCode != 0)
             {
+                Interlocked.Increment(ref _failures);
                 _log.Warn("route", $"{what} failed: {output}");
                 return false;
             }
@@ -618,6 +612,7 @@ internal sealed class LinuxRouteApplier : IRouteApplier
         }
         catch (IOException ex)
         {
+            Interlocked.Increment(ref _failures);
             _log.Error("route", "writing the batch of routes failed", ex);
             return false;
         }
@@ -639,6 +634,7 @@ internal sealed class LinuxRouteApplier : IRouteApplier
         var (exitCode, output) = Shell.RunAsync("ip", CancellationToken.None, args).GetAwaiter().GetResult();
         if (exitCode != 0)
         {
+            Interlocked.Increment(ref _failures);
             _log.Warn("route", $"ip {string.Join(' ', args)} failed: {output}");
             return false;
         }

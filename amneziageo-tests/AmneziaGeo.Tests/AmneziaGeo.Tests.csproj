@@ -26,6 +26,8 @@
     <Compile Include="..\..\amneziageo-android\AmneziaGeo.Android.Engine\DnsRouteHints.cs" Link="DnsRouteHints.cs" />
     <Compile Include="..\..\amneziageo-android\AmneziaGeo.Android.Engine\RouteBudget.cs" Link="RouteBudget.cs" />
     <Compile Include="..\..\amneziageo-android\AmneziaGeo.Android.Engine\VpnSessionFiles.cs" Link="VpnSessionFiles.cs" />
+    <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\TunnelRouting.cs" Link="TunnelRouting.cs" />
+    <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\LinuxNameRoutes.cs" Link="LinuxNameRoutes.cs" />
   </ItemGroup>
 
   <ItemGroup>

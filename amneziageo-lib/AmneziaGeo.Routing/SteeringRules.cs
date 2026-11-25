@@ -65,6 +65,9 @@ public static class SteeringRules
     public const string DirectGroup = "amneziageo-direct";
 
     private const string Blocked = "blocked";
+    private const string NameProxy = "name_proxy";
+    private const string NameDirect = "name_direct";
+    private const string NameBlock = "name_block";
 
     /// <summary>
     /// The ranges a list sends through the tunnel by address: its tunnel ranges without the direct and the blocked
@@ -92,7 +95,7 @@ public static class SteeringRules
     /// a list, every datagram. Null ranges leave the set of them out; the spared addresses stay off the mark of the
     /// ranges; the direct ranges, where given, take no other mark at all, and neither do the spared addresses then.
     /// </summary>
-    public static string Marks(string iface, string? cgroup, IReadOnlyList<string>? ranges, bool allUdp, string? endpoint, IReadOnlyList<string>? spared = null, IReadOnlyList<string>? direct = null)
+    public static string Marks(string iface, string? cgroup, IReadOnlyList<string>? ranges, bool allUdp, string? endpoint, IReadOnlyList<string>? spared = null, IReadOnlyList<string>? direct = null, bool names = false)
     {
         var text = new StringBuilder();
         text.Append("table inet ").Append(Table).Append(" {\n");
@@ -153,13 +156,43 @@ public static class SteeringRules
         text.Append("  chain source {\n");
         text.Append("    type nat hook postrouting priority srcnat; policy accept;\n");
         text.Append("    meta mark ").Append(Mark).Append(" oifname \"").Append(iface).Append("\" masquerade\n");
-        if (cgroup is { Length: > 0 })
+        if (names || cgroup is { Length: > 0 })
         {
             text.Append("    meta mark ").Append(AppMark).Append(" oifname \"").Append(iface).Append("\" masquerade\n");
         }
 
         text.Append("  }\n");
+        if (names)
+        {
+            Set(text, NameProxy, false, []);
+            Set(text, NameDirect, false, []);
+            Set(text, NameBlock, false, []);
+            text.Append("  chain names {\n");
+            text.Append("    type route hook output priority mangle + 2; policy accept;\n");
+            text.Append("    oifname \"lo\" return\n");
+            text.Append("    ct direction original ip daddr @").Append(NameProxy).Append(" meta mark set ").Append(AppMark).Append(" return\n");
+            text.Append("    ct direction original ip daddr @").Append(NameDirect).Append(" meta mark set ").Append(DirectMark).Append("\n");
+            text.Append("  }\n");
+            text.Append("  chain refuse_names {\n");
+            text.Append("    type filter hook output priority filter; policy accept;\n");
+            text.Append("    ct direction original ip daddr @").Append(NameBlock).Append(" reject with icmpx type admin-prohibited\n");
+            text.Append("  }\n");
+        }
+
         text.Append("}\n");
+
+        return text.ToString();
+    }
+
+    /// <summary>Replaces the three disjoint sets learned by the DNS router in one nftables transaction.</summary>
+    public static string ReloadNames(IReadOnlyList<string> proxy, IReadOnlyList<string> direct, IReadOnlyList<string> block)
+    {
+        var text = new StringBuilder();
+        foreach (var (set, addresses) in new[] { (NameProxy, proxy), (NameDirect, direct), (NameBlock, block) })
+        {
+            text.Append("flush set inet ").Append(Table).Append(' ').Append(set).Append('\n');
+            Add(text, set, addresses);
+        }
 
         return text.ToString();
     }
@@ -169,20 +202,23 @@ public static class SteeringRules
     /// everything, and rewrites its source on the devices it leaves by. Where a tunnel is named, the sixth family
     /// that would leave by it is refused to them instead.
     /// </summary>
-    public static string Passes(string cgroup, IReadOnlyList<string> devices, string? tunnel = null)
+    public static string Passes(string? cgroup, IReadOnlyList<string> devices, string? tunnel = null)
     {
         var text = new StringBuilder();
         text.Append("table inet ").Append(DirectTable).Append(" {\n");
-        text.Append("  chain apps {\n");
-        text.Append("    type route hook output priority mangle; policy accept;\n");
-        text.Append("    socket cgroupv2 level 1 \"").Append(cgroup).Append("\" meta mark set ").Append(DirectMark).Append('\n');
-        text.Append("  }\n");
+        if (cgroup is not null)
+        {
+            text.Append("  chain apps {\n");
+            text.Append("    type route hook output priority mangle + 1; policy accept;\n");
+            text.Append("    socket cgroupv2 level 1 \"").Append(cgroup).Append("\" meta mark set ").Append(DirectMark).Append('\n');
+            text.Append("  }\n");
+        }
         text.Append("  chain source {\n");
         text.Append("    type nat hook postrouting priority srcnat; policy accept;\n");
         text.Append("    meta mark ").Append(DirectMark).Append(" oifname { ");
         text.Append(string.Join(", ", devices.Select(device => $"\"{device}\""))).Append(" } masquerade\n");
         text.Append("  }\n");
-        if (tunnel is { Length: > 0 })
+        if (cgroup is not null && tunnel is { Length: > 0 })
         {
             text.Append("  chain refuse {\n");
             text.Append("    type filter hook output priority mangle - 1; policy accept;\n");
@@ -197,17 +233,15 @@ public static class SteeringRules
     }
 
     /// <summary>
-    /// The lines that replace the ranges the marks go by and spare more addresses in the same go; a null set is
-    /// one the table does not stand.
+    /// Replaces the range sets in one transaction while leaving cache-owned host exceptions alone.
     /// </summary>
-    public static string Reload(IReadOnlyList<string>? ranges, IReadOnlyList<string> spared, IReadOnlyList<string>? direct = null)
+    public static string Reload(IReadOnlyList<string>? ranges, IReadOnlyList<string>? direct = null)
     {
         var text = new StringBuilder();
         if (ranges is not null)
         {
             text.Append("flush set inet ").Append(Table).Append(' ').Append(Proxied).Append('\n');
             Add(text, Proxied, ranges);
-            Add(text, Spared, spared);
         }
 
         if (direct is not null)
@@ -269,7 +303,7 @@ public static class SteeringRules
     /// The table that refuses what leaves the machine for the ranges, in place of the one that stood; the applications
     /// a list names go where their own rule sends them.
     /// </summary>
-    public static string Refusals(IReadOnlyList<string> ranges)
+    public static string Refusals(IReadOnlyList<string> ranges, bool exemptApps = true)
     {
         var text = new StringBuilder();
         text.Append("table inet ").Append(BlockTable).Append('\n');
@@ -279,7 +313,10 @@ public static class SteeringRules
         text.Append("  chain output {\n");
         text.Append("    type filter hook output priority filter; policy accept;\n");
         text.Append("    oifname \"lo\" accept\n");
-        text.Append("    meta mark { ").Append(AppMark).Append(", ").Append(DirectMark).Append(" } accept\n");
+        if (exemptApps)
+        {
+            text.Append("    meta mark { ").Append(AppMark).Append(", ").Append(DirectMark).Append(" } accept\n");
+        }
         text.Append("    ip daddr @").Append(Blocked).Append(" reject with icmpx type admin-prohibited\n");
         text.Append("  }\n");
         text.Append("}\n");

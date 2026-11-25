@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Net;
 using System.Text;
 
@@ -46,7 +47,7 @@ internal static class DnsWire
     /// <summary>
     /// Reads the addresses the answer section carries.
     /// </summary>
-    public static IReadOnlyList<IPAddress> ReadAddresses(byte[] buffer, int length)
+    public static IReadOnlyList<(IPAddress Address, uint Ttl)> ReadAddresses(byte[] buffer, int length)
     {
         if (length < HeaderLength)
         {
@@ -59,7 +60,7 @@ internal static class DnsWire
             return [];
         }
 
-        var addresses = new List<IPAddress>();
+        var addresses = new List<(IPAddress Address, uint Ttl)>();
         var answers = ReadUInt16(buffer, 6);
         for (var index = 0; index < answers; index++)
         {
@@ -69,6 +70,7 @@ internal static class DnsWire
             }
 
             var type = ReadUInt16(buffer, offset);
+            var ttl = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(offset + 4, 4));
             var dataLength = ReadUInt16(buffer, offset + 8);
             offset += 10;
             if (offset + dataLength > length)
@@ -78,7 +80,7 @@ internal static class DnsWire
 
             if ((type == TypeA && dataLength == 4) || (type == TypeAaaa && dataLength == 16))
             {
-                addresses.Add(new IPAddress(buffer.AsSpan(offset, dataLength)));
+                addresses.Add((new IPAddress(buffer.AsSpan(offset, dataLength)), ttl));
             }
 
             offset += dataLength;

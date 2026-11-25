@@ -28,7 +28,6 @@ internal sealed class TunnelController : IDisposable
 {
     private const string TunDevice = "/dev/net/tun";
     private const string Loopback = "127.0.0.1";
-    private const int HandshakeWaitSeconds = 30;
     private const int KeepaliveSeconds = 25;
 
     private readonly string _enginePath;
@@ -41,13 +40,15 @@ internal sealed class TunnelController : IDisposable
     private IReadOnlyList<string> _configNetworks = [];
     private StandingBasis? _standingBasis;
     private StandingRanges _standing = StandingRanges.None;
-    private IReadOnlyList<string> _appRules = [];
     private IRouteMemory? _memory;
     private AppTunnel? _apps;
     private DirectPath? _direct;
     private AppBypass? _bypass;
-    private IReadOnlyList<string> _bypassRules = [];
-    private bool _allUdp;
+    private bool _routingIpv6;
+    private bool _blockInstalled;
+    private TunnelRouting? _startingRouting;
+    public TunnelRouting? AppliedRouting { get; private set; }
+    public bool RoutingRecoveryRequired { get; private set; }
     private string? _peerAddress;
     private CancellationTokenSource? _sessionCts;
     private string? _pinnedEndpoint;
@@ -203,8 +204,20 @@ internal sealed class TunnelController : IDisposable
 
         EndpointAddress = endpointIp;
 
-        var split = routing.Split && routing.HasRules;
-        var hasRules = routing.HasRules;
+        var selected = routing;
+        var split = routing.Split;
+        var hasRules = routing.Stamp is not null;
+        var configuredIps = WgConfigEditor.GetAllowedIps(resolved);
+        _routingIpv6 = options.Transport?.UseIpv6 == true || configuredIps.Any(range => range.Contains(':'))
+            || WgConfigEditor.GetAddresses(resolved).Any(address => address.Contains(':'));
+        if (routing.Unsupported(_routingIpv6) is { } unsupported)
+        {
+            carrier.Started?.Dispose();
+            _log.Warn("routing", unsupported);
+            return Refused(unsupported);
+        }
+
+        _log.Debug("routing", $"preparing {routing.ListIds.Count} list(s), split={split}, all UDP={routing.EffectiveAllUdp}");
         routing = AroundLocal(routing);
         var vpnDns = VpnDns.Pick(options.Dns, options.Offer?.Dns(), WgConfigEditor.GetDns(resolved), Beside());
         var tunnelResolvers = TunnelResolvers(vpnDns.Network ? [] : vpnDns.Servers);
@@ -257,7 +270,10 @@ internal sealed class TunnelController : IDisposable
 
         var inboundReturn = standing.Return;
 
-        var allowedIps = AllowedIpsResolver.Build(split, WgConfigEditor.GetAllowedIps(resolved), startupRoutes);
+        IReadOnlyList<string> baseIps = hasRules && !split
+            ? (_routingIpv6 ? ["0.0.0.0/0", "::/0"] : ["0.0.0.0/0"])
+            : configuredIps;
+        var allowedIps = AllowedIpsResolver.Build(split, baseIps, startupRoutes);
         // Split advertises almost nothing at first, so without a keepalive the peer would only be greeted once
         // some destination had already earned its route - and the name rules that earn it need the tunnel first.
         var config = WgConfigEditor.EnsurePersistentKeepalive(WgConfigEditor.ApplyAllowedIps(resolved, allowedIps), KeepaliveSeconds);
@@ -346,22 +362,29 @@ internal sealed class TunnelController : IDisposable
             _standing = standing;
             _standingRoutes = [.. inboundRoutes, .. signalRoutes, .. standing.All];
             // All UDP belongs to a split: a full tunnel already carries every datagram.
-            var allUdp = split && routing.AllUdp;
+            var allUdp = routing.EffectiveAllUdp;
             // The ranges of the list take the mark in a split alone: a full tunnel already carries them.
             var marked = split ? SteeringRules.Carried(routing.ProxyRoutes, routing.DirectRoutes, routing.BlockRoutes) : null;
             // The resolver addresses are handed over as pinned: a list range that covers one would otherwise make the
             // cache own its route and reclaim it as idle, taking the tunnel's own name lookups down with it.
             IReadOnlyList<string> pinned = [.. resolverRoutes.Select(server => server.ToString()), .. inboundRoutes, .. signalRoutes, .. inboundReturn];
             var past = SteeringRules.Bypassed(routing.DirectRoutes, routing.BlockRoutes, endpointIp is null ? pinned : [.. pinned, endpointIp]);
+            var names = routing.SteerNames && !_routingIpv6 && hop is ({ }, { });
+            if (routing.HasDomains && routing.SteerNames && !names)
+            {
+                throw new IOException("A physical IPv4 gateway is required for application and domain routing.");
+            }
             _apps = await AppTunnel.TryStartAsync(_iface, routing.TunnelApps,
-                [.. routing.DirectRoutes, .. routing.BlockRoutes], marked, [], past, allUdp, endpointIp, _log, ct).ConfigureAwait(false);
-            _appRules = routing.TunnelApps;
-            _allUdp = allUdp && _apps is not null;
+                [.. routing.DirectRoutes, .. routing.BlockRoutes], marked, past, allUdp, endpointIp, _log, ct, names).ConfigureAwait(false);
+            if (_apps is null && (routing.TunnelApps.Count > 0 || allUdp || names || marked is { Count: > 0 }))
+            {
+                throw new IOException("Linux could not install the VPN application or range marks.");
+            }
+
             applier.Attach(_apps);
             if (_apps is not null && !applier.CarryEverything())
             {
-                _log.Warn("apps", "the peer would not take the whole range, so the applications reach only what the rules "
-                    + "already advertised");
+                throw new IOException("The peer did not accept the routes required by the Linux marks.");
             }
             // Hands the cache what the previous session used most; loading and writing back happen on its own loop.
             // In a split the far end of a connection this machine took in earns no route: its answers go back the way
@@ -375,8 +398,16 @@ internal sealed class TunnelController : IDisposable
             // A split leaves the direct ranges on the path of the machine as it is.
             _direct = !split && hop is ({ } gateway, { } device) ? new DirectPath(gateway, device, _log) : null;
             await PassAsync(cache, routing, ct).ConfigureAwait(false);
-            _bypass = await BypassAsync(routing, split, hop, ct).ConfigureAwait(false);
-            _bypassRules = split ? [] : routing.DirectApps;
+            if (routing.DirectApps.Count > 0 || names)
+            {
+                if (hop is not ({ } gateway4, { } device4))
+                {
+                    throw new IOException("A physical IPv4 gateway is required for direct Linux applications.");
+                }
+
+                _bypass = await AppBypass.TryStartAsync(_iface, routing.DirectApps, gateway4, device4, _log, ct, names).ConfigureAwait(false)
+                    ?? throw new IOException("Linux could not install the path for direct applications or domains.");
+            }
             if (_memory is { } memory)
             {
                 cache.SetMemory(memory);
@@ -390,12 +421,18 @@ internal sealed class TunnelController : IDisposable
                 _ = Task.Run(() => ServerSignal.ListenAsync(signal, () => AskedDownAsync(session), Note, session));
             }
 
-            StartNameRouter(routing with { Split = split }, allowedIps, vpnDns.Network && lanResolvers.Count > 0 ? lanResolvers : tunnelResolvers, lanResolvers, options.DnsTransport, vpnDns.Network);
+            StartNameRouter(routing, allowedIps, vpnDns.Network && lanResolvers.Count > 0 ? lanResolvers : tunnelResolvers, lanResolvers, options.DnsTransport, vpnDns.Network, names ? _apps : null);
+            _startingRouting = selected;
             var ranges = cache.RangeCounts;
             _log.Info("tunnel", $"routing {Mode}: {allowedIps.Count} range(s) advertised, {ranges.Proxy} range(s) go through the tunnel, {ranges.Direct} stay outside it, {ranges.Block} are refused; each address is decided on first contact and forgotten after {options.RouteTtlSeconds} s unused");
             return null;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException)
+        {
+            await DownAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception ex)
         {
             _log.Error("tunnel", "routing setup failed; the tunnel is taken down", ex);
             await DownAsync(CancellationToken.None).ConfigureAwait(false);
@@ -417,6 +454,12 @@ internal sealed class TunnelController : IDisposable
     /// Hands over the store the cache keeps its hottest destinations in between sessions.
     /// </summary>
     public void SetRouteMemory(IRouteMemory memory) => _memory = memory;
+
+    public void UpdateRouteMemory(IRouteMemory memory)
+    {
+        _memory = memory;
+        _cache?.SetMemory(memory);
+    }
 
     /// <summary>
     /// Whether the tunnel is carried inside a websocket.
@@ -501,67 +544,93 @@ internal sealed class TunnelController : IDisposable
     /// </summary>
     public RoutingCache? Cache => _cache;
 
-    /// <summary>
-    /// Applies edited rules to the running tunnel and drops every verdict taken under the old ones; false when
-    /// only a fresh tunnel can carry the change, because the mode decides what the engine was told to accept.
-    /// </summary>
-    public bool ApplyRules(TunnelRouting routing)
+    /// <summary>Applies a compatible DNS/IP edit and returns why a reconnect is needed on refusal or failure.</summary>
+    public async Task<string?> ApplyRulesAsync(TunnelRouting requested)
     {
-        if (_cache is not { } cache)
+        if (_cache is not { } cache || _standingBasis is not { } basis || AppliedRouting is not { } applied)
         {
-            return false;
+            return "there is no active routing plan";
         }
 
-        if ((routing.Split && routing.HasRules) != _split)
+        if (RoutingRecoveryRequired)
         {
-            return false;
+            return "routing could not be fully applied; reconnect to restore a consistent policy";
         }
 
-        // The matcher is built with the tunnel, so a changed set of applications waits for the next one.
-        if (!new HashSet<string>(_appRules, StringComparer.Ordinal).SetEquals(routing.TunnelApps))
+        if (requested.Stamp == applied.Stamp)
         {
-            return false;
+            return null;
         }
 
-        // The mark is armed with the tunnel, so all UDP waits for the next one as well.
-        if ((_split && routing.AllUdp) != _allUdp)
+        var reason = requested.Unsupported(_routingIpv6) ?? applied.ReconnectReason(requested);
+        if (reason is not null)
         {
-            return false;
+            _log.Debug("routing", $"live update refused: {reason}");
+            return reason;
         }
 
-        // The applications kept past the tunnel are placed with it too.
-        IReadOnlyList<string> kept = _split ? [] : routing.DirectApps;
-        if (!new HashSet<string>(_bypassRules, StringComparer.Ordinal).SetEquals(kept))
+        if (requested.HasDomains && (_dns?.CanRouteDomains != true || !_resolverApplied || requested.SteerNames && _bypass is null))
         {
-            return false;
+            const string unavailable = "the session cannot route DNS decisions with its current paths";
+            _log.Debug("routing", $"live update refused: {unavailable}");
+            return unavailable;
         }
 
-        var hasRules = routing.HasRules;
-        routing = WithNetworkResolvers(AroundLocal(routing));
-        Restand(cache, routing);
-        Steer(cache, routing);
-        RefuseAsync(cache, routing, CancellationToken.None).GetAwaiter().GetResult();
-        // A direct range that left the list goes before the rebuild and a new one comes after it, so an address a
-        // name sends through the tunnel past one never stands without its own route.
-        Shed(cache, routing);
+        _log.Debug("routing", $"applying a live policy from {requested.ListIds.Count} list(s)");
+        try
+        {
+            var routing = WithNetworkResolvers(AroundLocal(requested));
+            var failures = basis.Applier.Failures;
+            var spareFailures = _apps?.SpareFailures ?? 0;
+            Restand(cache, routing);
+            Steer(cache, routing);
+            await RefuseAsync(cache, routing, CancellationToken.None).ConfigureAwait(false);
+            await ShedAsync(cache, routing).ConfigureAwait(false);
+            if (_dns?.ApplyRules(routing) == false)
+            {
+                throw new IOException("Netfilter refused the updated DNS routes.");
+            }
 
-        // Names take the edit first: the rebuild decides each held address by the name it came with.
-        _dns?.ApplyRules(routing);
-        cache.Rebuild(Proxied(routing), routing.DirectRoutes, routing.BlockRoutes, address => _dns?.VerdictOf(address) ?? RouteVerdict.None);
-        PassAsync(cache, routing, CancellationToken.None).GetAwaiter().GetResult();
-        Mode = _split ? $"split ({routing.ListName})" : hasRules ? $"full ({routing.ListName})" : "full";
-        RoutingMode = Token(_split, hasRules);
+            cache.Rebuild(Proxied(routing), routing.DirectRoutes, routing.BlockRoutes, address => _dns?.VerdictOf(address) ?? RouteVerdict.None);
+            if (_split && _apps is not null)
+            {
+                basis.Applier.Rearm();
+                cache.Reinstall();
+            }
+
+            await PassAsync(cache, routing, CancellationToken.None).ConfigureAwait(false);
+            if (failures != basis.Applier.Failures || spareFailures != (_apps?.SpareFailures ?? 0))
+            {
+                throw new IOException("A route, firewall or peer update failed during the live routing change.");
+            }
+
+            AppliedRouting = requested;
+            SetRoutingStatus(requested);
+            _log.Info("routing", $"applied {requested.ListIds.Count} routing list(s) without reconnecting");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            RoutingRecoveryRequired = true;
+            _log.Error("routing", "live routing update failed; reconnect to restore a consistent policy", ex);
+            return "routing could not be fully applied; reconnect to restore a consistent policy";
+        }
+    }
+
+    private void SetRoutingStatus(TunnelRouting routing)
+    {
+        Mode = routing.Stamp is null ? "full" : $"{(routing.Split ? "split" : "full")} ({routing.ListName})";
+        RoutingMode = Token(routing.Split, routing.Stamp is not null);
         ListName = routing.ListName;
-        return true;
     }
 
     /// <summary>
     /// Applies inbound access to the running tunnel: the ranges the tunnel reaches this machine at and the table
     /// that holds it off; false when no session stands to take the change.
     /// </summary>
-    public async Task<bool> ApplyInboundAsync(ConfigTransport? transport, TunnelRouting routing, CancellationToken ct)
+    public async Task<bool> ApplyInboundAsync(ConfigTransport? transport, CancellationToken ct)
     {
-        if (_cache is not { } cache || _standingBasis is null)
+        if (_cache is not { } cache || _standingBasis is null || AppliedRouting is not { } routing || RoutingRecoveryRequired)
         {
             return false;
         }
@@ -588,7 +657,7 @@ internal sealed class TunnelController : IDisposable
     }
 
     // Hands the kernel the ranges of the edited list the marks go by, raising the path of the tunnel ones when they
-    // are its first; what the cache holds off the tunnel stays off it.
+    // are its first.
     private void Steer(RoutingCache cache, TunnelRouting routing)
     {
         if (_standingBasis is not { } basis)
@@ -599,21 +668,21 @@ internal sealed class TunnelController : IDisposable
         var past = Past(cache, routing);
         if (!_split)
         {
-            _apps?.Reload([], [], past);
+            if (_apps?.Reload([], past) == false)
+            {
+                throw new IOException("Netfilter refused the updated VPN marks.");
+            }
+
             return;
         }
 
         var ranges = SteeringRules.Carried(routing.ProxyRoutes, routing.DirectRoutes, routing.BlockRoutes);
-        var held = cache.Snapshot()
-            .Where(one => one.Plan == RoutePlan.Permit)
-            .Select(one => AppTunnel.Numeric(one.Address))
-            .ToList();
         if (_apps is { } apps)
         {
             basis.Applier.Shore(ranges);
-            if (!apps.Reload(ranges, held, past))
+            if (!apps.Reload(ranges, past))
             {
-                return;
+                throw new IOException("Netfilter refused the updated split VPN marks.");
             }
         }
         else
@@ -624,70 +693,50 @@ internal sealed class TunnelController : IDisposable
             }
 
             _apps = AppTunnel.TryStartAsync(_iface, routing.TunnelApps, [.. routing.DirectRoutes, .. routing.BlockRoutes],
-                ranges, held, past, false, _peerAddress, _log, CancellationToken.None).GetAwaiter().GetResult();
+                ranges, past, false, _peerAddress, _log, CancellationToken.None).GetAwaiter().GetResult();
             basis.Applier.Attach(_apps);
-            if (_apps is null)
+            if (_apps is null || !basis.Applier.CarryEverything())
             {
-                return;
-            }
-
-            if (!basis.Applier.CarryEverything())
-            {
-                _log.Warn("routing", "the peer would not take the whole range, so the ranges of the list reach only what the rules already advertised");
+                throw new IOException("Linux could not install the new split VPN ranges.");
             }
         }
-
-        basis.Applier.Rearm();
-        cache.Reinstall();
-    }
-
-    // Raises the path past the tunnel for the applications the list keeps direct; a split leaves them to its rules
-    // by address.
-    private async Task<AppBypass?> BypassAsync(TunnelRouting routing, bool split, (string? Via, string? Dev) hop, CancellationToken ct)
-    {
-        if (routing.DirectApps.Count == 0)
-        {
-            return null;
-        }
-
-        if (split)
-        {
-            _log.Info("apps", $"the {routing.DirectApps.Count} application(s) the list keeps direct follow its rules by address: only a tunnel that carries everything takes them aside");
-            return null;
-        }
-
-        if (hop is not ({ } via, { } device))
-        {
-            _log.Warn("apps", "the machine names no hop of its own to the internet, so the applications the list keeps direct ride the tunnel with everything else");
-            return null;
-        }
-
-        return await AppBypass.TryStartAsync(_iface, routing.DirectApps, via, device, _log, ct).ConfigureAwait(false);
     }
 
     // Refuses the ranges the list blocks, apart from what the connection itself stands on.
     private async Task RefuseAsync(RoutingCache cache, TunnelRouting routing, CancellationToken ct)
     {
         var refused = SteeringRules.Refused(routing.BlockRoutes, Kept(cache));
-        var standing = await BlockFirewall.ApplyAsync(refused, _log, ct).ConfigureAwait(false);
-        var marked = _apps?.CarriesApplications == true || (!_split && routing.DirectApps.Count > 0);
-        _standingBasis?.Applier.Refuse(standing && marked ? refused : []);
+        if ((_blockInstalled || refused.Count > 0) && !await BlockFirewall.ApplyAsync(refused, _log, ct).ConfigureAwait(false))
+        {
+            throw new IOException("Netfilter refused the blocked routes.");
+        }
+
+        _blockInstalled |= refused.Count > 0;
+        _standingBasis?.Applier.Refuse(refused);
     }
 
     // Lays the ranges the list keeps direct past a tunnel that carries everything; a held address they no longer
     // lead there takes a route of its own.
     private async Task PassAsync(RoutingCache cache, TunnelRouting routing, CancellationToken ct)
     {
+        if (!_split && _direct is null && Past(cache, routing).Count > 0)
+        {
+            throw new IOException("A physical IPv4 gateway is required for direct Linux routes.");
+        }
+
         if (_direct is { } direct)
         {
-            await direct.ApplyAsync(Past(cache, routing), ct).ConfigureAwait(false);
+            if (!await direct.ApplyAsync(Past(cache, routing), ct).ConfigureAwait(false))
+            {
+                throw new IOException("Linux could not apply the direct routes.");
+            }
             _standingBasis?.Applier.Uphold(direct.Standing);
         }
     }
 
     // Takes the direct ranges that left the list out of the routes; a held address they led past the tunnel takes
     // a route of its own first.
-    private void Shed(RoutingCache cache, TunnelRouting routing)
+    private async Task ShedAsync(RoutingCache cache, TunnelRouting routing)
     {
         if (_direct is not { } direct)
         {
@@ -696,7 +745,10 @@ internal sealed class TunnelController : IDisposable
 
         var past = Past(cache, routing);
         _standingBasis?.Applier.Uphold(direct.Staying(past));
-        direct.ShedAsync(past, CancellationToken.None).GetAwaiter().GetResult();
+        if (!await direct.ShedAsync(past, CancellationToken.None).ConfigureAwait(false))
+        {
+            throw new IOException("Linux could not withdraw the previous direct routes.");
+        }
     }
 
     // The ranges the list keeps off the tunnel, apart from what the connection itself stands on.
@@ -821,8 +873,6 @@ internal sealed class TunnelController : IDisposable
         if (_apps is { } apps)
         {
             _apps = null;
-            _appRules = [];
-            _allUdp = false;
             await apps.StopAsync().ConfigureAwait(false);
             apps.Dispose();
         }
@@ -841,7 +891,10 @@ internal sealed class TunnelController : IDisposable
             bypass.Dispose();
         }
 
-        _bypassRules = [];
+        _startingRouting = null;
+        AppliedRouting = null;
+        RoutingRecoveryRequired = false;
+        _blockInstalled = false;
 
         _peerAddress = null;
 
@@ -916,48 +969,57 @@ internal sealed class TunnelController : IDisposable
 
     // Binds the name router and points the machine at it once the peer answers, so a dial that never completes
     // cannot leave the machine without a resolver.
-    private void StartNameRouter(TunnelRouting routing, IReadOnlyList<string> allowedIps, IReadOnlyList<IPAddress> tunnelResolvers, IReadOnlyList<IPAddress> lanResolvers, string dnsTransport, bool network)
+    private void StartNameRouter(TunnelRouting routing, IReadOnlyList<string> allowedIps, IReadOnlyList<IPAddress> tunnelResolvers, IReadOnlyList<IPAddress> lanResolvers, string dnsTransport, bool network, AppTunnel? nameSteering)
     {
         var stripV6 = !allowedIps.Any(range => range.Contains(':', StringComparison.Ordinal));
-        var router = new DnsRouter(routing, stripV6, tunnelResolvers, lanResolvers, _cache!, _log, dnsTransport, network);
-        if (!router.Start())
+        var router = new DnsRouter(routing, stripV6, tunnelResolvers, lanResolvers, _cache!, _log, dnsTransport, network, nameSteering, _peerAddress);
+        if (!router.Start() || routing.HasDomains && !router.CanRouteDomains)
         {
             router.Dispose();
-            _log.Warn("dns", "the name router could not bind, so rules by domain name do not apply; only rules by address do");
+            if (routing.HasDomains)
+            {
+                throw new IOException("The Linux DNS router could not bind for a policy with domain rules.");
+            }
+
+            _log.Warn("dns", "the name router could not bind");
             return;
         }
 
         _dns = router;
-        _ = Task.Run(() => ApplyResolverWhenUpAsync(_sessionCts!.Token));
     }
 
-    private async Task ApplyResolverWhenUpAsync(CancellationToken ct)
+    public async Task<bool> ConfirmRoutingAsync()
     {
-        try
+        if (_startingRouting is not { } routing)
         {
-            for (var attempt = 0; attempt < HandshakeWaitSeconds * 2; attempt++)
+            return AppliedRouting is not null;
+        }
+
+        if (_dns is { } router)
+        {
+            _resolverApplied = await ResolvConf.ApplyAsync(DnsRouter.Listen, _iface, _log).ConfigureAwait(false);
+            if (_resolverApplied)
             {
-                if (await HandshakeSeenAsync(ct).ConfigureAwait(false))
+                _log.Info("dns", $"lookups now go to {DnsRouter.Listen}");
+                if (_others is { } others && _sessionCts is { } session)
                 {
-                    _resolverApplied = await ResolvConf.ApplyAsync(DnsRouter.Listen, _iface, _log).ConfigureAwait(false);
-                    _log.Info("dns", $"lookups now go to {DnsRouter.Listen}");
-                    // Another VPN that points the resolver elsewhere later is followed, not fought.
-                    if (_resolverApplied && _others is { } others && _dns is { } router)
-                    {
-                        _ = Task.Run(() => others.WatchResolverAsync(router, ct));
-                    }
-
-                    return;
+                    var ct = session.Token;
+                    _ = Task.Run(() => others.WatchResolverAsync(router, ct));
                 }
-
-                await Task.Delay(500, ct).ConfigureAwait(false);
             }
+        }
 
-            _log.Warn("dns", "the server never answered, so the machine keeps its own resolver and rules by domain name do not apply");
-        }
-        catch (OperationCanceledException)
+        if (routing.HasDomains && !_resolverApplied)
         {
+            await ResolvConf.RestoreAsync(_iface, _log).ConfigureAwait(false);
+            _log.Error("routing", "the Linux DNS router could not be installed for a policy with domain rules");
+            await DownAsync(CancellationToken.None).ConfigureAwait(false);
+            return false;
         }
+
+        AppliedRouting = routing;
+        _startingRouting = null;
+        return true;
     }
 
     /// <summary>
@@ -1039,32 +1101,6 @@ internal sealed class TunnelController : IDisposable
         {
             return -1;
         }
-    }
-
-    // Whether the peer has answered at least once.
-    private async Task<bool> HandshakeSeenAsync(CancellationToken ct)
-    {
-        if (_daemon is not { } daemon)
-        {
-            return false;
-        }
-
-        try
-        {
-            foreach (var line in (await daemon.GetConfigAsync(ct).ConfigureAwait(false)).Split('\n'))
-            {
-                if (line.StartsWith("last_handshake_time_sec=", StringComparison.Ordinal)
-                    && long.TryParse(line.AsSpan(24), out var seconds) && seconds > 0)
-                {
-                    return true;
-                }
-            }
-        }
-        catch (Exception ex) when (ex is IOException or SocketException)
-        {
-        }
-
-        return false;
     }
 
     // Refuses the connect with an actionable reason when the host cannot carry a tunnel.
@@ -1309,7 +1345,7 @@ internal sealed class TunnelController : IDisposable
                 }
                 else
                 {
-                    _log.Warn("tunnel", $"ip route add {route} failed: {added.Output}");
+                    return $"ip route add {route} failed: {added.Output}";
                 }
             }
         }

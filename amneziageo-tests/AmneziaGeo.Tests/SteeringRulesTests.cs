@@ -172,22 +172,13 @@ public sealed class SteeringRulesTests
     {
         Assert.Equal(
             "flush set inet amneziageo proxied\nadd element inet amneziageo proxied { 198.18.10.0/25, 203.0.113.0/24 }\n",
-            SteeringRules.Reload(["198.18.10.0/25", "203.0.113.0/24"], []));
+            SteeringRules.Reload(["198.18.10.0/25", "203.0.113.0/24"]));
     }
 
     [Fact]
     public void Reload_OnlyEmptiesTheSetOfAListLeftWithoutRanges()
     {
-        Assert.Equal("flush set inet amneziageo proxied\n", SteeringRules.Reload([], []));
-    }
-
-    [Fact]
-    public void Reload_SparesInTheSameGoWhatANameHoldsOffTheTunnel()
-    {
-        Assert.Equal(
-            "flush set inet amneziageo proxied\nadd element inet amneziageo proxied { 198.18.10.0/24 }\n"
-            + "add element inet amneziageo spared { 198.18.10.9, 198.18.10.77 }\n",
-            SteeringRules.Reload(["198.18.10.0/24"], ["198.18.10.9", "198.18.10.77"]));
+        Assert.Equal("flush set inet amneziageo proxied\n", SteeringRules.Reload([]));
     }
 
     [Fact]
@@ -289,18 +280,18 @@ public sealed class SteeringRulesTests
     }
 
     [Fact]
-    public void Reload_FillsTheDirectRangesInTheSameGo()
+    public void Reload_ChangesRangeSetsWithoutTouchingHostExceptions()
     {
         Assert.Equal(
             "flush set inet amneziageo proxied\nadd element inet amneziageo proxied { 198.18.10.0/25 }\n"
             + "flush set inet amneziageo direct\nadd element inet amneziageo direct { 198.18.10.128/25 }\n",
-            SteeringRules.Reload(["198.18.10.0/25"], [], ["198.18.10.128/25"]));
+            SteeringRules.Reload(["198.18.10.0/25"], ["198.18.10.128/25"]));
     }
 
     [Fact]
     public void Reload_LeavesAloneTheSetsTheTableDoesNotStand()
     {
-        Assert.Equal("flush set inet amneziageo direct\n", SteeringRules.Reload(null, ["198.18.10.9"], []));
+        Assert.Equal("flush set inet amneziageo direct\n", SteeringRules.Reload(null, []));
     }
 
     [Fact]
@@ -321,7 +312,7 @@ public sealed class SteeringRulesTests
         var text = SteeringRules.Passes("amneziageo-direct", ["eth0"]);
 
         Assert.StartsWith("table inet amneziageo-direct {\n", text, StringComparison.Ordinal);
-        Assert.Contains("    type route hook output priority mangle; policy accept;\n    socket cgroupv2 level 1 \"amneziageo-direct\" meta mark set 0x51822\n", text, StringComparison.Ordinal);
+        Assert.Contains("    type route hook output priority mangle + 1; policy accept;\n    socket cgroupv2 level 1 \"amneziageo-direct\" meta mark set 0x51822\n", text, StringComparison.Ordinal);
         Assert.DoesNotContain(SteeringRules.Mark, text, StringComparison.Ordinal);
     }
 

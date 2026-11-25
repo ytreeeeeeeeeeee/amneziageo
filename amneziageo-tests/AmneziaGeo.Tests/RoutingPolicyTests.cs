@@ -4,6 +4,7 @@ using AmneziaGeo.Dal;
 using AmneziaGeo.Decl;
 using AmneziaGeo.Geo;
 using AmneziaGeo.Ipc;
+using AmneziaGeo.Linux.App;
 using AmneziaGeo.Routing;
 using Xunit;
 
@@ -314,6 +315,74 @@ public sealed class RoutingPolicyTests : IAsyncLifetime
         AndroidPlan(RoutingPolicy? policy, int api, Func<string, bool>? installed = null,
             bool useRouter = true, bool ipv6 = false) =>
         GeoRoutingPlan.FromPolicy(policy, useRouter, ipv6, api, [], 300, SplitBudget.DefaultLimit, installed ?? (_ => true));
+
+    [Fact]
+    public async Task LinuxProjectsAllListsAndDistinguishesLiveEditsFromReconnects()
+    {
+        var apps = await AddAsync("Apps", ["proxy|app:name=browser", "direct|app:name=player"]);
+        var names = await AddAsync("Names", ["proxy|domain:video.test"]);
+        var full = await AddAsync("Full", []);
+        await _store.SetRoutingSettingsAsync(new RoutingSettings(full, "", false, UseGlobalProxy: true));
+        var split = TunnelRouting.FromPolicy(await _geo.LoadPolicyAsync([apps], AppRulePlatform.Linux));
+        await _store.UpdateSelectedRoutingListsAsync(_ => [names, apps]);
+        var mixed = await TunnelRouting.LoadAsync(_store, _geo, null, TestContext.Current.CancellationToken);
+
+        Assert.Equal([apps, names], mixed.ListIds);
+        Assert.Equal(["name=browser"], mixed.TunnelApps);
+        Assert.Equal(["name=player"], mixed.DirectApps);
+        Assert.True(mixed.SteerNames);
+        Assert.True(mixed.Split);
+        Assert.Null(split.ReconnectReason(mixed));
+        Assert.NotNull(mixed.ReconnectReason(mixed with { DirectApps = [] }));
+        Assert.NotNull(mixed.ReconnectReason(mixed with { AllUdp = true }));
+        Assert.NotNull(mixed.Unsupported(ipv6: true));
+        Assert.Null(mixed.Unsupported(ipv6: false));
+
+        await _store.SetRoutingSettingsAsync(new RoutingSettings(apps, "", true));
+        var combined = TunnelRouting.FromPolicy(await _geo.LoadPolicyAsync([names, apps, full], AppRulePlatform.Linux));
+        Assert.False(combined.Split);
+        Assert.True(combined.AllUdp);
+        Assert.False(combined.EffectiveAllUdp);
+        Assert.NotNull(mixed.ReconnectReason(combined));
+    }
+
+    [Fact]
+    public void LinuxDnsRoutesWithdrawOnAmbiguityAndRetryAfterKernelFailure()
+    {
+        var address = IPAddress.Parse("192.0.2.10");
+        var rules = new NameRules([new(GeoDomainKind.Domain, "vpn.test")], [new(GeoDomainKind.Domain, "direct.test")], []);
+        var routes = new LinuxNameRoutes();
+        (string[] Proxy, string[] Direct, string[] Block) installed = ([], [], []);
+        Assert.True(routes.Observe(address, "video.vpn.test", 90, 0));
+        Assert.True(routes.Apply(rules, Install, _ => false));
+        Assert.Equal(["192.0.2.10"], installed.Proxy);
+        Assert.Empty(installed.Direct);
+
+        Assert.True(routes.Observe(address, "direct.test", 30, 0));
+        Assert.Equal(RouteVerdict.None, routes.VerdictOf(address, rules));
+        Assert.False(routes.Apply(rules, (_, _, _) => false, _ => false));
+        Assert.Equal(["192.0.2.10"], installed.Proxy);
+        Assert.True(routes.Apply(rules, Install, _ => false));
+        Assert.Empty(installed.Proxy);
+        Assert.Empty(installed.Direct);
+
+        Assert.True(routes.Expire(30_000));
+        Assert.True(routes.Apply(rules, Install, _ => false));
+        Assert.Equal(["192.0.2.10"], installed.Proxy);
+        var edited = new NameRules([], [new(GeoDomainKind.Domain, "vpn.test")], []);
+        Assert.True(routes.Apply(edited, Install, _ => false));
+        Assert.Empty(installed.Proxy);
+        Assert.Equal(["192.0.2.10"], installed.Direct);
+        Assert.True(routes.Expire(90_000));
+        Assert.True(routes.Apply(edited, Install, _ => false));
+        Assert.Empty(installed.Direct);
+
+        bool Install(IReadOnlyList<string> proxy, IReadOnlyList<string> direct, IReadOnlyList<string> block)
+        {
+            installed = (proxy.ToArray(), direct.ToArray(), block.ToArray());
+            return true;
+        }
+    }
 
     private Task<long> AddAsync(string name, IReadOnlyList<string> rules) => _geo.ApplyToRoutingListAsync(0, name, rules);
 

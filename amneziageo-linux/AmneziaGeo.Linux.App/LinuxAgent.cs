@@ -129,6 +129,7 @@ internal sealed class LinuxAgent : IDisposable
     private DateTime _handshakeDueUtc = DateTime.MaxValue;
     private bool _connectFailed;
     private bool _restartRequired;
+    private string? _routingPending;
     private string _connectFailReason = string.Empty;
     private string _connectFailDetail = string.Empty;
     private bool _disposed;
@@ -422,7 +423,7 @@ internal sealed class LinuxAgent : IDisposable
             RoutingLists: routingLists,
             Active: _tunnel.Running,
             BoundStatus: _boundStatus,
-            RestartRequired: _restartRequired,
+            RestartRequired: _restartRequired || _routingPending is not null || _tunnel.RoutingRecoveryRequired,
             SelectedTarget: _selectedTarget ?? string.Empty,
             SelectedRoutingList: await _store.GetSelectedRoutingListAsync(ct).ConfigureAwait(false),
             Sources: await BuildSourcesAsync(ct).ConfigureAwait(false),
@@ -671,13 +672,7 @@ internal sealed class LinuxAgent : IDisposable
 
         if (await _tunnel.PeerCountersAsync(ct).ConfigureAwait(false) is { HandshakeUnix: > 0 })
         {
-            _handshakeDueUtc = DateTime.MaxValue;
-            _boundStatus = ConnectionStatus.Connected;
-            Stood();
-            FindAppsLater();
-            _log.Info("agent", $"connected: {_boundTarget}");
-            _session.Raised(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), _boundTarget ?? string.Empty);
-            await PushAsync(ct).ConfigureAwait(false);
+            await ConfirmConnectionAsync(ct).ConfigureAwait(false);
             return;
         }
 
@@ -1092,6 +1087,7 @@ internal sealed class LinuxAgent : IDisposable
             _heldUnanswered = false;
             _desiredConnected = false;
             _restartRequired = false;
+            _routingPending = null;
             _handshakeDueUtc = DateTime.MaxValue;
             _boundStatus = ConnectionStatus.Disconnecting;
             await PushAsync(ct).ConfigureAwait(false);
@@ -1124,6 +1120,7 @@ internal sealed class LinuxAgent : IDisposable
         _desiredConnected = true;
         _connectFailed = false;
         _restartRequired = false;
+        _routingPending = null;
         _gaveUpLogged = false;
         _connectFailReason = string.Empty;
         _connectFailDetail = string.Empty;
@@ -1143,7 +1140,22 @@ internal sealed class LinuxAgent : IDisposable
             return new IpcAck(false, ServerListsOnly.UnavailableDetail);
         }
 
-        var routing = await TunnelRouting.LoadAsync(_store, configName, ct).ConfigureAwait(false);
+        TunnelRouting routing;
+        try
+        {
+            routing = await TunnelRouting.LoadAsync(_store, _geo, configName, ct).ConfigureAwait(false);
+        }
+        catch (InvalidDataException ex)
+        {
+            _log.Error("routing", "the selected routing policy could not be compiled", ex);
+            _connectFailed = true;
+            _connectFailReason = ConnectFailureReason.TunnelSetupFailed.ToString();
+            _connectFailDetail = ex.Message;
+            _boundStatus = ConnectionStatus.Failed;
+            _nextRetryUtc = DateTime.UtcNow.AddSeconds(_reconnectIntervalSeconds);
+            await PushAsync(ct).ConfigureAwait(false);
+            return new IpcAck(false, ex.Message);
+        }
         var configDns = await _store.GetConfigDnsAsync(configName, ct).ConfigureAwait(false);
         var configTransport = await _store.GetConfigTransportAsync(configName, ct).ConfigureAwait(false);
         _hold.Set(configTransport?.HoldTraffic ?? true);
@@ -1151,7 +1163,7 @@ internal sealed class LinuxAgent : IDisposable
         _recovery.Held = _hold.Active;
         _heldUnanswered = false;
         var options = TunnelOptions.Read(configDns?.Servers, _routeTtlSeconds, configTransport, _dnsTransport) with { Offer = offer, Dns = configDns };
-        _tunnel.SetRouteMemory(new StoredRouteMemory(_store, configName, routing.TunnelApps, routing.ProxyDomains, routing.DirectDomains, routing.BlockDomains));
+        _tunnel.SetRouteMemory(new StoredRouteMemory(_store, configName, routing.TunnelApps, routing.ProxyDomains, routing.DirectDomains, routing.BlockDomains, routing.Stamp));
         _tunnel.FrontAsker = Asker(configName, config);
         var failure = await _tunnel.UpAsync(config, routing, options, ct).ConfigureAwait(false);
         if (failure is { } refusal)
@@ -1168,13 +1180,7 @@ internal sealed class LinuxAgent : IDisposable
         StartLossProbe(config);
         if (await FirstHandshakeAsync(ct).ConfigureAwait(false))
         {
-            _boundStatus = ConnectionStatus.Connected;
-            Stood();
-            FindAppsLater();
-            _log.Info("agent", $"connected: {_boundTarget}");
-            _session.Raised(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), _boundTarget ?? string.Empty);
-            await PushAsync(ct).ConfigureAwait(false);
-            return Ok();
+            return await ConfirmConnectionAsync(ct).ConfigureAwait(false);
         }
 
         // The interface stands from the moment the engine starts, and nothing has answered on it yet; the
@@ -1183,6 +1189,35 @@ internal sealed class LinuxAgent : IDisposable
         _log.Info("agent", $"{_boundTarget}: the interface is up, waiting for the server's first answer");
         await PushAsync(ct).ConfigureAwait(false);
         return new IpcAck(true, IpcMessage.Key("Agent_ConnectWaiting"));
+    }
+
+    private async Task<IpcAck> ConfirmConnectionAsync(CancellationToken ct)
+    {
+        _handshakeDueUtc = DateTime.MaxValue;
+        if (!await _tunnel.ConfirmRoutingAsync().ConfigureAwait(false))
+        {
+            StopLossProbe();
+            _connectFailed = true;
+            _connectFailReason = ConnectFailureReason.TunnelSetupFailed.ToString();
+            _connectFailDetail = "Linux could not activate DNS routing for the selected lists.";
+            _boundStatus = ConnectionStatus.Failed;
+            _nextRetryUtc = DateTime.UtcNow.AddSeconds(_reconnectIntervalSeconds);
+            await PushAsync(ct).ConfigureAwait(false);
+            return new IpcAck(false, _connectFailDetail);
+        }
+
+        _boundStatus = ConnectionStatus.Connected;
+        Stood();
+        FindAppsLater();
+        _log.Info("agent", $"connected: {_boundTarget}");
+        _session.Raised(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), _boundTarget ?? string.Empty);
+        if (_routingPending is not null)
+        {
+            await ApplyRoutingAsync(ct).ConfigureAwait(false);
+        }
+
+        await PushAsync(ct).ConfigureAwait(false);
+        return Ok();
     }
 
     // Takes the session down on the signal of its server, the way the command of the user does.
@@ -1748,15 +1783,30 @@ internal sealed class LinuxAgent : IDisposable
 
         if (!await KeepServerListsAsync(config, ct).ConfigureAwait(false))
         {
-            _restartRequired = true;
+            _routingPending = ServerListsOnly.UnavailableDetail;
             return;
         }
 
-        var routing = await TunnelRouting.LoadAsync(_store, _boundTarget, ct).ConfigureAwait(false);
-        if (!_tunnel.ApplyRules(routing))
+        try
         {
-            _restartRequired = true;
-            _log.Info("agent", "the edited rules change the tunnel mode; they apply on the next connect");
+            var routing = await TunnelRouting.LoadAsync(_store, _geo, config, ct).ConfigureAwait(false);
+            var before = _tunnel.AppliedRouting;
+            _routingPending = await _tunnel.ApplyRulesAsync(routing).ConfigureAwait(false);
+            if (_routingPending is null && !ReferenceEquals(before, _tunnel.AppliedRouting))
+            {
+                _tunnel.UpdateRouteMemory(new StoredRouteMemory(_store, config, routing.TunnelApps, routing.ProxyDomains,
+                    routing.DirectDomains, routing.BlockDomains, routing.Stamp));
+            }
+        }
+        catch (InvalidDataException ex)
+        {
+            _routingPending = ex.Message;
+            _log.Error("routing", "the selected routing policy could not be compiled", ex);
+        }
+
+        if (_routingPending is { } reason)
+        {
+            _log.Info("routing", $"selected routing lists are pending: {reason}");
         }
     }
 
@@ -1932,8 +1982,7 @@ internal sealed class LinuxAgent : IDisposable
             return;
         }
 
-        var routing = await TunnelRouting.LoadAsync(_store, name, ct).ConfigureAwait(false);
-        if (!await _tunnel.ApplyInboundAsync(transport, routing, ct).ConfigureAwait(false))
+        if (!await _tunnel.ApplyInboundAsync(transport, ct).ConfigureAwait(false))
         {
             _restartRequired = true;
             _log.Info("agent", "access from the tunnel applies on the next connect");
@@ -2625,17 +2674,23 @@ internal sealed class LinuxAgent : IDisposable
             report.Append("mtu          : ").Append(WgConfigEditor.GetMtu(text)).Append('\n');
         }
 
-        var selectedList = await ConfigRouting.AllowedAsync(_store, configName ?? string.Empty, ct).ConfigureAwait(false)
-            && await _store.GetSelectedRoutingListAsync(ct).ConfigureAwait(false) is { } selectedId
-                ? await _store.GetRoutingListAsync(selectedId, ct).ConfigureAwait(false)
-                : null;
-        report.Append("routing list : ").Append(selectedList?.Name ?? "(off)").Append('\n');
-        if (selectedList is not null)
+        var selectedIds = await _store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false) ?? [];
+        report.Append("selected lists : ").AppendJoin(", ", selectedIds).Append('\n');
+        if (_tunnel.AppliedRouting is { } applied)
         {
-            report.Append("  geoip routes   : ").Append(selectedList.Routes.Count).Append('\n');
-            report.Append("  geosite domains: ").Append(selectedList.Domains.Count).Append('\n');
-            var listSettings = await _store.GetRoutingSettingsAsync(selectedList.Id, ct).ConfigureAwait(false);
-            report.Append("  all udp        : ").Append(listSettings is { AllUdp: true, UseGlobalProxy: false } ? "on" : "off").Append('\n');
+            report.Append("applied lists  : ").AppendJoin(", ", applied.ListIds).Append('\n');
+            report.Append("routing version: ").Append(applied.Stamp ?? "(off)").Append('\n');
+            report.Append("all UDP        : ").Append(applied.AllUdp ? "on" : "off").Append('\n');
+        }
+
+        if (_routingPending is { } pending)
+        {
+            report.Append("routing pending: ").Append(pending).Append('\n');
+        }
+
+        if (_tunnel.RoutingRecoveryRequired)
+        {
+            report.AppendLine("routing state  : recovery required");
         }
 
         report.Append("mode         : ").Append(_tunnel.Mode).Append('\n');
@@ -3007,17 +3062,19 @@ internal sealed class LinuxAgent : IDisposable
             return new IpcAck(false, "check-target requires a domain, an address, an app token or a geo rule");
         }
 
-        var list = await ConfigRouting.AllowedAsync(_store, _selectedTarget ?? string.Empty, ct).ConfigureAwait(false)
-            && await _store.GetSelectedRoutingListAsync(ct).ConfigureAwait(false) is { } listId
-            && await _store.GetRoutingListAsync(listId, ct).ConfigureAwait(false) is { } stored
-                ? await AppFinds.ExpandListAsync(_store, stored, ct).ConfigureAwait(false)
-                : null;
-        var split = _tunnel.RoutingMode is not (SessionReport.ModeFull or SessionReport.ModeOff);
+        if (_tunnel.RoutingRecoveryRequired)
+        {
+            return new IpcAck(false, "Linux routing needs recovery; reconnect before checking the active policy.");
+        }
+
+        var routing = _tunnel.AppliedRouting ?? await TunnelRouting.LoadAsync(_store, _geo, _selectedTarget, ct).ConfigureAwait(false);
+        var list = routing.List;
+        var split = routing.Split;
         // A probe nothing answers is counted on the tunnel, as the ladder counts its peer.
         var probes = new TargetProbes(
             Held,
             Trace: _tunnel.Running ? (address, token) => ChannelProbe.TraceAsync(address, _tunnel.TunnelCountersAsync, token) : null);
-        var report = await new TargetInspector(list, split, directApps: !split)
+        var report = await new TargetInspector(list, split, AppScope.Additive)
             .InspectAsync(await AppFinds.TargetAsync(_store, args[0], ct).ConfigureAwait(false), _selectedTarget ?? string.Empty, probes, ct)
             .ConfigureAwait(false);
 
@@ -3291,7 +3348,7 @@ internal sealed class LinuxAgent : IDisposable
             }
 
             _log.Info("agent", $"programs found again for {string.Join(", ", search.Changed.Select(name => "app:" + name))}");
-            await GatedAsync(() => TakeFoundAppsAsync(search.Changed), CancellationToken.None).ConfigureAwait(false);
+            await GatedAsync(() => ApplyRoutingAsync(CancellationToken.None), CancellationToken.None).ConfigureAwait(false);
             await PushAsync(CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -3302,35 +3359,6 @@ internal sealed class LinuxAgent : IDisposable
         {
             _finding.Release();
         }
-    }
-
-    // Puts the programs found again in force on the running tunnel when the list in use names them.
-    private async Task TakeFoundAppsAsync(IReadOnlyList<string> changed)
-    {
-        if (!_tunnel.Running
-            || await _store.GetSelectedRoutingListAsync(CancellationToken.None).ConfigureAwait(false) is not { } listId
-            || await _store.GetRoutingListStampAsync(listId, CancellationToken.None).ConfigureAwait(false) is not { } stamp
-            || !AppFinds.NamesOf(stamp.Rules).Intersect(changed, StringComparer.OrdinalIgnoreCase).Any())
-        {
-            return;
-        }
-
-        var routing = await TunnelRouting.LoadAsync(_store, _boundTarget, CancellationToken.None).ConfigureAwait(false);
-        if (_tunnel.ApplyRules(routing))
-        {
-            return;
-        }
-
-        if (!string.Equals(_boundTarget, _selectedTarget, StringComparison.Ordinal))
-        {
-            _restartRequired = true;
-            _log.Info("agent", "the routed list names other programs now; they apply on the next connect");
-            return;
-        }
-
-        _log.Info("agent", $"{_boundTarget}: the routed list names other programs now; reconnecting so the tunnel takes them");
-        await SetConnectionAsync("disconnect", CancellationToken.None).ConfigureAwait(false);
-        await SetConnectionAsync("connect", CancellationToken.None).ConfigureAwait(false);
     }
 
     // The limit the server of the configuration standing up sets on the routing lists.

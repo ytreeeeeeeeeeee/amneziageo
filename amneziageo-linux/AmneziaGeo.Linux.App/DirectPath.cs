@@ -45,8 +45,13 @@ internal sealed class DirectPath
     {
         if (ranges.Count == 0)
         {
+            if (!await ShedAsync([], ct).ConfigureAwait(false))
+            {
+                return false;
+            }
+
             await LowerAsync(ct).ConfigureAwait(false);
-            return false;
+            return true;
         }
 
         var (added, removed) = StandingRanges.Diff(_standing, ranges);
@@ -69,7 +74,10 @@ internal sealed class DirectPath
 
         if (removed.Count > 0)
         {
-            await RunAsync(SteeringRules.Withdrawals(removed, Table), true, ct).ConfigureAwait(false);
+            if (!await RunAsync(SteeringRules.Withdrawals(removed, Table), true, ct).ConfigureAwait(false))
+            {
+                return false;
+            }
         }
 
         _standing = [.. ranges];
@@ -97,18 +105,23 @@ internal sealed class DirectPath
     /// <summary>
     /// Takes down the routes of the ranges that left the list; the new ones wait for the next squaring.
     /// </summary>
-    public async Task ShedAsync(IReadOnlyList<string> ranges, CancellationToken ct)
+    public async Task<bool> ShedAsync(IReadOnlyList<string> ranges, CancellationToken ct)
     {
         var (_, removed) = StandingRanges.Diff(_standing, ranges);
         if (!_ruled || removed.Count == 0)
         {
-            return;
+            return true;
         }
 
         var staying = Staying(ranges);
-        await RunAsync(SteeringRules.Withdrawals(removed, Table), true, ct).ConfigureAwait(false);
+        if (!await RunAsync(SteeringRules.Withdrawals(removed, Table), true, ct).ConfigureAwait(false))
+        {
+            return false;
+        }
+
         _standing = staying;
         _log.Info("routing", $"direct ranges past the tunnel squared: 0 added, {removed.Count} removed");
+        return true;
     }
 
     /// <summary>
@@ -183,7 +196,7 @@ internal sealed class DirectPath
             var (exitCode, output) = force
                 ? await Shell.RunAsync("ip", ct, "-force", "-batch", path).ConfigureAwait(false)
                 : await Shell.RunAsync("ip", ct, "-batch", path).ConfigureAwait(false);
-            if (exitCode != 0 && !force)
+            if (exitCode != 0)
             {
                 _log.Warn("routing", $"{Fallback}: {output.Split('\n')[0]}");
             }

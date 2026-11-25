@@ -25,6 +25,10 @@ internal sealed class DnsRouter : IDisposable
     private readonly bool _split;
     private readonly bool _stripV6;
     private volatile NameRules _rules;
+    private readonly object _ruleGate = new();
+    private readonly LinuxNameRoutes _nameRoutes = new();
+    private readonly AppTunnel? _nameSteering;
+    private readonly string? _endpoint;
     private readonly IReadOnlyList<IPAddress> _tunnelResolvers;
     private volatile IReadOnlyList<IPAddress> _lanResolvers;
     // The resolvers another VPN or network answers the names under its suffixes with, the longest suffix first.
@@ -49,7 +53,7 @@ internal sealed class DnsRouter : IDisposable
     /// <summary>
     /// ctor
     /// </summary>
-    public DnsRouter(TunnelRouting routing, bool stripV6, IReadOnlyList<IPAddress> tunnelResolvers, IReadOnlyList<IPAddress> lanResolvers, RoutingCache routes, AgentLog log, string dnsTransport = AmneziaGeo.Ipc.DnsTransports.Auto, bool network = false)
+    public DnsRouter(TunnelRouting routing, bool stripV6, IReadOnlyList<IPAddress> tunnelResolvers, IReadOnlyList<IPAddress> lanResolvers, RoutingCache routes, AgentLog log, string dnsTransport = AmneziaGeo.Ipc.DnsTransports.Auto, bool network = false, AppTunnel? nameSteering = null, string? endpoint = null)
     {
         _split = routing.Split;
         _stripV6 = stripV6;
@@ -57,6 +61,8 @@ internal sealed class DnsRouter : IDisposable
         _tunnelResolvers = tunnelResolvers;
         _lanResolvers = lanResolvers;
         _network = network;
+        _nameSteering = nameSteering;
+        _endpoint = endpoint;
         _routes = routes;
         _log = log;
         _doh = AmneziaGeo.Ipc.DnsTransports.Of(dnsTransport) == AmneziaGeo.Ipc.DnsTransports.Plain
@@ -74,6 +80,8 @@ internal sealed class DnsRouter : IDisposable
     /// Address the router listens on.
     /// </summary>
     public static IPAddress Listen { get; } = IPAddress.Parse("127.0.0.71");
+
+    public bool CanRouteDomains => _udp is not null && _tcp is not null;
 
     /// <summary>
     /// The name that last answered with the address, empty when none did.
@@ -96,16 +104,29 @@ internal sealed class DnsRouter : IDisposable
     /// </summary>
     public RouteVerdict VerdictOf(IPAddress address)
     {
-        return _names.TryGetValue(address.ToString(), out var name) ? Decide(name) : RouteVerdict.None;
+        lock (_ruleGate)
+        {
+            return _nameSteering is null ? _nameRoutes.VerdictOf(address, _rules) : RouteVerdict.None;
+        }
     }
 
     /// <summary>
     /// Takes the edited rules over; the next lookup is answered by them.
     /// </summary>
-    public void ApplyRules(TunnelRouting routing)
+    public bool ApplyRules(TunnelRouting routing)
     {
-        _rules = new NameRules(routing.ProxyDomains, routing.DirectDomains, routing.BlockDomains);
-        _log.Info("dns", $"name rules reloaded: {routing.ProxyDomains.Count} tunneled, {routing.DirectDomains.Count} direct, {routing.BlockDomains.Count} refused");
+        lock (_ruleGate)
+        {
+            var next = new NameRules(routing.ProxyDomains, routing.DirectDomains, routing.BlockDomains);
+            if (!ApplyNameRoutes(next))
+            {
+                return false;
+            }
+
+            _rules = next;
+            _log.Debug("dns", $"name rules reloaded: {routing.ProxyDomains.Count} tunneled, {routing.DirectDomains.Count} direct, {routing.BlockDomains.Count} refused");
+            return true;
+        }
     }
 
     /// <summary>
@@ -171,6 +192,10 @@ internal sealed class DnsRouter : IDisposable
         }
 
         _ = Task.Run(() => ServeUdpAsync(_cts.Token));
+        if (_nameSteering is not null)
+        {
+            _ = SweepNameRoutesAsync(_cts.Token);
+        }
         var ranges = _routes.RangeCounts;
         _log.Info("dns", $"name router on {Listen}:{Port}, {ranges.Proxy} proxy range(s), {ranges.Direct} direct range(s), {ranges.Block} blocked range(s){(_stripV6 ? ", addresses over IPv6 withheld from tunneled names" : string.Empty)}");
         return true;
@@ -337,7 +362,15 @@ internal sealed class DnsRouter : IDisposable
             return null;
         }
 
-        return ApplyAnswer(name, verdict, answer) ? DnsWire.BuildRefusal(query, length) : answer;
+        lock (_ruleGate)
+        {
+            if (_disposed || Decide(name) != verdict)
+            {
+                return null;
+            }
+
+            return ApplyAnswer(name, verdict, answer) ? DnsWire.BuildRefusal(query, length) : answer;
+        }
     }
 
     // A name of a single label, which only the machine's own network answers.
@@ -353,34 +386,85 @@ internal sealed class DnsRouter : IDisposable
     // addresses, and the rest are left to the ranges.
     private bool ApplyAnswer(string name, RouteVerdict verdict, byte[] answer)
     {
-        foreach (var address in DnsWire.ReadAddresses(answer, answer.Length))
+        var addresses = DnsWire.ReadAddresses(answer, answer.Length)
+            .Where(record => record.Address.AddressFamily == AddressFamily.InterNetwork).ToArray();
+        if (addresses.Any(record => _routes.Classify(record.Address) == RouteVerdict.Block))
         {
-            if (address.AddressFamily != AddressFamily.InterNetwork
-                || !GeoIpRanges.TryToNumeric(address, out var value))
-            {
-                continue;
-            }
+            return true;
+        }
 
-            if (_routes.Classify(value) == RouteVerdict.Block)
+        var now = Environment.TickCount64;
+        _nameRoutes.Expire(now);
+        foreach (var (address, ttl) in addresses)
+        {
+            if (!_nameRoutes.Observe(address, name, ttl, now))
             {
-                _log.Route($"{name} -> {address} blocked");
+                _log.Warn("dns", "the DNS routing cache is full; the answer was withheld");
                 return true;
             }
 
-            if (verdict == RouteVerdict.None)
+            if (_nameSteering is null)
             {
-                _routes.Note(value);
-            }
-            else
-            {
-                _routes.Note(value, verdict);
+                var inferred = _nameRoutes.VerdictOf(address, _rules);
+                _routes.NoteDns(address, inferred == RouteVerdict.None ? [] : [inferred]);
             }
 
             Remember(name, address.ToString());
-            _log.Route($"{name} -> {address} {verdict.ToString().ToLowerInvariant()}");
         }
 
+        if (_nameSteering is not null && !ApplyNameRoutes(_rules))
+        {
+            _log.Error("dns", "netfilter did not install DNS routes; the answer was withheld");
+            return true;
+        }
+
+        _log.Debug("dns", $"applied {addresses.Length} DNS address(es), domain verdict {verdict}");
         return false;
+    }
+
+    private bool ApplyNameRoutes(NameRules rules)
+    {
+        if (_nameSteering is null)
+        {
+            return true;
+        }
+
+        var kept = _endpoint is null ? _routes.PinnedRoutes : [.. _routes.PinnedRoutes, _endpoint];
+        var pinned = GeoIpRanges.Build(kept);
+        return _nameRoutes.Apply(rules, _nameSteering.ReloadNames,
+            address => GeoIpRanges.TryToNumeric(address, out var value) && pinned.Contains(value));
+    }
+
+    private async Task SweepNameRoutesAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        try
+        {
+            var pending = false;
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                lock (_ruleGate)
+                {
+                    if (_disposed)
+                    {
+                        return;
+                    }
+
+                    if (_nameRoutes.Expire(Environment.TickCount64) || pending)
+                    {
+                        var wasPending = pending;
+                        pending = !ApplyNameRoutes(_rules);
+                        if (pending && !wasPending)
+                        {
+                            _log.Error("dns", "netfilter could not withdraw expired DNS routes; retrying");
+                        }
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
     }
 
     // Keeps the name an address came with, dropping the whole set once it has grown past what a journal needs.
@@ -548,7 +632,10 @@ internal sealed class DnsRouter : IDisposable
             return;
         }
 
-        _disposed = true;
+        lock (_ruleGate)
+        {
+            _disposed = true;
+        }
         _cts.Cancel();
         _udp?.Dispose();
         _tcp?.Dispose();

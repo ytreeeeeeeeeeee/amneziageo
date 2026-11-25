@@ -25,61 +25,74 @@ internal sealed record TunnelRouting(
     /// </summary>
     public static TunnelRouting None { get; } = new(false, string.Empty, [], [], [], [], [], [], [], []);
 
+    public string? Stamp { get; init; }
+    public RoutingList? List { get; init; }
+    public IReadOnlyList<long> ListIds { get; init; } = [];
+    public IReadOnlyList<string> BlockApps { get; init; } = [];
+    public bool HasDomains => ProxyDomains.Count + DirectDomains.Count + BlockDomains.Count > 0;
+    public bool SteerNames => TunnelApps.Count + DirectApps.Count > 0 || EffectiveAllUdp;
+
+    public string? Unsupported(bool ipv6) => BlockApps.Count > 0
+        ? "Linux routing does not support blocking an application by executable."
+        : ipv6 && (SteerNames && HasDomains || ProxyRoutes.Concat(DirectRoutes).Concat(BlockRoutes).Any(range => range.Contains(':')))
+            ? "Linux cannot enforce this routing policy with IPv6 enabled." : null;
+    public bool EffectiveAllUdp => Split && AllUdp;
+
+    public string? ReconnectReason(TunnelRouting next)
+    {
+        if (Split != next.Split || (Stamp is null) != (next.Stamp is null))
+        {
+            return "the routing mode changed";
+        }
+
+        if (EffectiveAllUdp != next.EffectiveAllUdp)
+        {
+            return "the all-UDP policy changed";
+        }
+
+        if (!Same(TunnelApps, next.TunnelApps) || !Same(DirectApps, next.DirectApps) || !Same(BlockApps, next.BlockApps))
+        {
+            return "application rules changed";
+        }
+
+        return null;
+
+        static bool Same(IReadOnlyList<string> a, IReadOnlyList<string> b) =>
+            new HashSet<string>(a, StringComparer.Ordinal).SetEquals(b);
+    }
+
     /// <summary>
-    /// The applications the list keeps past a tunnel that carries everything.
+    /// The applications the list keeps past the tunnel.
     /// </summary>
     public IReadOnlyList<string> DirectApps { get; init; } = [];
 
-    /// <summary>
-    /// Whether any bucket carries a rule.
-    /// </summary>
-    public bool HasRules =>
-        ProxyRoutes.Count > 0 || ProxyDomains.Count > 0
-        || DirectRoutes.Count > 0 || DirectDomains.Count > 0
-        || BlockRoutes.Count > 0 || BlockDomains.Count > 0
-        || TunnelApps.Count > 0 || DirectApps.Count > 0;
-
-    /// <summary>
-    /// Reads the globally selected list and the mode it runs in; none for a config kept off routing.
-    /// </summary>
-    public static async Task<TunnelRouting> LoadAsync(IStateStore store, string? name, CancellationToken ct)
+    public static async Task<TunnelRouting> LoadAsync(IStateStore store, GeoConfigurator geo, string? name, CancellationToken ct)
     {
         if (name is not null && !await ConfigRouting.AllowedAsync(store, name, ct).ConfigureAwait(false))
         {
             return None;
         }
 
-        var listId = await store.GetSelectedRoutingListAsync(ct).ConfigureAwait(false);
-        if (listId is null)
+        var ids = await store.GetSelectedRoutingListsAsync(ct).ConfigureAwait(false);
+        return FromPolicy(await geo.LoadPolicyAsync(ids, AppRulePlatform.Linux, ct: ct).ConfigureAwait(false));
+    }
+
+    public static TunnelRouting FromPolicy(RoutingPolicy? policy)
+    {
+        if (policy is null)
         {
             return None;
         }
 
-        var stored = await store.GetRoutingListAsync(listId.Value, ct).ConfigureAwait(false);
-        if (stored is null)
+        var list = policy.List;
+        return new TunnelRouting(policy.Settings?.UseGlobalProxy != true, list.Name, list.Rules, list.Routes, list.Domains,
+            list.DirectRoutes, list.DirectDomains, list.BlockRoutes, list.BlockDomains, list.Apps, policy.Settings?.AllUdp == true)
         {
-            return None;
-        }
-
-        // A program the list names stands for what this machine found for it last.
-        var list = await AppFinds.ExpandListAsync(store, stored, ct).ConfigureAwait(false);
-
-        var settings = await store.GetRoutingSettingsAsync(listId.Value, ct).ConfigureAwait(false);
-        var split = !(settings?.UseGlobalProxy ?? false);
-        return new TunnelRouting(
-            split,
-            list.Name,
-            list.Rules,
-            list.Routes,
-            list.Domains,
-            list.DirectRoutes,
-            list.DirectDomains,
-            list.BlockRoutes,
-            list.BlockDomains,
-            list.Apps,
-            settings?.AllUdp ?? false)
-        {
+            Stamp = policy.Stamp,
+            List = list,
+            ListIds = [.. policy.Sources.Select(source => source.Id)],
             DirectApps = list.DirectApps,
+            BlockApps = policy.BlockApps,
         };
     }
 }

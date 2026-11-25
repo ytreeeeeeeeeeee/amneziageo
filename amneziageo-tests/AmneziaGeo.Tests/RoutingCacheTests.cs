@@ -1353,6 +1353,26 @@ public sealed class RoutingCacheTests
     }
 
     [Fact]
+    public void RebuildingBeforeReinstallKeepsPermitsOnlyForAddressesStillGoingDirect()
+    {
+        var applier = new FakeApplier { Generation = 1, FiltersOutliveRearm = true };
+        var cache = Cache(applier, split: true);
+        var moved = IPAddress.Parse(YandexAddress);
+        var stillDirect = IPAddress.Parse("77.88.55.243");
+        cache.Note(moved);
+        cache.Note(stillDirect, RouteVerdict.Direct);
+        applier.Permitted.Clear();
+
+        cache.Rebuild([YandexRange], [], [], address => address.Equals(stillDirect) ? RouteVerdict.Direct : RouteVerdict.None);
+        applier.Generation++;
+        cache.Reinstall();
+
+        Assert.Equal([YandexAddress], applier.Tunneled);
+        Assert.Equal([Numeric(stillDirect.ToString())], applier.Permitted);
+        Assert.Single(applier.Deleted);
+    }
+
+    [Fact]
     public void ARebuild_DropsAnAddressItMovesToBlock()
     {
         var applier = new FakeApplier { Generation = 1 };
