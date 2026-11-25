@@ -1620,8 +1620,8 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         }
 
         var limit = await ServerListsOnly.FirstAsync(scoped, ServerListsOrder(config), ct).ConfigureAwait(false);
-        var inUse = await scoped.GetSelectedRoutingListAsync(ct).ConfigureAwait(false);
-        if (ServerListsOnly.Switch(limit, inUse) is not { } pick)
+        var (inUse, chosen) = await ServerListsOnly.EnforceSingleSelectionAsync(scoped, limit, ct).ConfigureAwait(false);
+        if (chosen is not { } pick)
         {
             return routed;
         }
@@ -1629,7 +1629,6 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         var from = inUse is { } held ? (await scoped.GetRoutingListStampAsync(held, ct).ConfigureAwait(false))?.Name : null;
         var to = (await scoped.GetRoutingListStampAsync(pick, ct).ConfigureAwait(false))?.Name;
         Journal(SwitchLog.RoutingList(from, to));
-        await scoped.SetSelectedRoutingListAsync(pick, ct).ConfigureAwait(false);
         logger.LogInformation("{Config}: its server allows none but its own routing lists; routing list {List} is put in use", limit!.Config, pick);
 
         return true;
@@ -1836,7 +1835,7 @@ internal class AgentStatusBroker(GeoFileUpdater geoFileUpdater, GeoUpdateChecker
         // The first list applies at once.
         if (id == 0 && lists.Count == 0)
         {
-            await store.SetSelectedRoutingListAsync(resultId, ct);
+            await store.UpdateSelectedRoutingListsAsync(current => current is null ? [resultId] : null, ct).ConfigureAwait(false);
         }
 
         // Flag a reconnect only when the running tunnel routes through this list and a connect-time rule changed.

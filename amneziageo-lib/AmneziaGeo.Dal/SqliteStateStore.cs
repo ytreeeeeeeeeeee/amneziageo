@@ -417,6 +417,7 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
             await AddColumnAsync(connection, schema, "routing_list_origins", "config", "TEXT NOT NULL DEFAULT ''", ct).ConfigureAwait(false);
 
             await DropProfilesAsync(connection, ct).ConfigureAwait(false);
+            await NormalizeRoutingSelectionAsync(connection, ct).ConfigureAwait(false);
 
             await SetUserVersionAsync(connection, ct).ConfigureAwait(false);
         }
@@ -436,24 +437,34 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
 
         await BackupBeforeAsync(connection, ".pre-profiles.bak", ct).ConfigureAwait(false);
 
-        var carried = await ReadCarriedProfileAsync(connection, ct).ConfigureAwait(false);
+        var transaction = connection.BeginTransaction(deferred: false);
+        await using var transactionScope = transaction.ConfigureAwait(false);
+        if (!await TableExistsAsync(connection, "profiles", ct, transaction).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        var carried = await ReadCarriedProfileAsync(connection, transaction, ct).ConfigureAwait(false);
         if (carried is { } source)
         {
             var write = connection.CreateCommand();
             await using (write.ConfigureAwait(false))
             {
+                write.Transaction = transaction;
                 write.CommandText =
                     """
                     INSERT INTO settings (key, value, updated_at)
-                    VALUES ($target, $config, $updated), ($listKey, $list, $updated)
+                    VALUES ($target, $config, $updated)
                     ON CONFLICT(key) DO UPDATE SET
                         value      = excluded.value,
                         updated_at = excluded.updated_at;
+                    INSERT INTO settings (key, value, updated_at) VALUES ($listKey, $list, $updated)
+                    ON CONFLICT(key) DO NOTHING;
                     """;
                 write.Parameters.AddWithValue("$target", StateKeys.SelectedTarget);
                 write.Parameters.AddWithValue("$config", source.Config);
                 write.Parameters.AddWithValue("$listKey", StateKeys.SelectedRoutingList);
-                write.Parameters.AddWithValue("$list", source.RoutingList);
+                write.Parameters.AddWithValue("$list", "[" + source.RoutingList + "]");
                 write.Parameters.AddWithValue("$updated", Timestamp());
                 await write.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
@@ -462,17 +473,22 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
         var drop = connection.CreateCommand();
         await using (drop.ConfigureAwait(false))
         {
+            drop.Transaction = transaction;
             drop.CommandText = "DROP TABLE profiles; DROP TABLE IF EXISTS profile_state;";
             await drop.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
+
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
     }
 
     // An empty table leaves the settings alone: without profiles the selection already names a config.
-    private static async Task<(string Config, string RoutingList)?> ReadCarriedProfileAsync(SqliteConnection connection, CancellationToken ct)
+    private static async Task<(string Config, string RoutingList)?> ReadCarriedProfileAsync(SqliteConnection connection,
+        SqliteTransaction transaction, CancellationToken ct)
     {
         var command = connection.CreateCommand();
         await using (command.ConfigureAwait(false))
         {
+            command.Transaction = transaction;
             command.CommandText =
                 """
                 SELECT config, routing_list_id, use_routing
@@ -654,11 +670,12 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
         }
     }
 
-    private static async Task<bool> TableExistsAsync(SqliteConnection connection, string table, CancellationToken ct)
+    private static async Task<bool> TableExistsAsync(SqliteConnection connection, string table, CancellationToken ct, SqliteTransaction? transaction = null)
     {
         var command = connection.CreateCommand();
         await using (command.ConfigureAwait(false))
         {
+            command.Transaction = transaction;
             command.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $name;";
             command.Parameters.AddWithValue("$name", table);
             return await command.ExecuteScalarAsync(ct).ConfigureAwait(false) is not null;
@@ -2799,16 +2816,11 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
             var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
             await using (transaction.ConfigureAwait(false))
             {
-                var clearSelection = connection.CreateCommand();
-                await using (clearSelection.ConfigureAwait(false))
+                var selected = ParseRoutingSelection(await ReadRoutingSelectionAsync(connection, transaction, ct).ConfigureAwait(false));
+                if (selected is not null && selected.Contains(id))
                 {
-                    // Turns routing off when the removed list was the selected one.
-                    clearSelection.Transaction = transaction;
-                    clearSelection.CommandText = "UPDATE settings SET value = '', updated_at = $updated WHERE key = $key AND value = $id;";
-                    clearSelection.Parameters.AddWithValue("$key", StateKeys.SelectedRoutingList);
-                    clearSelection.Parameters.AddWithValue("$id", id.ToString(CultureInfo.InvariantCulture));
-                    clearSelection.Parameters.AddWithValue("$updated", Timestamp());
-                    await clearSelection.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                    await WriteRoutingSelectionAsync(connection, transaction, selected.Where(item => item != id).ToArray(), ct)
+                        .ConfigureAwait(false);
                 }
 
                 var deleteRules = connection.CreateCommand();
@@ -3146,15 +3158,193 @@ public sealed class SqliteStateStore(string databasePath) : IStateStore
     /// <inheritdoc/>
     public async Task<long?> GetSelectedRoutingListAsync(CancellationToken ct = default)
     {
-        var value = await GetSettingAsync(StateKeys.SelectedRoutingList, ct).ConfigureAwait(false);
-        return long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var id) ? id : null;
+        var ids = await GetSelectedRoutingListsAsync(ct).ConfigureAwait(false);
+        return ids is { Count: 1 } ? ids[0] : null;
     }
 
     /// <inheritdoc/>
+    public async Task<IReadOnlyList<long>?> GetSelectedRoutingListsAsync(CancellationToken ct = default)
+        => ParseRoutingSelection(await GetSettingAsync(StateKeys.SelectedRoutingList, ct).ConfigureAwait(false));
+
+    /// <inheritdoc/>
     public Task SetSelectedRoutingListAsync(long? routingListId, CancellationToken ct = default)
+        => UpdateSelectedRoutingListsAsync(_ => routingListId is long id ? [id] : [], ct);
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<long>?> UpdateSelectedRoutingListsAsync(
+        Func<IReadOnlyList<long>?, IReadOnlyList<long>?> update, CancellationToken ct = default)
     {
-        var value = routingListId?.ToString(CultureInfo.InvariantCulture) ?? string.Empty;
-        return SetSettingAsync(StateKeys.SelectedRoutingList, value, ct);
+        ArgumentNullException.ThrowIfNull(update);
+        var lease = await LeaseAsync(ct).ConfigureAwait(false);
+        await using var leaseScope = lease.ConfigureAwait(false);
+        var connection = lease.Connection;
+        var transaction = connection.BeginTransaction(deferred: false);
+        await using var transactionScope = transaction.ConfigureAwait(false);
+
+        var raw = await ReadRoutingSelectionAsync(connection, transaction, ct).ConfigureAwait(false);
+        var previous = ParseRoutingSelection(raw);
+        var requested = update(previous);
+        if (requested is null)
+        {
+            return previous;
+        }
+
+        var next = requested.Distinct().Order().ToArray();
+        if (next.Any(id => id <= 0)
+            || (await ExistingRoutingListIdsAsync(connection, transaction, next, ct).ConfigureAwait(false)).Count != next.Length)
+        {
+            throw new InvalidOperationException("The routing selection contains an unknown or invalid list.");
+        }
+
+        if (JsonSerializer.Serialize(next) != raw)
+        {
+            await WriteRoutingSelectionAsync(connection, transaction, next, ct).ConfigureAwait(false);
+        }
+
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        return next;
+    }
+
+    /// <summary>
+    /// Imports a legacy Android JSON pick if the store has no current choice. The old Android agent used an
+    /// scalar to hand off a preset and an empty string to acknowledge it. The JSON pick owned the selection.
+    /// </summary>
+    /// <param name="id">The legacy list ID, or null for an explicit routing off choice.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<bool> TryMigrateAndroidRoutingListAsync(long? id, CancellationToken ct = default)
+    {
+        if (id is <= 0)
+        {
+            return false;
+        }
+
+        var lease = await LeaseAsync(ct).ConfigureAwait(false);
+        await using var leaseScope = lease.ConfigureAwait(false);
+        var command = lease.Connection.CreateCommand();
+        await using var commandScope = command.ConfigureAwait(false);
+        command.CommandText = """
+            INSERT INTO settings (key, value, updated_at)
+            SELECT $key, $choice, $updated
+            WHERE $id IS NULL OR EXISTS (SELECT 1 FROM routing_lists WHERE id = $id)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            WHERE settings.value = ''
+               OR (settings.value NOT GLOB '*[^0-9]*' AND CAST(settings.value AS INTEGER) > 0);
+            """;
+        command.Parameters.AddWithValue("$key", StateKeys.SelectedRoutingList);
+        command.Parameters.AddWithValue("$choice", id is long listId ? JsonSerializer.Serialize(new[] { listId }) : "[]");
+        command.Parameters.AddWithValue("$updated", Timestamp());
+        command.Parameters.AddWithValue("$id", (object?)id ?? DBNull.Value);
+        return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false) != 0;
+    }
+
+    private static async Task NormalizeRoutingSelectionAsync(SqliteConnection connection, CancellationToken ct)
+    {
+        var transaction = connection.BeginTransaction(deferred: false);
+        await using var transactionScope = transaction.ConfigureAwait(false);
+        var raw = await ReadRoutingSelectionAsync(connection, transaction, ct).ConfigureAwait(false);
+        if (string.IsNullOrEmpty(raw))
+        {
+            // Preserve the old Android handoff marker until its JSON selection has been imported.
+            return;
+        }
+
+        var ids = ParseRoutingSelection(raw) ?? [];
+        var existing = await ExistingRoutingListIdsAsync(connection, transaction, ids, ct).ConfigureAwait(false);
+        // A valid scalar can be the former Android handoff. Keep its representation until the next write or import.
+        var legacyScalar = existing.Count == 1 && raw == existing[0].ToString(CultureInfo.InvariantCulture);
+        var normalized = JsonSerializer.Serialize(existing);
+        if (!legacyScalar && normalized != raw)
+        {
+            await WriteRoutingSelectionAsync(connection, transaction, existing, ct).ConfigureAwait(false);
+        }
+
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        if (existing.Count != ids.Count)
+        {
+            System.Diagnostics.Trace.TraceWarning("Discarded {0} missing routing list reference(s) while opening the state store.",
+                ids.Count - existing.Count);
+        }
+        else if (legacyScalar)
+        {
+            System.Diagnostics.Trace.TraceInformation("Loaded one routing list ID from the legacy SQLite selection.");
+        }
+    }
+
+    private static IReadOnlyList<long>? ParseRoutingSelection(string? raw)
+    {
+        if (raw is null)
+        {
+            return null;
+        }
+
+        if (long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var legacy) && legacy > 0)
+        {
+            return [legacy];
+        }
+
+        if (!raw.StartsWith('['))
+        {
+            return [];
+        }
+
+        try
+        {
+            return (JsonSerializer.Deserialize<long[]>(raw) ?? []).Where(id => id > 0).Distinct().Order().ToArray();
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static async Task<string?> ReadRoutingSelectionAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken ct)
+    {
+        var command = connection.CreateCommand();
+        await using var commandScope = command.ConfigureAwait(false);
+        command.Transaction = transaction;
+        command.CommandText = "SELECT value FROM settings WHERE key = $key;";
+        command.Parameters.AddWithValue("$key", StateKeys.SelectedRoutingList);
+        return await command.ExecuteScalarAsync(ct).ConfigureAwait(false) as string;
+    }
+
+    private static async Task<IReadOnlyList<long>> ExistingRoutingListIdsAsync(SqliteConnection connection,
+        SqliteTransaction transaction, IReadOnlyList<long> ids, CancellationToken ct)
+    {
+        if (ids.Count == 0)
+        {
+            return [];
+        }
+
+        var command = connection.CreateCommand();
+        await using var commandScope = command.ConfigureAwait(false);
+        command.Transaction = transaction;
+        command.CommandText = "SELECT id FROM routing_lists WHERE id IN (SELECT value FROM json_each($ids)) ORDER BY id;";
+        command.Parameters.AddWithValue("$ids", JsonSerializer.Serialize(ids));
+        var existing = new List<long>(ids.Count);
+        var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        await using var readerScope = reader.ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            existing.Add(reader.GetInt64(0));
+        }
+
+        return existing;
+    }
+
+    private static async Task WriteRoutingSelectionAsync(SqliteConnection connection, SqliteTransaction transaction,
+        IReadOnlyList<long> ids, CancellationToken ct)
+    {
+        var command = connection.CreateCommand();
+        await using var commandScope = command.ConfigureAwait(false);
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO settings (key, value, updated_at) VALUES ($key, $value, $updated)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;
+            """;
+        command.Parameters.AddWithValue("$key", StateKeys.SelectedRoutingList);
+        command.Parameters.AddWithValue("$value", JsonSerializer.Serialize(ids));
+        command.Parameters.AddWithValue("$updated", Timestamp());
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
     private static async Task<RoutingList?> ReadRoutingListAsync(SqliteConnection connection, string whereClause, string keyParam, object keyValue, CancellationToken ct)

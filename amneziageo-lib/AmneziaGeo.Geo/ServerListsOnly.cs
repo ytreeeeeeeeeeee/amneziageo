@@ -100,6 +100,30 @@ public static class ServerListsOnly
     public static IpcAck? Refusal(ListsLimit? limit, long? listId) =>
         limit is null || limit.Allows(listId) ? null : new IpcAck(false, IpcMessage.Key("Agent_RoutingListsServerOnly", limit.Config));
 
+    /// <summary>Applies the existing single-list restriction to the selection in one store operation.</summary>
+    public static async Task<(long? Before, long? Pick)> EnforceSingleSelectionAsync(IStateStore store, ListsLimit? limit, CancellationToken ct)
+    {
+        if (limit is null)
+        {
+            return default;
+        }
+
+        long? before = null;
+        long? pick = null;
+        await store.UpdateSelectedRoutingListsAsync(current =>
+        {
+            if (current is { Count: > 1 })
+            {
+                return null;
+            }
+
+            before = current is { Count: 1 } ? current[0] : null;
+            pick = Switch(limit, before);
+            return pick is long id ? [id] : null;
+        }, ct).ConfigureAwait(false);
+        return (before, pick);
+    }
+
     /// <summary>
     /// Returns the refusal of a command that keeps a stored config off the routing list where its server allows none
     /// but its own lists, null when it may.

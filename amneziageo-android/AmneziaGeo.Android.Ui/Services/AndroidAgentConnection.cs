@@ -85,6 +85,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     private readonly AndroidUpdater _updater;
     private readonly ServerOffers _offers;
     private readonly object _loadGate = new();
+    private readonly SemaphoreSlim _routingSelectionRead = new(1, 1);
     // Null until the store has been read: the snapshot says "not loaded yet", not "no lists".
     private IReadOnlyList<RoutingListEntry>? _routingSummaries;
     private IReadOnlyDictionary<string, ConfigTransport> _transports = new Dictionary<string, ConfigTransport>(StringComparer.Ordinal);
@@ -140,7 +141,10 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     private volatile bool _linkUntold;
 
     private string? _selectedTarget;
-    private long? _selectedRoutingList;
+    private LegacyRoutingSelection? _legacyRoutingSelection;
+    private IReadOnlyList<long>? _routingSelection;
+
+    private long? SelectedRoutingList => Volatile.Read(ref _routingSelection) is { Count: 1 } selection ? selection[0] : null;
 
     // What the notification of a tunnel taken down was last told, so the same is not posted again.
     private string _downNotice = string.Empty;
@@ -416,6 +420,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         {
             case IpcContract.OpImportConfig:
             case IpcContract.OpEditConfig:
+                await EnsureInitAsync().ConfigureAwait(false);
                 if (args.Count < 2)
                 {
                     return Fail();
@@ -448,6 +453,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
 
             // One head, one process: presence needs no announcing here; the servers are asked what they offer.
             case IpcContract.OpAttachUi:
+                await EnsureInitAsync().ConfigureAwait(false);
                 _offers.Warm(OfferTargets(), OfferChangedAsync);
                 return Ok();
 
@@ -781,7 +787,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
 
         // A list the server put in use joins the plan of this connect, and the lists it handed out show at once.
         ct.ThrowIfCancellationRequested();
-        if (await TakeStorePickAsync().ConfigureAwait(false))
+        if (await RefreshRoutingSelectionAsync().ConfigureAwait(false))
         {
             _connectPreparation.Apply(() => _restartRequired = false, ct);
         }
@@ -796,7 +802,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         var transport = _transports.GetValueOrDefault(configName);
-        var listId = ConfigRouting.Allowed(transport) ? _selectedRoutingList : null;
+        var listId = ConfigRouting.Allowed(transport) ? SelectedRoutingList : null;
         var useRouter = transport?.UseRouter != false;
 
         // Правила разворачиваются в пуле: агент живёт в процессе UI, и план большого списка держит поток.
@@ -998,7 +1004,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         var language = UiPreferences.Load().Language;
         var takes = _selectedTarget is not { Length: > 0 } name
             || ConfigRouting.Allowed(_transports.GetValueOrDefault(name));
-        var list = takes ? await ListNameAsync(_selectedRoutingList).ConfigureAwait(false) ?? string.Empty : string.Empty;
+        var list = takes ? await ListNameAsync(SelectedRoutingList).ConfigureAwait(false) ?? string.Empty : string.Empty;
         var lists = takes && (list.Length > 0 || await AnyListAsync().ConfigureAwait(false));
         return new NoticeWords(
             Loc.GetIn(language, "Status_Connected"),
@@ -1420,17 +1426,25 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         PushSnapshot();
         if (again)
         {
-            AskDialed(session);
+            _ = AskDialedAsync(session);
         }
     }
 
     // A dial inside a websocket that goes on to another attempt has the server of its configuration asked again.
-    private void AskDialed(string? config)
+    private async Task AskDialedAsync(string? config)
     {
         if (config is { Length: > 0 } && _frontHanded && _configs.TryGetValue(config, out var text)
             && _transports.GetValueOrDefault(config) is { UseWebSocket: true })
         {
-            _offers.Warm([(config, text)], OfferChangedAsync);
+            try
+            {
+                await EnsureInitAsync().ConfigureAwait(false);
+                _offers.Warm([(config, text)], OfferChangedAsync);
+            }
+            catch (Exception ex)
+            {
+                _log.Error("agent", "Could not load the routing selection before asking the server", ex);
+            }
         }
     }
 
@@ -1601,7 +1615,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             BoundStatus: _boundStatus,
             RestartRequired: _restartRequired,
             SelectedTarget: _selectedTarget ?? string.Empty,
-            SelectedRoutingList: _selectedRoutingList,
+            SelectedRoutingList: SelectedRoutingList,
             Sources: BuildSources(),
             ConnectFailed: _connectFailed,
             ConnectFailReason: _connectFailReason,
@@ -1875,7 +1889,13 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     }
 
     // Initializes the SQLite store and seeds default geo sources once.
-    private Task EnsureInitAsync() => _initTask ??= InitAsync();
+    private Task EnsureInitAsync()
+    {
+        lock (_loadGate)
+        {
+            return _initTask ??= InitAsync();
+        }
+    }
 
     private async Task InitAsync()
     {
@@ -1885,9 +1905,38 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         _log.Info("agent", "android agent started");
         _ = Task.Run(() => CrashLog.ReportPastExits(_log));
         await _store.InitializeAsync().ConfigureAwait(false);
+        if (_legacyRoutingSelection is { } legacy)
+        {
+            try
+            {
+                if (await _store.TryMigrateAndroidRoutingListAsync(legacy.ListId).ConfigureAwait(false))
+                {
+                    _log.Debug("agent", legacy.ListId is null
+                        ? "[FIX] Migrated an explicit routing off choice into SQLite without rewriting agent.json"
+                        : "[FIX] Migrated one routing list ID into SQLite without rewriting agent.json");
+                }
+                else if (legacy.ListId is long id && await _store.GetRoutingListStampAsync(id).ConfigureAwait(false) is null)
+                {
+                    _log.Warn("agent", "[FIX] The legacy Android selection refers to a missing routing list");
+                }
+                else
+                {
+                    _log.Debug("agent", "[FIX] Kept the existing SQLite routing selection");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Error("agent", "[FIX] Could not migrate the legacy Android routing selection", ex);
+                throw;
+            }
+
+            // The SQLite choice takes precedence even if the legacy JSON is read again on restart.
+            _legacyRoutingSelection = null;
+        }
+
+        await RefreshRoutingSelectionAsync().ConfigureAwait(false);
         await GeoDefaults.SeedAsync(_store, _geoFiles, null, CancellationToken.None).ConfigureAwait(false);
         await RematerializeIfStaleAsync().ConfigureAwait(false);
-        await TakeStorePickAsync().ConfigureAwait(false);
         await RefreshTransportsAsync().ConfigureAwait(false);
         await RefreshRoutingSummariesAsync().ConfigureAwait(false);
         await RefreshGeoSourcesAsync().ConfigureAwait(false);
@@ -2342,14 +2391,14 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
 
         var limit = await ServerListsOnly.OfAsync(_store, config, text, CancellationToken.None).ConfigureAwait(false);
-        if (ServerListsOnly.Switch(limit, _selectedRoutingList) is not { } pick)
+        var (previous, chosen) = await ServerListsOnly.EnforceSingleSelectionAsync(_store, limit, CancellationToken.None).ConfigureAwait(false);
+        if (chosen is not { } pick)
         {
             return routed;
         }
 
-        Journal(SwitchLog.RoutingList(await ListNameAsync(_selectedRoutingList).ConfigureAwait(false), await ListNameAsync(pick).ConfigureAwait(false)));
-        _selectedRoutingList = pick;
-        Save();
+        await RefreshRoutingSelectionAsync().ConfigureAwait(false);
+        Journal(SwitchLog.RoutingList(await ListNameAsync(previous).ConfigureAwait(false), await ListNameAsync(pick).ConfigureAwait(false)));
         _log.Info("agent", $"{config}: its server allows none but its own routing lists; routing list {pick} is put in use");
 
         return true;
@@ -2480,8 +2529,8 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         // The first list applies at once.
         if (id == 0 && lists.Count == 0)
         {
-            _selectedRoutingList = savedId;
-            Save();
+            await _store.UpdateSelectedRoutingListsAsync(current => current is null ? [savedId] : null).ConfigureAwait(false);
+            await RefreshRoutingSelectionAsync().ConfigureAwait(false);
         }
 
         MarkRoutingChanged(savedId);
@@ -2603,12 +2652,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         await _store.RemoveRoutingListAsync(id).ConfigureAwait(false);
         MarkRoutingChanged(id);
 
-        // Turns routing off when the removed list was the selected one.
-        if (_selectedRoutingList == id)
-        {
-            _selectedRoutingList = null;
-            Save();
-        }
+        await RefreshRoutingSelectionAsync().ConfigureAwait(false);
 
         await RefreshRoutingSummariesAsync().ConfigureAwait(false);
         PushSnapshot();
@@ -2791,7 +2835,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             var (picked, _) = BundleLists.Pick(await _store.ListRoutingListsAsync().ConfigureAwait(false), routingNames);
             foreach (var (key, list) in picked)
             {
-                if (_selectedRoutingList == list.Id)
+                if (SelectedRoutingList == list.Id)
                 {
                     activeList = list;
                 }
@@ -2934,7 +2978,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             _log.Info("agent", $"the bundle carries {legacy.Count} profile(s) from an older build; their pairings are dropped");
         }
 
-        RestoreBundleSelection(bundle, importedConfigs, importedLists);
+        await RestoreBundleSelectionAsync(bundle, importedConfigs, importedLists).ConfigureAwait(false);
         Save();
         await RefreshRoutingSummariesAsync().ConfigureAwait(false);
         PushSnapshot();
@@ -2964,7 +3008,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     }
 
     // Ставит выбор из бандла, пока своего нет: чужой выбор при восстановлении не трогается.
-    private void RestoreBundleSelection(
+    private async Task RestoreBundleSelectionAsync(
         PortableBundle.Bundle bundle,
         IReadOnlyDictionary<string, string> configs,
         IReadOnlyList<(PortableBundle.RoutingBlock Block, long Id)> lists)
@@ -2981,10 +3025,19 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         var active = bundle.ActiveRoutingListId is { Length: > 0 } uid
             ? lists.FirstOrDefault(one => string.Equals(one.Block.Id, uid, StringComparison.Ordinal))
             : lists.FirstOrDefault(one => bundle.ActiveRoutingList is { Length: > 0 } named && string.Equals(one.Block.Name, named, StringComparison.Ordinal));
-        if (_selectedRoutingList is null && active.Block is not null)
+        if (active.Block is not null)
         {
-            _selectedRoutingList = active.Id;
-            _log.Info("agent", $"the bundle's routing list is applied again: {active.Block.Name}");
+            var restored = false;
+            await _store.UpdateSelectedRoutingListsAsync(current =>
+            {
+                restored = current is null;
+                return restored ? [active.Id] : null;
+            }).ConfigureAwait(false);
+            await RefreshRoutingSelectionAsync().ConfigureAwait(false);
+            if (restored)
+            {
+                _log.Info("agent", $"the bundle's routing list is applied again: {active.Block.Name}");
+            }
         }
     }
 
@@ -3251,7 +3304,11 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     {
         await RefreshOffersAsync().ConfigureAwait(false);
         await RefreshSubscriptionMembersAsync().ConfigureAwait(false);
-        await TakeStorePickAsync().ConfigureAwait(false);
+        if (await RefreshRoutingSelectionAsync().ConfigureAwait(false) && _active)
+        {
+            _restartRequired = true;
+        }
+
         FindAppsLater();
         if (_active && string.Equals(_boundTarget, config, StringComparison.Ordinal) && await KeepServerListsAsync(config).ConfigureAwait(false))
         {
@@ -3280,27 +3337,27 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         _ = RestartTunnelAsync();
     }
 
-    // A list the store side puts in picks itself in the store, where this agent keeps no pick: it takes the pick over
-    // while it has none of its own, and clears it there either way, so a pick the owner drops does not come back.
-    // Returns whether it took the pick over.
-    private async Task<bool> TakeStorePickAsync()
+    // SQLite owns the choice. The in-process copy is only used for the synchronous status snapshot and legacy callers.
+    private async Task<bool> RefreshRoutingSelectionAsync()
     {
-        if (await _store.GetSelectedRoutingListAsync().ConfigureAwait(false) is not { } picked)
+        await _routingSelectionRead.WaitAsync().ConfigureAwait(false);
+        try
         {
-            return false;
-        }
+            var previous = Volatile.Read(ref _routingSelection);
+            var current = await _store.GetSelectedRoutingListsAsync().ConfigureAwait(false);
+            Volatile.Write(ref _routingSelection, current);
+            var changed = (previous is null) != (current is null) || !(previous ?? []).SequenceEqual(current ?? []);
+            if (changed)
+            {
+                _log.Debug("agent", $"Refreshed the routing selection from SQLite ({current?.Count ?? 0} list(s))");
+            }
 
-        await _store.SetSelectedRoutingListAsync(null).ConfigureAwait(false);
-        if (_selectedRoutingList is not null || !(await _store.ListRoutingListsAsync().ConfigureAwait(false)).Any(list => list.Id == picked))
+            return changed;
+        }
+        finally
         {
-            return false;
+            _routingSelectionRead.Release();
         }
-
-        _selectedRoutingList = picked;
-        Save();
-        MarkRoutingChanged(picked);
-
-        return true;
     }
 
     // The files of the geo sources a server handed out are fetched in the background, then the lists take them.
@@ -3395,26 +3452,37 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     // Picks the routing list every config uses. Args: list id, or "none" to turn routing off.
     private async Task<IpcAck> AssignRoutingAsync(IReadOnlyList<string> args)
     {
+        await EnsureInitAsync().ConfigureAwait(false);
         var listArg = args.Count > 0 ? args[0] : "none";
-        var picked = string.Equals(listArg, "none", StringComparison.OrdinalIgnoreCase)
-            || !long.TryParse(listArg, NumberStyles.Integer, CultureInfo.InvariantCulture, out var listId)
-                ? null
-                : (long?)listId;
+        long? picked = null;
+        if (!string.Equals(listArg, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!long.TryParse(listArg, NumberStyles.Integer, CultureInfo.InvariantCulture, out var listId) || listId <= 0
+                || await _store.GetRoutingListStampAsync(listId).ConfigureAwait(false) is null)
+            {
+                _log.Warn("agent", "The routing selection refers to an unknown or invalid list");
+                return Fail();
+            }
+
+            picked = listId;
+        }
         if (ServerListsOnly.Refusal(await ServerListsLimitAsync().ConfigureAwait(false), picked) is { } refusal)
         {
             return refusal;
         }
 
-        var names = await Task.Run(async () => (
-            From: await ListNameAsync(_selectedRoutingList).ConfigureAwait(false),
-            To: await ListNameAsync(picked).ConfigureAwait(false))).ConfigureAwait(false);
-
-        // The list in force picked again changes nothing the tunnel carries, and raising it again would only open a
-        // gap where its traffic goes past it; a pending edit still asks for the fresh tunnel it needs.
-        var same = picked == _selectedRoutingList && !_restartRequired;
-        Journal(SwitchLog.RoutingList(names.From, names.To));
-        _selectedRoutingList = picked;
-        Save();
+        long? previous = null;
+        var changed = false;
+        await _store.UpdateSelectedRoutingListsAsync(current =>
+        {
+            previous = current is { Count: 1 } ? current[0] : null;
+            IReadOnlyList<long> next = picked is long id ? [id] : [];
+            changed = !(current ?? []).SequenceEqual(next);
+            return next;
+        }).ConfigureAwait(false);
+        await RefreshRoutingSelectionAsync().ConfigureAwait(false);
+        Journal(SwitchLog.RoutingList(await ListNameAsync(previous).ConfigureAwait(false), await ListNameAsync(picked).ConfigureAwait(false)));
+        var same = !changed && !_restartRequired;
         PushSnapshot();
         if (_active && !same)
         {
@@ -3450,7 +3518,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         _selectedTarget is { Length: > 0 } name
         && !ConfigRouting.Allowed(_transports.GetValueOrDefault(name))
             ? null
-            : _selectedRoutingList;
+            : SelectedRoutingList;
 
     // Соединение приписывается своему владельцу начиная с Android 10.
     private static bool PerAppSupported => Build.VERSION.SdkInt >= BuildVersionCodes.Q;
@@ -3640,14 +3708,6 @@ internal sealed class AndroidAgentConnection : IAgentConnection
         }
     }
 
-    private static (long? ListId, bool UseRouting) ParseRouting(string raw)
-    {
-        var bar = raw.IndexOf('|');
-        var idPart = bar < 0 ? raw : raw[..bar];
-        var useRouting = bar >= 0 && bar + 1 < raw.Length && raw[(bar + 1)..] == "1";
-        return long.TryParse(idPart, NumberStyles.Integer, CultureInfo.InvariantCulture, out var id) ? (id, useRouting) : (null, false);
-    }
-
     private static int SubscriptionInterval(string? value)
     {
         return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var hours)
@@ -3678,12 +3738,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             using var document = JsonDocument.Parse(System.IO.File.ReadAllText(_storePath));
             LoadMap(document.RootElement, "Configs", _configs);
             _order = [.. _configs.Keys];
-            if (document.RootElement.TryGetProperty("SelectedRouting", out var selectedList)
-                && selectedList.ValueKind == JsonValueKind.Number
-                && selectedList.TryGetInt64(out var listId))
-            {
-                _selectedRoutingList = listId;
-            }
+            _legacyRoutingSelection = LegacyRoutingSelection.Read(document.RootElement);
 
             if (document.RootElement.TryGetProperty("LogLevel", out var level) && level.ValueKind == JsonValueKind.String)
             {
@@ -3814,7 +3869,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
     }
 
     // One-time move off named profiles: the selected profile (else any) hands its config to the selection and its
-    // routing list to the global one; the rest of the pairings are lost. Save() drops both maps, so this runs once.
+    // routing list to the global one. The next regular settings save drops the legacy maps.
     private string? CarryProfile(JsonElement root, string? target)
     {
         if (!root.TryGetProperty("Profiles", out var profiles) || profiles.ValueKind != JsonValueKind.Object)
@@ -3836,17 +3891,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             return target;
         }
 
-        if (root.TryGetProperty("Routing", out var routing)
-            && routing.ValueKind == JsonValueKind.Object
-            && routing.TryGetProperty(carried, out var raw)
-            && raw.ValueKind == JsonValueKind.String)
-        {
-            var (listId, useRouting) = ParseRouting(raw.GetString() ?? string.Empty);
-            if (useRouting && listId is not null)
-            {
-                _selectedRoutingList = listId;
-            }
-        }
+        _legacyRoutingSelection ??= LegacyRoutingSelection.ReadProfile(root, carried);
 
         var bound = profiles.GetProperty(carried);
         return bound.ValueKind == JsonValueKind.String && bound.GetString() is { Length: > 0 } config ? config : target;
@@ -3895,7 +3940,11 @@ internal sealed class AndroidAgentConnection : IAgentConnection
             builder.Append(",\"Proxy\":").Append(JsonSerializer.Serialize(_proxyOptions));
             builder.Append(",\"DialWanted\":").Append(_dialWanted ? "true" : "false");
             builder.Append(",\"Selected\":").Append(JsonSerializer.Serialize(_selectedTarget));
-            builder.Append(",\"SelectedRouting\":").Append(_selectedRoutingList?.ToString(CultureInfo.InvariantCulture) ?? "null");
+            // Keep the legacy choice if another setting is saved before SQLite initialization completes.
+            if (_legacyRoutingSelection is { } legacy)
+            {
+                builder.Append(",\"SelectedRouting\":").Append(legacy.ListId.GetValueOrDefault().ToString(CultureInfo.InvariantCulture));
+            }
             builder.Append('}');
             System.IO.File.WriteAllText(_storePath, builder.ToString());
         }
@@ -4466,7 +4515,7 @@ internal sealed class AndroidAgentConnection : IAgentConnection
                 new BundleSources(
                     Cache: _ => Task.FromResult(held.Sessions.Count == 0 ? "the tunnel holds nothing right now" : held.Render()),
                     Recent: _ => Task.FromResult(RecentLog.Merge(_log.Recent.Snapshot(), RecentLog.Parse(VpnBridge.ReadRecent()))),
-                    Library: new BundleLibrary([.. _order.Where(texts.ContainsKey)], name => texts.GetValueOrDefault(name), _selectedRoutingList))).ConfigureAwait(false);
+                    Library: new BundleLibrary([.. _order.Where(texts.ContainsKey)], name => texts.GetValueOrDefault(name), SelectedRoutingList))).ConfigureAwait(false);
             _log.Info("agent", $"diagnostics archive written to {path}; keys and credentials in it are masked");
             return new IpcAck(true, path);
         }

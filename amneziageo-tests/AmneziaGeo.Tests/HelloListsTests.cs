@@ -1,3 +1,5 @@
+using System.Text.Json;
+using AmneziaGeo.Android.Ui.Services;
 using AmneziaGeo.Dal;
 using AmneziaGeo.Decl;
 using AmneziaGeo.Geo;
@@ -279,6 +281,48 @@ public sealed class HelloListsTests : IAsyncLifetime
         Assert.Equal(own, await _store.GetSelectedRoutingListAsync());
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LegacyAndroidNullLeavesTheFirstHelloInChargeOnlyWhenNoChoiceExists(bool explicitlyOff)
+    {
+        using var legacy = JsonDocument.Parse("""{"SelectedRouting":null}""");
+        Assert.Null(LegacyRoutingSelection.Read(legacy.RootElement));
+        if (explicitlyOff)
+        {
+            await _store.SetSelectedRoutingListAsync(null);
+        }
+
+        await AskAsync(Item(First, "Default", "proxy|geosite:youtube", Morning, marked: true));
+        var added = Assert.Single(await _store.ListRoutingListsAsync());
+        Assert.Equal(explicitlyOff ? [] : new[] { added.Id }, await _store.GetSelectedRoutingListsAsync());
+    }
+
+    [Fact]
+    public async Task LegacyAndroidProfileOffStaysOffOnFirstHello()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var geo = new GeoConfigurator(_store, new NoFiles());
+        var id = await geo.ApplyToRoutingListAsync(0, "Local", ["proxy|domain:legacy.example"], ct: ct);
+        using var legacy = JsonDocument.Parse(JsonSerializer.Serialize(new
+        {
+            Selected = "work",
+            Profiles = new { work = "office" },
+            Routing = new { work = $"{id}|0" }
+        }));
+        var choice = Assert.IsType<LegacyRoutingSelection>(LegacyRoutingSelection.ReadProfile(legacy.RootElement, "work"));
+
+        Assert.True(await _store.TryMigrateAndroidRoutingListAsync(choice.ListId, ct));
+        await AskAsync(Item(First, "Default", "proxy|geosite:youtube", Morning, marked: true));
+
+        Assert.Equal(2, (await _store.ListRoutingListsAsync(ct)).Count);
+        Assert.Empty(Assert.IsAssignableFrom<IReadOnlyList<long>>(await _store.GetSelectedRoutingListsAsync(ct)));
+
+        await _store.SetSelectedRoutingListAsync(id, ct);
+        Assert.False(await _store.TryMigrateAndroidRoutingListAsync(choice.ListId, ct));
+        Assert.Equal(id, await _store.GetSelectedRoutingListAsync(ct));
+    }
+
     [Fact]
     public async Task AListMarkedDefault_IsPutInUseOnlyWhenItIsAdded()
     {
@@ -443,7 +487,7 @@ public sealed class HelloListsTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ARemovedListOfTheServer_ComesBack()
+    public async Task ARemovedListOfTheServer_ComesBackUnselected()
     {
         await AskAsync(Item(First, "Unblock", "proxy|geosite:youtube", Morning, marked: true));
         var first = Assert.Single(await _store.ListRoutingListsAsync());
@@ -455,7 +499,7 @@ public sealed class HelloListsTests : IAsyncLifetime
         var back = Assert.Single(await _store.ListRoutingListsAsync());
         Assert.Empty(gone);
         Assert.NotEqual(first.Id, back.Id);
-        Assert.Equal(back.Id, await _store.GetSelectedRoutingListAsync());
+        Assert.Empty((await _store.GetSelectedRoutingListsAsync())!);
         Assert.Equal(First, Assert.Single(await _store.ListRoutingListOriginsAsync()).PresetId);
     }
 

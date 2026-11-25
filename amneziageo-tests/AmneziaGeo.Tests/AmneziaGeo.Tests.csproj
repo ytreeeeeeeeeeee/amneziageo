@@ -19,6 +19,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="..\..\amneziageo-android\AmneziaGeo.Android.Ui\Services\AndroidAgentConnection.cs" LogicalName="AndroidAgentConnection.cs" />
+    <Compile Include="..\..\amneziageo-android\AmneziaGeo.Android.Ui\Services\LegacyRoutingSelection.cs" Link="LegacyRoutingSelection.cs" />
     <Compile Include="..\..\amneziageo-android\AmneziaGeo.Android.Ui\Services\VpnConnectPreparation.cs" Link="VpnConnectPreparation.cs" />
     <Compile Include="..\..\amneziageo-android\AmneziaGeo.Android.Engine\GeoRoutingPlan.cs" Link="GeoRoutingPlan.cs" />
     <Compile Include="..\..\amneziageo-android\AmneziaGeo.Android.Engine\VpnSessionFiles.cs" Link="VpnSessionFiles.cs" />

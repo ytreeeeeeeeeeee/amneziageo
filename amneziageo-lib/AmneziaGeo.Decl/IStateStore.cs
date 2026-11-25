@@ -313,7 +313,19 @@ public interface IStateStore
     Task RemoveRoutingSettingsAsync(long routingListId, CancellationToken ct = default);
 
     /// <summary>
-    /// Returns the globally selected routing list id, or null when routing is off.
+    /// Reads the global selection. Null means no choice has been made, and an empty set means routing is off.
+    /// </summary>
+    Task<IReadOnlyList<long>?> GetSelectedRoutingListsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Changes the selection atomically. The callback receives the current set and can return null to leave it in place.
+    /// Returned IDs are unique and sorted. A choice referring to a missing list is rejected.
+    /// </summary>
+    Task<IReadOnlyList<long>?> UpdateSelectedRoutingListsAsync(
+        Func<IReadOnlyList<long>?, IReadOnlyList<long>?> update, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns the globally selected list for a caller that accepts only a single list.
     /// </summary>
     Task<long?> GetSelectedRoutingListAsync(CancellationToken ct = default);
 

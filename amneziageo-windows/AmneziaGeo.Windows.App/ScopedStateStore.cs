@@ -283,6 +283,12 @@ internal sealed class ScopedStateStore(IStateStore machine, IStateStore user) : 
     /// <inheritdoc/>
     public Task<long?> GetSelectedRoutingListAsync(CancellationToken ct = default) => user.GetSelectedRoutingListAsync(ct);
 
+    public Task<IReadOnlyList<long>?> GetSelectedRoutingListsAsync(CancellationToken ct = default) => user.GetSelectedRoutingListsAsync(ct);
+
+    public Task<IReadOnlyList<long>?> UpdateSelectedRoutingListsAsync(
+        Func<IReadOnlyList<long>?, IReadOnlyList<long>?> update, CancellationToken ct = default)
+        => user.UpdateSelectedRoutingListsAsync(update, ct);
+
     /// <inheritdoc/>
     public Task SetSelectedRoutingListAsync(long? routingListId, CancellationToken ct = default) => user.SetSelectedRoutingListAsync(routingListId, ct);
 

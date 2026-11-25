@@ -176,11 +176,10 @@ public static class OfferedLists
         var lists = (await store.ListRoutingListsAsync(ct).ConfigureAwait(false)).ToList();
         var origins = (await store.ListRoutingListOriginsAsync(ct).ConfigureAwait(false)).ToList();
         var names = new HashSet<string>(lists.Select(list => list.Name), StringComparer.Ordinal);
-        var ids = new HashSet<long>(lists.Select(list => list.Id));
         var added = 0;
         var waiting = 0;
         var marks = 0;
-        var inUse = default(long?);
+        var defaultId = default(long?);
         var taking = new List<long>();
         foreach (var preset in offered)
         {
@@ -188,7 +187,7 @@ public static class OfferedLists
             {
                 if (names.Add(preset.Name))
                 {
-                    ids.Add(await AddListAsync(store, geo, preset.Name, preset.Rules, preset.AllUdp, preset.Full, string.Empty, ct).ConfigureAwait(false));
+                    await AddListAsync(store, geo, preset.Name, preset.Rules, preset.AllUdp, preset.Full, string.Empty, ct).ConfigureAwait(false);
                     added++;
                 }
 
@@ -201,6 +200,11 @@ public static class OfferedLists
             if (at >= 0)
             {
                 var origin = origins[at];
+                if (preset.Default && lists.Any(list => list.Id == origin.ListId))
+                {
+                    defaultId ??= origin.ListId;
+                }
+
                 var marked = origin with { ReadOnly = preset.ReadOnly, Config = config };
                 marks += marked.ReadOnly == origin.ReadOnly ? 0 : 1;
                 if (when > Newest(origin) && lists.Find(list => list.Id == origin.ListId) is { } held)
@@ -237,16 +241,29 @@ public static class OfferedLists
             var fresh = new RoutingListOrigin(id, preset.Id, version.Source, when, ReadOnly: preset.ReadOnly, Config: config);
             await store.SetRoutingListOriginAsync(fresh, ct).ConfigureAwait(false);
             origins.Add(fresh);
-            ids.Add(id);
             added++;
-            if (preset.Default && !await InUseAsync(store, ids, ct).ConfigureAwait(false))
+            if (preset.Default)
             {
-                await store.SetSelectedRoutingListAsync(id, ct).ConfigureAwait(false);
-                inUse = id;
+                defaultId ??= id;
             }
         }
 
         marks += await ReleaseAsync(store, config, offered, origins, ct).ConfigureAwait(false);
+
+        var inUse = default(long?);
+        if (defaultId is long choice)
+        {
+            await store.UpdateSelectedRoutingListsAsync(current =>
+            {
+                if (current is not null)
+                {
+                    return null;
+                }
+
+                inUse = choice;
+                return [choice];
+            }, ct).ConfigureAwait(false);
+        }
 
         return new TakenPresets(added, waiting, inUse, taking, marks);
     }
@@ -376,9 +393,6 @@ public static class OfferedLists
     // The time of the newest version of the server the list knows of: the one it holds or the one that waits.
     private static DateTimeOffset Newest(RoutingListOrigin origin) =>
         origin.Pending?.Updated is { } waiting && waiting > origin.Updated ? waiting : origin.Updated;
-
-    private static async Task<bool> InUseAsync(IStateStore store, HashSet<long> ids, CancellationToken ct) =>
-        await store.GetSelectedRoutingListAsync(ct).ConfigureAwait(false) is { } selected && ids.Contains(selected);
 
     // Tells whether a list holds what a version of the server hands out.
     private static async Task<bool> SameAsync(IStateStore store, RoutingList list, OfferedPreset version, CancellationToken ct)

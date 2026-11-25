@@ -11,7 +11,7 @@ public static class StateKeys
     public const string SelectedTarget = "selected-target";
 
     /// <summary>
-    /// Id of the globally selected routing list; empty turns routing off and leaves the config's own AllowedIPs.
+    /// Global routing selection as a JSON array. An absent setting means no choice has been made.
     /// </summary>
     public const string SelectedRoutingList = "selected-routing-list";
 

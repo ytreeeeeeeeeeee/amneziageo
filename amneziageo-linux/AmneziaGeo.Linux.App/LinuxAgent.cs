@@ -2048,7 +2048,7 @@ internal sealed class LinuxAgent : IDisposable
         // The first list applies at once.
         if (id == 0 && lists.Count == 0)
         {
-            await _store.SetSelectedRoutingListAsync(saved, ct).ConfigureAwait(false);
+            await _store.UpdateSelectedRoutingListsAsync(current => current is null ? [saved] : null, ct).ConfigureAwait(false);
         }
 
         await ApplyRoutingAsync(ct).ConfigureAwait(false);
@@ -3239,8 +3239,9 @@ internal sealed class LinuxAgent : IDisposable
             _log.Info("agent", $"{config}: its server allows none but its own routing lists; the configuration takes the routing list");
         }
 
-        var inUse = await _store.GetSelectedRoutingListAsync(ct).ConfigureAwait(false);
-        if (ServerListsOnly.Switch(await ServerListsOnly.OfAsync(_store, config, ct).ConfigureAwait(false), inUse) is not { } pick)
+        var limit = await ServerListsOnly.OfAsync(_store, config, ct).ConfigureAwait(false);
+        var (inUse, chosen) = await ServerListsOnly.EnforceSingleSelectionAsync(_store, limit, ct).ConfigureAwait(false);
+        if (chosen is not { } pick)
         {
             return;
         }
@@ -3248,7 +3249,6 @@ internal sealed class LinuxAgent : IDisposable
         Journal(SwitchLog.RoutingList(
             await ListNameAsync(inUse, ct).ConfigureAwait(false),
             await ListNameAsync(pick, ct).ConfigureAwait(false)));
-        await _store.SetSelectedRoutingListAsync(pick, ct).ConfigureAwait(false);
         _log.Info("agent", $"{config}: its server allows none but its own routing lists; routing list {pick} is put in use");
     }
 
