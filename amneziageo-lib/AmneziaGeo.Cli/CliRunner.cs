@@ -135,7 +135,7 @@ public static class CliRunner
                                              [--ipv6 on|off] [--router on|off]
               config mtu <name> auto|config|<number>   packet size: picked, from the text, or set here
               config inbound <name> off|host|network    nobody, the server, or the whole tunnel network
-              config routing <name> on|off              take the routing list or keep off it
+              config routing <name> on|off              use the selected routing lists for this configuration
               config signal <name> on|off               let the server take the tunnel down or not
               config hold <name> on|off                 hold what the tunnel carries while it reconnects
               config geo <name> on|off [rule...]
@@ -143,7 +143,7 @@ public static class CliRunner
             routing lists
               routing list
               routing use <id|name|none>               replace with one list or clear selection
-              routing selection                       show requested and applied lists
+              routing selection                      show selected and applied lists, VPN mode and all-UDP flag
               routing enable <id|name>                add one list to the selection
               routing disable <id|name>               remove one list from the selection
               routing replace <id|name> ... | none    replace the selected set
@@ -158,6 +158,19 @@ public static class CliRunner
               routing settings <id|name>
               routing configure <id|name> [--exclusions <a,b>] [--exclusions-file <p>]
                                           [--all-udp on|off] [--global-proxy on|off]
+
+            If any selected list has global proxy enabled, VPN is the default. Otherwise the
+            lists select what goes through the VPN. The combined all-UDP flag is on if any
+            list requests it. A recognized domain rule takes precedence over an app rule.
+            Server presets marked enabled by default are selected on first receipt if no
+            selection has been saved. Server-only mode requires at least one allowed preset.
+            Windows applies selection changes on reconnect. Linux can apply compatible
+            domain and IP changes live. Android attempts to reconnect automatically.
+
+            Sample commands with two existing lists
+              {host.ExeName} routing enable "Yandex Disk direct"
+              {host.ExeName} routing enable "Discord via VPN"
+              {host.ExeName} routing selection
 
             A rule is "<role>|<token>" where role is proxy, direct or block, and token is
             geosite:<category>, geoip:<country>, domain:<name>, app:<id>, or an address/CIDR.
