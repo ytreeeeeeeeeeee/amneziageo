@@ -66,6 +66,25 @@ public sealed class RangeClaimsTests : IAsyncLifetime
     }
 
     [Fact]
+    public void ReorderedDualStackClaimsGiveTheSameRoutes()
+    {
+        string[] proxy = ["10.0.0.0/8", "2001:db8::/32"];
+        string[] direct = ["10.2.0.0/16", "2001:db8:2::/48"];
+        string[] block = ["10.2.1.0/24", "2001:db8:2:1::/64"];
+        var expected = RangeClaims.Settle(proxy, direct, block);
+        var reordered = RangeClaims.Settle([.. proxy.Reverse(), proxy[0]], [.. direct.Reverse(), direct[0]],
+            [.. block.Reverse(), block[0]]);
+
+        Assert.Equal(expected.Proxy.Order(StringComparer.Ordinal), reordered.Proxy.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal));
+        Assert.Equal(expected.Direct.Order(StringComparer.Ordinal), reordered.Direct.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal));
+        Assert.Equal(expected.Block.Order(StringComparer.Ordinal), reordered.Block.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal));
+        Assert.True(RangeClaims.Matcher(reordered.Proxy)(IPAddress.Parse("2001:db8:3::1")));
+        Assert.True(RangeClaims.Matcher(reordered.Direct)(IPAddress.Parse("10.2.2.1")));
+        Assert.True(RangeClaims.Matcher(reordered.Block)(IPAddress.Parse("2001:db8:2:1::1")));
+        Assert.True(RangeClaims.Matcher(reordered.Block)(IPAddress.Parse("10.2.1.1")));
+    }
+
+    [Fact]
     public void ANarrowerTunnelRange_CutsItsHoleInTheDirectRange()
     {
         var direct = GeoIpRanges.Build(RangeClaims.Settle(["10.8.2.0/24"], ["10.0.0.0/8"], []).Direct);

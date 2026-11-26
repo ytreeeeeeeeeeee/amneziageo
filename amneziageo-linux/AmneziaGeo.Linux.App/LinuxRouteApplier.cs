@@ -19,6 +19,7 @@ internal sealed class LinuxRouteApplier : IRouteApplier
     private readonly List<string> _advertised;
     private readonly string? _endpoint;
     private readonly AgentLog _log;
+    private readonly Func<string[], (int ExitCode, string Output)>? _runIp;
     private readonly HashSet<string> _live = new(StringComparer.Ordinal);
     // The held addresses the mark of their range carries, which hold no route of their own.
     private readonly HashSet<uint> _marked = [];
@@ -39,7 +40,8 @@ internal sealed class LinuxRouteApplier : IRouteApplier
     /// <summary>
     /// ctor
     /// </summary>
-    public LinuxRouteApplier(string interfaceName, string? peerPublicKeyHex, AwgDaemon daemon, string? gateway, string? device, IReadOnlyList<string> advertised, string? endpoint, AgentLog log)
+    public LinuxRouteApplier(string interfaceName, string? peerPublicKeyHex, AwgDaemon daemon, string? gateway, string? device,
+        IReadOnlyList<string> advertised, string? endpoint, AgentLog log, Func<string[], (int ExitCode, string Output)>? runIp = null)
     {
         _iface = interfaceName;
         _peerKey = peerPublicKeyHex;
@@ -49,6 +51,7 @@ internal sealed class LinuxRouteApplier : IRouteApplier
         _advertised = [.. advertised];
         _endpoint = endpoint;
         _log = log;
+        _runIp = runIp;
     }
 
     /// <inheritdoc/>
@@ -190,9 +193,9 @@ internal sealed class LinuxRouteApplier : IRouteApplier
         lock (_laid)
         {
             _passed.Remove(numeric);
-            if (_laid.Remove(numeric))
+            if (_laid.Remove(numeric) && _gateway is not null && _device is not null)
             {
-                Ip("route", "del", host);
+                Ip("route", "del", host, "via", _gateway, "dev", _device, "table", SteeringRules.MainTable);
             }
         }
     }
@@ -220,14 +223,33 @@ internal sealed class LinuxRouteApplier : IRouteApplier
             var hosts = left.Select(address => $"{GeoIpRanges.Format(address)}/32").ToList();
             if (!Batch(SteeringRules.Bypasses(hosts, _gateway, _device, SteeringRules.MainTable), $"routing {left.Count} address(es) out {_device}"))
             {
-                return;
+                var (exitCode, output) = RunIp("-o", "-4", "route", "show", "table", SteeringRules.MainTable, "via", _gateway, "dev", _device);
+                if (exitCode != 0)
+                {
+                    // Keep possible additions eligible for a retry and record them for cleanup.
+                    _laid.UnionWith(left);
+                    _log.Warn("routing", $"could not verify the routes after a partial update: {output}");
+                    return;
+                }
+
+                var installed = output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(line => line.Split(' ', 2)[0]).ToHashSet(StringComparer.Ordinal);
+                left.RemoveAll(address =>
+                {
+                    var host = GeoIpRanges.Format(address);
+                    return !installed.Contains(host) && !installed.Contains($"{host}/32");
+                });
+                if (left.Count == 0)
+                {
+                    return;
+                }
             }
 
             _passed.ExceptWith(left);
             _laid.UnionWith(left);
-            foreach (var host in hosts)
+            foreach (var address in left)
             {
-                _log.Route($"route replace {host} via {_gateway} dev {_device}");
+                _log.Route($"route replace {GeoIpRanges.Format(address)}/32 via {_gateway} dev {_device}");
             }
 
             _log.Info("routing", $"{left.Count} address(es) keep their way past {_iface} by a route of their own: the direct ranges standing in the routes no longer cover them");
@@ -425,7 +447,7 @@ internal sealed class LinuxRouteApplier : IRouteApplier
     // The routing table that leads the address anywhere but into the tunnel; null when the tunnel takes it.
     private string? Leading(IPAddress address)
     {
-        var (exitCode, output) = Shell.RunAsync("ip", CancellationToken.None, "route", "get", address.ToString()).GetAwaiter().GetResult();
+        var (exitCode, output) = RunIp("route", "get", address.ToString());
         return exitCode == 0 ? SteeringRules.Leading(output, _iface) : null;
     }
 
@@ -600,7 +622,7 @@ internal sealed class LinuxRouteApplier : IRouteApplier
         try
         {
             File.WriteAllText(file, lines);
-            var (exitCode, output) = Shell.RunAsync("ip", CancellationToken.None, "-batch", file).GetAwaiter().GetResult();
+            var (exitCode, output) = RunIp("-batch", file);
             if (exitCode != 0)
             {
                 Interlocked.Increment(ref _failures);
@@ -631,9 +653,20 @@ internal sealed class LinuxRouteApplier : IRouteApplier
 
     private bool Ip(params string[] args)
     {
-        var (exitCode, output) = Shell.RunAsync("ip", CancellationToken.None, args).GetAwaiter().GetResult();
+        var (exitCode, output) = RunIp(args);
         if (exitCode != 0)
         {
+            // A route may already be absent or a failed batch may not have installed it.
+            if (args is ["route", "del", var cidr, .. var selectors] &&
+                selectors is ["dev", _] or ["via", _, "dev", _, "table", SteeringRules.MainTable])
+            {
+                var existing = RunIp(["route", "show", "exact", cidr, .. selectors]);
+                if (existing is { ExitCode: 0, Output.Length: 0 })
+                {
+                    return true;
+                }
+            }
+
             Interlocked.Increment(ref _failures);
             _log.Warn("route", $"ip {string.Join(' ', args)} failed: {output}");
             return false;
@@ -642,6 +675,9 @@ internal sealed class LinuxRouteApplier : IRouteApplier
         _log.Route(string.Join(' ', args));
         return true;
     }
+
+    private (int ExitCode, string Output) RunIp(params string[] args) =>
+        _runIp?.Invoke(args) ?? Shell.RunAsync("ip", CancellationToken.None, args).GetAwaiter().GetResult();
 
     private static string Cidr(IPAddress address) =>
         address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? $"{address}/128" : $"{address}/32";

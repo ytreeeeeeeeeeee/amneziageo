@@ -317,6 +317,65 @@ public sealed class RoutingPolicyTests : IAsyncLifetime
         GeoRoutingPlan.FromPolicy(policy, useRouter, ipv6, api, [], 300, SplitBudget.DefaultLimit, installed ?? (_ => true));
 
     [Fact]
+    public async Task AndroidKeepsBothLargeApplicationSetsInOnePlan()
+    {
+        var local = await AddAsync("Local applications", [.. Enumerable.Range(0, 827)
+            .Select(index => $"direct|app:pkg=org.example.local{index}")]);
+        var remote = await AddAsync("VPN applications", [.. Enumerable.Range(0, 162)
+            .Select(index => $"proxy|app:pkg=org.example.remote{index}")]);
+
+        var policy = await _geo.LoadPolicyAsync([remote, local], AppRulePlatform.Android);
+        var current = AndroidPlan(policy, 33).Plan;
+        Assert.True(current.FlowRules);
+        Assert.Equal(827, current.DirectApps.Count);
+        Assert.Equal(162, current.TunnelApps.Count);
+        Assert.Equal(RouteVerdict.Direct, current.AppVerdict("org.example.local826"));
+        Assert.Equal(RouteVerdict.Proxy, current.AppVerdict("org.example.remote161"));
+        Assert.Throws<NotSupportedException>(() => AndroidPlan(policy, 28));
+
+        await _store.SetRoutingSettingsAsync(new RoutingSettings(local, string.Empty, false, UseGlobalProxy: true));
+        var full = AndroidPlan(await _geo.LoadPolicyAsync([local, remote], AppRulePlatform.Android), 33);
+        Assert.True(full.Plan.FullTunnel);
+        Assert.Equal(827, full.Bypass.Length);
+        Assert.Contains("org.example.local826", full.Bypass);
+        var splitAgain = AndroidPlan(await _geo.LoadPolicyAsync([remote], AppRulePlatform.Android), 33);
+        Assert.Equal("include", splitAgain.AppMode);
+        Assert.Empty(splitAgain.Bypass);
+        Assert.Equal(162, splitAgain.Apps.Length);
+    }
+
+    [Fact]
+    public async Task ReconnectReusesRouteMemoryOnlyWhileTheCombinedPolicyVersionMatches()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var names = await AddAsync("Names", ["proxy|domain:video.test"]);
+        var apps = await AddAsync("Apps", ["proxy|app:name=browser"]);
+        var initial = Assert.IsType<RoutingPolicy>(await _geo.LoadPolicyAsync([names, apps], AppRulePlatform.Linux, ct: ct));
+        var memory = Memory(initial);
+        var now = DateTimeOffset.UtcNow;
+        await memory.SaveAsync(
+            [new RememberedRoute("192.0.2.11", nameof(RouteVerdict.Proxy), true, false, now),
+             new RememberedRoute("192.0.2.12", nameof(RouteVerdict.Proxy), false, true, now.AddSeconds(-1))], ct);
+
+        var reordered = Assert.IsType<RoutingPolicy>(await _geo.LoadPolicyAsync([apps, names, apps], AppRulePlatform.Linux, ct: ct));
+        Assert.Equal(initial.Stamp, reordered.Stamp);
+        var remembered = await Memory(reordered).LoadAsync(ct);
+        Assert.Contains(remembered, route => route.ByName);
+        Assert.Contains(remembered, route => route.ByApp);
+
+        await _geo.ApplyToRoutingListAsync(names, "Names", ["direct|domain:video.test"], ct);
+        var edited = Assert.IsType<RoutingPolicy>(await _geo.LoadPolicyAsync([apps, names], AppRulePlatform.Linux, ct: ct));
+        Assert.NotEqual(initial.Stamp, edited.Stamp);
+        var loaded = await Memory(edited).LoadAsync(ct);
+        Assert.Equal(2, loaded.Count);
+        Assert.All(loaded, route => Assert.False(route.ByName || route.ByApp));
+        Assert.Equal(RouteVerdict.Direct, Decide(edited, "192.0.2.11", "video.test", "name=browser").Verdict);
+
+        StoredRouteMemory Memory(RoutingPolicy policy) => new(_store, "test-tunnel", policy.List.Apps,
+            policy.List.Domains, policy.List.DirectDomains, policy.List.BlockDomains, policy.Stamp);
+    }
+
+    [Fact]
     public async Task LinuxProjectsAllListsAndDistinguishesLiveEditsFromReconnects()
     {
         var apps = await AddAsync("Apps", ["proxy|app:name=browser", "direct|app:name=player"]);

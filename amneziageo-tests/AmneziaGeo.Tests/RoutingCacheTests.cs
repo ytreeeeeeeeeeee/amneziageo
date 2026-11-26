@@ -1386,30 +1386,34 @@ public sealed class RoutingCacheTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void ANameShieldsItsVerdictFromAppsUntilDnsNamesDisagree(bool appFirst)
+    [InlineData(false, true, RouteVerdict.Direct, RoutePlan.Permit, RoutePlan.Tunnel)]
+    [InlineData(true, true, RouteVerdict.Direct, RoutePlan.Permit, RoutePlan.Tunnel)]
+    [InlineData(false, false, RouteVerdict.Proxy, RoutePlan.None, RoutePlan.Bypass)]
+    [InlineData(true, false, RouteVerdict.Proxy, RoutePlan.None, RoutePlan.Bypass)]
+    public void ANameShieldsItsVerdictFromAppsUntilDnsNamesDisagree(bool appFirst, bool split,
+        RouteVerdict domain, RoutePlan namedPlan, RoutePlan applicationPlan)
     {
         var applier = new FakeApplier { Generation = 1 };
-        var cache = Cache(applier, split: true);
+        var cache = Cache(applier, split);
         var address = IPAddress.Parse(YandexAddress);
         if (appFirst)
         {
             cache.Note(Numeric(YandexAddress), app: true);
         }
 
-        cache.NoteDns(address, [RouteVerdict.Direct]);
+        cache.NoteDns(address, [domain]);
         cache.Note(Numeric(YandexAddress), app: true);
         var named = Assert.Single(cache.Snapshot());
         Assert.True(named.ByName);
         Assert.False(named.ByApp);
-        Assert.Equal(RoutePlan.Permit, named.Plan);
+        // A full tunnel needs no per-address route for a name that uses the tunnel.
+        Assert.Equal(namedPlan, named.Plan);
 
-        cache.NoteDns(address, [RouteVerdict.Proxy, RouteVerdict.Direct]);
+        cache.NoteDns(address, appFirst ? [RouteVerdict.Proxy, RouteVerdict.Direct] : [RouteVerdict.Direct, RouteVerdict.Proxy]);
         var fallback = Assert.Single(cache.Snapshot());
         Assert.False(fallback.ByName);
         Assert.True(fallback.ByApp);
-        Assert.Equal(RoutePlan.Tunnel, fallback.Plan);
+        Assert.Equal(applicationPlan, fallback.Plan);
     }
 
     [Fact]

@@ -9,6 +9,8 @@ namespace AmneziaGeo.Linux.App;
 /// </summary>
 internal static class BlockFirewall
 {
+    private const string RoutingUpdateTable = "amneziageo-routing-update";
+
     /// <summary>
     /// Refuses the ranges from the first packet and returns whether the table stands; no ranges take it down.
     /// </summary>
@@ -33,6 +35,32 @@ internal static class BlockFirewall
 
         log.Info("routing", $"{ranges.Count} blocked range(s) are refused from the first packet, whatever sends it");
         return true;
+    }
+
+    // Rules, peer routes and DNS marks are separate kernel operations. Hold egress while they disagree.
+    internal static async Task HoldRoutingUpdateAsync()
+    {
+        var path = Path.Combine(AgentPaths.Root, "routing-update.nft");
+        await File.WriteAllTextAsync(path, $$"""
+            table inet {{RoutingUpdateTable}} {
+                chain output {
+                    type filter hook output priority filter; policy drop;
+                    oifname "lo" accept
+                }
+            }
+            """).ConfigureAwait(false);
+        var result = await Shell.RunAsync("nft", CancellationToken.None, "-f", path).ConfigureAwait(false);
+        if (result.ExitCode != 0)
+        {
+            throw new IOException($"Could not hold outgoing traffic during the routing update: {result.Output}");
+        }
+    }
+
+    internal static async Task<bool> ReleaseRoutingUpdateAsync()
+    {
+        var result = await Shell.RunAsync("nft", CancellationToken.None, "delete", "table", "inet", RoutingUpdateTable)
+            .ConfigureAwait(false);
+        return result.ExitCode == 0;
     }
 
     /// <summary>

@@ -46,6 +46,7 @@ internal sealed class TunnelController : IDisposable
     private AppBypass? _bypass;
     private bool _routingIpv6;
     private bool _blockInstalled;
+    private bool _routingUpdateHeld;
     private TunnelRouting? _startingRouting;
     public TunnelRouting? AppliedRouting { get; private set; }
     public bool RoutingRecoveryRequired { get; private set; }
@@ -82,6 +83,7 @@ internal sealed class TunnelController : IDisposable
         // killed run left standing: a session that lets the tunnel in lays no table of its own, so nothing else would
         // lift that one.
         BlockFirewall.RemoveAsync(CancellationToken.None).GetAwaiter().GetResult();
+        BlockFirewall.ReleaseRoutingUpdateAsync().GetAwaiter().GetResult();
         DirectPath.RemoveAsync(CancellationToken.None).GetAwaiter().GetResult();
         AppBypass.RemoveAsync(CancellationToken.None).GetAwaiter().GetResult();
         InboundFirewall.RemoveAsync(CancellationToken.None).GetAwaiter().GetResult();
@@ -170,6 +172,11 @@ internal sealed class TunnelController : IDisposable
     /// </summary>
     public async Task<TunnelFailure?> UpAsync(string configText, TunnelRouting routing, TunnelOptions options, CancellationToken ct)
     {
+        if (_routingUpdateHeld)
+        {
+            return Refused("Disconnect to release traffic held after a failed routing update.");
+        }
+
         var front = options.Transport?.UseWebSocket == true ? WsEndpoint.Of(configText, options.Offer, options.Transport) : null;
         var carried = front is not null;
         var blocker = Preflight(carried);
@@ -554,7 +561,7 @@ internal sealed class TunnelController : IDisposable
 
         if (RoutingRecoveryRequired)
         {
-            return "routing could not be fully applied; reconnect to restore a consistent policy";
+            return "routing could not be fully applied; traffic is held until disconnect";
         }
 
         if (requested.Stamp == applied.Stamp)
@@ -579,10 +586,59 @@ internal sealed class TunnelController : IDisposable
         _log.Debug("routing", $"applying a live policy from {requested.ListIds.Count} list(s)");
         try
         {
+            await BlockFirewall.HoldRoutingUpdateAsync().ConfigureAwait(false);
+            _routingUpdateHeld = true;
+        }
+        catch (Exception ex)
+        {
+            _log.Error("routing", "could not hold traffic for the live update; the current policy was kept", ex);
+            return "could not hold traffic for a live routing update";
+        }
+
+        var standingChanged = false;
+        var hadAppTunnel = _apps is not null;
+        try
+        {
             var routing = WithNetworkResolvers(AroundLocal(requested));
+            await InstallAsync(routing).ConfigureAwait(false);
+            await ReleaseRoutingUpdateAsync().ConfigureAwait(false);
+
+            AppliedRouting = requested;
+            SetRoutingStatus(requested);
+            _log.Info("routing", $"applied {requested.ListIds.Count} routing list(s) without reconnecting");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _log.Error("routing", "live routing update failed", ex);
+            if (standingChanged && hadAppTunnel == (_apps is not null))
+            {
+                try
+                {
+                    var previous = WithNetworkResolvers(AroundLocal(applied));
+                    await InstallAsync(previous).ConfigureAwait(false);
+                    await ReleaseRoutingUpdateAsync().ConfigureAwait(false);
+                    _log.Info("routing", "restored the previous live routing policy after the update failed");
+                    return "routing update failed; the previous policy is still applied";
+                }
+                catch (Exception rollback)
+                {
+                    _log.Error("routing", "could not restore the previous routing policy", rollback);
+                }
+            }
+
+            RoutingRecoveryRequired = true;
+            _log.Warn("routing", "outgoing traffic is held after a failed routing update; disconnect to release it");
+            return "routing could not be fully applied; traffic is held until disconnect";
+        }
+
+        async Task InstallAsync(TunnelRouting routing)
+        {
             var failures = basis.Applier.Failures;
             var spareFailures = _apps?.SpareFailures ?? 0;
+            standingChanged = false;
             Restand(cache, routing);
+            standingChanged = true;
             Steer(cache, routing);
             await RefuseAsync(cache, routing, CancellationToken.None).ConfigureAwait(false);
             await ShedAsync(cache, routing).ConfigureAwait(false);
@@ -603,18 +659,17 @@ internal sealed class TunnelController : IDisposable
             {
                 throw new IOException("A route, firewall or peer update failed during the live routing change.");
             }
+        }
+    }
 
-            AppliedRouting = requested;
-            SetRoutingStatus(requested);
-            _log.Info("routing", $"applied {requested.ListIds.Count} routing list(s) without reconnecting");
-            return null;
-        }
-        catch (Exception ex)
+    private async Task ReleaseRoutingUpdateAsync()
+    {
+        if (!await BlockFirewall.ReleaseRoutingUpdateAsync().ConfigureAwait(false))
         {
-            RoutingRecoveryRequired = true;
-            _log.Error("routing", "live routing update failed; reconnect to restore a consistent policy", ex);
-            return "routing could not be fully applied; reconnect to restore a consistent policy";
+            throw new IOException("Could not lift the live routing update traffic hold.");
         }
+
+        _routingUpdateHeld = false;
     }
 
     private void SetRoutingStatus(TunnelRouting routing)
@@ -928,6 +983,11 @@ internal sealed class TunnelController : IDisposable
             _daemon = null;
             daemon.Dispose();
             _log.Info("tunnel", $"{_iface} down");
+        }
+
+        if (_routingUpdateHeld)
+        {
+            await ReleaseRoutingUpdateAsync().ConfigureAwait(false);
         }
 
         Mode = "(down)";

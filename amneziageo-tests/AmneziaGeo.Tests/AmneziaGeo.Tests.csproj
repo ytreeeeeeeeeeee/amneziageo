@@ -28,6 +28,15 @@
     <Compile Include="..\..\amneziageo-android\AmneziaGeo.Android.Engine\VpnSessionFiles.cs" Link="VpnSessionFiles.cs" />
     <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\TunnelRouting.cs" Link="TunnelRouting.cs" />
     <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\LinuxNameRoutes.cs" Link="LinuxNameRoutes.cs" />
+    <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\DirectPath.cs" Link="DirectPath.cs" />
+    <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\AgentLog.cs" Link="AgentLog.cs" />
+    <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\AgentPaths.cs" Link="AgentPaths.cs" />
+    <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\Shell.cs" Link="Shell.cs" />
+    <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\LinuxRouteApplier.cs" Link="LinuxRouteApplier.cs" />
+    <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\AppTunnel.cs" Link="AppTunnel.cs" />
+    <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\AppGroup.cs" Link="AppGroup.cs" />
+    <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\AppImages.cs" Link="AppImages.cs" />
+    <Compile Include="..\..\amneziageo-linux\AmneziaGeo.Linux.App\ProcEvents.cs" Link="ProcEvents.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -35,6 +44,7 @@
     <ProjectReference Include="..\..\amneziageo-lib\AmneziaGeo.Dal\AmneziaGeo.Dal.csproj" />
     <ProjectReference Include="..\..\amneziageo-lib\AmneziaGeo.Deltas\AmneziaGeo.Deltas.csproj" />
     <ProjectReference Include="..\..\amneziageo-lib\AmneziaGeo.Ui\AmneziaGeo.Ui.csproj" />
+    <ProjectReference Include="..\..\amneziageo-linux\AmneziaGeo.Linux.Engine\AmneziaGeo.Linux.Engine.csproj" />
     <ProjectReference Include="..\..\amneziageo-windows\AmneziaGeo.Windows.App\AmneziaGeo.Windows.App.csproj" />
   </ItemGroup>
 
